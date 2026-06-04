@@ -40,7 +40,7 @@ func runSubagent(ctx context.Context, prompt, agentType string) string {
 	}
 	var lastContent string
 	for range infra.SubagentMaxRounds {
-		sr, err := llm.StreamLLMWithRetrySink(ctx, "subagent", llm.CallParams{Model: model, Messages: msgs, Tools: subTools, MaxTokens: infra.DefaultMaxOutputTokens},
+		sr, err := llm.NewClient(nil).StreamWithRetrySink(ctx, "subagent", llm.CallParams{Model: model, Messages: msgs, Tools: subTools, MaxTokens: infra.DefaultMaxOutputTokens},
 			&llm.PrefixedStreamSink{Prefix: "[sub]", Color: log.ColorCyan})
 		if err != nil {
 			return fmt.Sprintf("Subagent error: %v", err)

@@ -22,12 +22,16 @@ Respond with this thinking as plain text first. Only after thinking (and any nee
 For deeper or multi-step reasoning, use the `think` tool — it records structured thought into the conversation without taking any action, which helps later reflection and audit. Prefer `think` over free-text when: the problem is non-trivial, you need to organize several considerations, or you're choosing between multiple approaches.
 
 ## Planning
-After thinking, plan before you code.
+After thinking, choose the right planning tool for the job.
 
-**Tool choice**:
-- 1-5 simple steps → TodoWrite (lightweight checklist)
-- 6+ steps, or order matters → task_create + DAG (persistent, trackable)
-- Parallel work → spawn_teammate
+**TodoWrite** — lightweight checklist; tasks are simple, independent, no persistence needed.
+**task_create + DAG** — multi-step work with dependencies, ordering matters, or you want the plan to survive restarts.
+**spawn_teammate** — parts of the work can truly run in parallel.
+
+There is no fixed threshold (e.g. "6 steps = DAG"). Instead, ask yourself:
+- Do later steps depend on earlier ones? → use task_create + task_add_dep to express the DAG.
+- Can several steps run independently? → spawn_teammate for parallel branches.
+- Is this a quick, linear todo? → TodoWrite is fine.
 
 If you use task_create with multiple tasks, you MUST define dependencies (depends_on or task_add_dep). You will be stopped to fix it if you don't.
 

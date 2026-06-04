@@ -7,6 +7,8 @@ import (
 	"go-code-agent/infra"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/prompt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -15,7 +17,12 @@ import (
 //
 // A secondary LLM call evaluates whether the agent's actions match the
 // user's intent. Triggered after task completion. Uses a separate
-// (usually cheaper) model. Disabled by default; opt-in via --judge.
+// (usually cheaper) model. Disabled by default; opt-in via JUDGE_ENABLED.
+//
+// The judge is configured entirely through JUDGE_* environment variables
+// (see judgeConfigFromEnv + llm.JudgeProvider), so its model, endpoint
+// and credentials are set through one consistent mechanism rather than a
+// mix of CLI flags and env vars.
 
 // JudgeVerdict is the structured output produced by the Judge LLM.
 type JudgeVerdict struct {
@@ -57,6 +64,29 @@ func NewJudge(enabled bool, model string, minScore int) *Judge {
 	}
 }
 
+// judgeConfigFromEnv reads the judge's entire configuration from the
+// JUDGE_* environment variables, mirroring the JUDGE_PROVIDER/API_KEY/
+// BASE_URL routing vars consumed by llm.JudgeProvider so the judge is
+// configured through one consistent mechanism:
+//
+//	JUDGE_ENABLED    turn the judge on    (1 | true | yes | on)
+//	JUDGE_MODEL      judge model id       (empty = reuse the main model)
+//	JUDGE_MIN_SCORE  retry threshold 1-10 (default infra.JudgeMinScore)
+func judgeConfigFromEnv() (enabled bool, model string, minScore int) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("JUDGE_ENABLED"))) {
+	case "1", "true", "yes", "on":
+		enabled = true
+	}
+	model = strings.TrimSpace(os.Getenv("JUDGE_MODEL"))
+	minScore = infra.JudgeMinScore
+	if v := strings.TrimSpace(os.Getenv("JUDGE_MIN_SCORE")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			minScore = n
+		}
+	}
+	return enabled, model, minScore
+}
+
 // IsEnabled reports whether the judge is active.
 func (j *Judge) IsEnabled() bool {
 	j.mu.RLock()
@@ -86,7 +116,12 @@ func (j *Judge) Verify(ctx context.Context, originalTask string, conversation []
 		callModel = model
 	}
 
-	comp, err := llm.CallLLMWithRetry(ctx, "judge", llm.CallParams{
+	// Route to the backend that serves the judge. The judge is designed
+	// to run a *different* (cheaper) model than the main agent;
+	// JudgeProvider honours the JUDGE_PROVIDER / JUDGE_API_KEY /
+	// JUDGE_BASE_URL env vars so it can even live behind a separate
+	// endpoint, falling back to the main model's provider otherwise.
+	comp, err := llm.NewClient(llm.JudgeProvider(callModel)).CallWithRetry(ctx, "judge", llm.CallParams{
 		Model:       callModel,
 		Messages:    []llm.Message{llm.SystemMessage(prompt)},
 		Temperature: 0.0, // deterministic judgment

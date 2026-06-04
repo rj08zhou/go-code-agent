@@ -425,14 +425,29 @@ func anthropicIsRetriable(err error) bool {
 	return false
 }
 
-func init() {
+// newAnthropicProvider builds an Anthropic provider with explicit
+// credentials. Empty apiKey/baseURL fall back to the ANTHROPIC_API_KEY /
+// ANTHROPIC_BASE_URL env vars, so the same constructor serves both the
+// default startup registration and the judge's dedicated-endpoint path.
+func newAnthropicProvider(apiKey, baseURL string) Provider {
+	if apiKey == "" {
+		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	}
+	if baseURL == "" {
+		baseURL = os.Getenv("ANTHROPIC_BASE_URL")
+	}
 	var opts []option.RequestOption
-	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
-		opts = append(opts, option.WithAPIKey(key))
+	if apiKey != "" {
+		opts = append(opts, option.WithAPIKey(apiKey))
 	}
-	if base := os.Getenv("ANTHROPIC_BASE_URL"); base != "" {
-		opts = append(opts, option.WithBaseURL(base))
+	if baseURL != "" {
+		opts = append(opts, option.WithBaseURL(baseURL))
 	}
-	RegisterProvider(&anthropicProvider{client: anthropic.NewClient(opts...)})
+	return &anthropicProvider{client: anthropic.NewClient(opts...)}
+}
+
+func init() {
+	RegisterProvider(newAnthropicProvider("", ""))
+	RegisterProviderBuilder("anthropic", newAnthropicProvider)
 	SetRetriableClassifier("anthropic", anthropicIsRetriable)
 }

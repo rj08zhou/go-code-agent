@@ -26,6 +26,22 @@ After significant events (task completion, post-reflection), the Judge:
 
 ## Configuration
 
+In this repo the judge is configured entirely through `JUDGE_*` environment
+variables (no CLI flags), so its model, endpoint, credentials and behaviour
+all live in one consistent place:
+
+```bash
+JUDGE_ENABLED=1                       # turn the judge on (1 | true | yes | on)
+JUDGE_MODEL=claude-haiku-4.5          # empty = reuse main model
+JUDGE_MIN_SCORE=7                     # below this, should_retry is forced
+JUDGE_PROVIDER=openai                 # optional: explicit backend SDK
+JUDGE_API_KEY=<key>                   # optional: judge-only key
+JUDGE_BASE_URL=https://api.deepseek.com  # optional: judge-only endpoint
+```
+
+The conceptual config below maps onto those vars (`min_score` →
+`JUDGE_MIN_SCORE`, `model` → `JUDGE_MODEL`, …):
+
 ```yaml
 skills:
   - name: judge

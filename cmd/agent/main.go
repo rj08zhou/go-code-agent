@@ -100,9 +100,6 @@ func main() {
 	// CLI flags
 	sessionFlag := flag.String("session", "", "activate a specific session id")
 	newSessionFlag := flag.Bool("new-session", false, "start a brand-new session instead of resuming the latest")
-	judgeFlag := flag.Bool("judge", false, "enable LLM-as-Judge post-completion verification")
-	judgeModelFlag := flag.String("judge-model", infra.JudgeDefaultModel, "model id for the judge (empty = reuse main model)")
-	judgeMinScoreFlag := flag.Int("judge-min-score", infra.JudgeMinScore, "judge score below this forces a retry (1-10)")
 	humanFlag := flag.Bool("human", false, "enable Human-in-the-loop approval for high-risk tool calls")
 	humanModeFlag := flag.String("human-mode", infra.HitlDefaultMode, "hitl mode: interactive | auto-approve | auto-reject | notify-only")
 
@@ -189,11 +186,18 @@ func main() {
 
 	initTools()
 
+	// Persist autonomous-decision events to the active session's
+	// decisions.jsonl for after-the-fact replay via /decisions.
+	initDecisionLog()
+
 	// ---- Judge + HITL ----
-	if *judgeFlag {
-		globalJudge = NewJudge(true, *judgeModelFlag, *judgeMinScoreFlag)
+	// The judge is configured entirely via JUDGE_* env vars so its model,
+	// endpoint and credentials live in one place (see judgeConfigFromEnv
+	// + llm.JudgeProvider) instead of a mix of flags and env vars.
+	if enabled, judgeModel, minScore := judgeConfigFromEnv(); enabled {
+		globalJudge = NewJudge(true, judgeModel, minScore)
 		log.PrintSystem(fmt.Sprintf("[judge] enabled (model=%q, min_score=%d)",
-			firstNonEmpty(*judgeModelFlag, model), *judgeMinScoreFlag))
+			firstNonEmpty(judgeModel, model), minScore))
 	}
 	if *humanFlag {
 		hitl_audit.HitlManager.SetEnabled(true)
@@ -239,7 +243,7 @@ func main() {
 	if session.History != nil {
 		fmt.Printf("  History: %s (%d entries)\n", session.History.Path(), session.History.WrittenCount())
 	}
-	fmt.Println("  Commands: /session /compact /tasks /dag /team /inbox /memory /search <q> /mcp /approve /security /usage")
+	fmt.Println("  Commands: /session /compact /tasks /dag /decisions /team /inbox /memory /search <q> /mcp /approve /security /usage")
 	fmt.Println("  Type 'q' or 'exit' to quit.")
 	fmt.Printf("  Security: bash allowlist ON, path sandbox ON, secrets sanitizer ON\n")
 	fmt.Printf("  Judge: %s  |  HITL: %s  |  Preview: %s\n",

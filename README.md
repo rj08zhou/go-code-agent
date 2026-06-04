@@ -73,9 +73,13 @@ export LLM_PROVIDER="anthropic"  # openai | anthropic | gemini
 ### Optional Features
 
 ```bash
-# LLM-as-Judge: post-completion verification
-./agent --judge
-./agent --judge --judge-model claude-haiku-4.5 --judge-min-score 8
+# LLM-as-Judge: post-completion verification (configured via JUDGE_* env vars)
+JUDGE_ENABLED=1 ./agent
+JUDGE_ENABLED=1 JUDGE_MODEL=claude-haiku-4.5 JUDGE_MIN_SCORE=8 ./agent
+
+# Point the judge at a separate / cheaper endpoint
+JUDGE_ENABLED=1 JUDGE_PROVIDER=openai JUDGE_API_KEY=<key> \
+  JUDGE_BASE_URL=https://api.deepseek.com JUDGE_MODEL=deepseek-chat ./agent
 
 # Human-in-the-loop approval for high-risk operations
 ./agent --human
@@ -182,7 +186,7 @@ agentLoop(ctx, &conv)
   │
   ├─ [post-dispatch]
   │    ├─ planningGate: check if tasks exist after first tool round
-  │    ├─ judge: if all tasks done + --judge → LLM verification
+  │    ├─ judge: if all tasks done + JUDGE_ENABLED → LLM verification
   │    └─ reflection triggers:
   │         ├─ mini-reflect: on tool failure
   │         ├─ strategy-change: after 3 consecutive failures
@@ -227,11 +231,21 @@ Session End:
 |------|---------|-------------|
 | `--session <id>` | — | Activate a specific session by ID |
 | `--new-session` | false | Force creation of a new session |
-| `--judge` | false | Enable LLM-as-Judge post-completion verification |
-| `--judge-model <id>` | main model | Use a cheaper/faster model for judge calls |
-| `--judge-min-score <n>` | 7 | Score below this triggers a retry (scale 1-10) |
 | `--human` | false | Enable Human-in-the-loop approval |
 | `--human-mode` | interactive | `interactive` / `auto-approve` / `auto-reject` / `notify-only` |
+
+### LLM-as-Judge Env Vars
+
+The judge is configured entirely through environment variables (no CLI flags):
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `JUDGE_ENABLED` | unset | Enable the judge (`1` / `true` / `yes` / `on`) |
+| `JUDGE_MODEL` | main model | Model id for judge calls (empty = reuse main model) |
+| `JUDGE_MIN_SCORE` | 7 | Score below this triggers a retry (scale 1-10) |
+| `JUDGE_PROVIDER` | inferred | Explicit backend SDK (`openai` / `anthropic` / `gemini`) |
+| `JUDGE_API_KEY` | main key | Judge-only key (else the backend's standard key) |
+| `JUDGE_BASE_URL` | main url | Judge-only endpoint (else the backend's standard url) |
 
 ### Tunable Constants (infra/consts.go)
 
@@ -588,7 +602,7 @@ After completing work (≥3 tool rounds), the agent is prompted to write lessons
 
 ### LLM-as-Judge
 
-When `--judge` is enabled:
+When `JUDGE_ENABLED` is set:
 1. Agent completes all tasks
 2. A second LLM call evaluates: "Did the agent actually achieve the user's goal?"
 3. Scores 1-10; below threshold (default 7) → critical feedback injected → agent retries
@@ -822,7 +836,7 @@ View aggregated stats with the `/usage` REPL command.
 ## Example Workflow
 
 ```
-$ ./agent --judge --human
+$ JUDGE_ENABLED=1 ./agent --human
 
 > Implement a REST API for user management with CRUD endpoints
 

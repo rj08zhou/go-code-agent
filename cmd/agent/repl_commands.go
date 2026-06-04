@@ -31,6 +31,10 @@ func handleReplCommand(ctx context.Context, query string, history []llm.Message)
 		fmt.Println(app.DagSched().TopoView())
 		return true, history
 
+	case query == "/decisions":
+		fmt.Println(renderDecisions())
+		return true, history
+
 	case query == "/team":
 		fmt.Println(app.TeamMgr().ListAll())
 		return true, history

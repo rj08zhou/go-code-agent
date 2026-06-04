@@ -281,16 +281,24 @@ func openAIIsRetriable(err error) bool {
 	return false
 }
 
-func init() {
-	// Configure SDK from environment. Keys are the same ones the old
-	// main.go used; we preserve them so users don't have to change
-	// anything.
-	var opts []option.RequestOption
-	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-		opts = append(opts, option.WithAPIKey(key))
+// newOpenAIProvider builds an OpenAI provider with explicit credentials.
+// Empty apiKey/baseURL fall back to the OPENAI_API_KEY / OPENAI_BASE_URL
+// env vars, so the same constructor serves both the default startup
+// registration and the judge's dedicated-endpoint path (JUDGE_API_KEY /
+// JUDGE_BASE_URL).
+func newOpenAIProvider(apiKey, baseURL string) Provider {
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
 	}
-	if base := os.Getenv("OPENAI_BASE_URL"); base != "" {
-		opts = append(opts, option.WithBaseURL(base))
+	if baseURL == "" {
+		baseURL = os.Getenv("OPENAI_BASE_URL")
+	}
+	var opts []option.RequestOption
+	if apiKey != "" {
+		opts = append(opts, option.WithAPIKey(apiKey))
+	}
+	if baseURL != "" {
+		opts = append(opts, option.WithBaseURL(baseURL))
 	}
 	// Install an explicit http.Client with timeouts. The SDK otherwise
 	// falls back to http.DefaultClient which has no read deadline, so a
@@ -319,6 +327,14 @@ func init() {
 			MaxIdleConnsPerHost:   10,
 		},
 	}))
-	RegisterProvider(&openAIProvider{client: openai.NewClient(opts...)})
+	return &openAIProvider{client: openai.NewClient(opts...)}
+}
+
+func init() {
+	// Configure SDK from environment. Keys are the same ones the old
+	// main.go used; we preserve them so users don't have to change
+	// anything.
+	RegisterProvider(newOpenAIProvider("", ""))
+	RegisterProviderBuilder("openai", newOpenAIProvider)
 	SetRetriableClassifier("openai", openAIIsRetriable)
 }
