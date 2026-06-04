@@ -7,20 +7,20 @@ const AppRootDirName = ".go-code-agent"
 // Project-wide configuration constants. All tunable thresholds and timeouts.
 
 const (
-	StuckThreshold         = 10  // rounds without completing a task = "stuck"
-	ReflectInterval        = 5   // periodic reflection every N tool rounds
-	MaxConsecutiveFailures = 3   // same tool failing → force strategy change
-	MaxRounds              = 100 // hard safety cap for agent loop
-	LessonThreshold        = 3   // min tool rounds before auto-lesson prompt
-	SubagentMaxRounds      = 30  // subagent inner loop cap
-	TeammateWorkMaxRounds  = 50  // teammate workPhase inner loop cap
+	StuckThreshold         = 10    // rounds without completing a task = "stuck"
+	ReflectInterval        = 5     // periodic reflection every N tool rounds
+	MaxConsecutiveFailures = 3     // same tool failing → force strategy change
+	MaxRounds              = 100   // hard safety cap for agent loop
+	LessonThreshold        = 3     // min tool rounds before auto-lesson prompt
+	SubagentMaxRounds      = 30    // subagent inner loop cap
+	TeammateWorkMaxRounds  = 50    // teammate workPhase inner loop cap
 	DefaultMaxOutputTokens = 16384 // default max output tokens for LLM calls
 )
 
 const (
-	TokenThreshold = 100000  // autoCompact trigger (estimated total tokens)
-	KeepRecent     = 3       // microCompact keeps N most recent tool messages
-	MaxOutputLen   = 500000  // max bytes per tool output (truncation limit, 500KB)
+	TokenThreshold = 100000 // autoCompact trigger (estimated total tokens)
+	KeepRecent     = 3      // microCompact keeps N most recent tool messages
+	MaxOutputLen   = 500000 // max bytes per tool output (truncation limit, 500KB)
 )
 
 const (
@@ -115,10 +115,23 @@ const (
 // The judge runs a SECOND LLM call after task completion to evaluate whether
 // the agent actually achieved the user's goal (vs. just claiming it did).
 // See judge.go.
+//
+// The judge is configured entirely through JUDGE_* environment variables
+// (model, endpoint, credentials and behaviour), so it is set up through one
+// consistent mechanism rather than a mix of CLI flags and env vars:
+//
+//	JUDGE_ENABLED   turn the judge on        (1 | true | yes | on)
+//	JUDGE_MODEL     judge model id           (empty = reuse main model)
+//	JUDGE_MIN_SCORE retry threshold 1-10     (default JudgeMinScore)
+//	JUDGE_PROVIDER  explicit backend SDK     (openai | anthropic | gemini)
+//	JUDGE_API_KEY   judge-only key           (else the backend's standard key)
+//	JUDGE_BASE_URL  judge-only endpoint      (else the backend's standard url)
+//
+// Backend routing (JUDGE_PROVIDER/API_KEY/BASE_URL) is resolved in
+// llm.JudgeProvider; the rest is read by judgeConfigFromEnv.
 const (
-	JudgeMinScore        = 7  // verdicts below this force a retry (scale 1-10)
-	JudgeDefaultModel    = "" // empty = reuse main model; override via --judge-model
-	JudgeMaxRetryInjects = 2  // at most N verification-failed injections per agentLoop run
+	JudgeMinScore        = 7 // verdicts below this force a retry (scale 1-10)
+	JudgeMaxRetryInjects = 2 // at most N verification-failed injections per agentLoop run
 )
 
 // Human-in-the-loop approval

@@ -34,6 +34,11 @@ const (
 	sessionHistoryDir     = "history"
 	SessionTranscriptsDir = "transcripts"
 
+	// SessionDecisionsFile holds the append-only JSONL timeline of the
+	// agent's autonomous decisions (planning, compaction, memory, judge,
+	// reflection) for after-the-fact replay via /decisions.
+	SessionDecisionsFile = "decisions.jsonl"
+
 	// Session statuses tracked in meta.json / sessions.json.
 	StatusActive   = "active"
 	StatusArchived = "archived"

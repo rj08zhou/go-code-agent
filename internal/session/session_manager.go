@@ -182,7 +182,7 @@ func (sm *SessionManager) SaveToMemory(ctx context.Context, s *Session) (string,
 		"session_history": hist.String(),
 	})
 
-	comp, err := llm.CallLLMWithRetry(ctx, "memory-save", llm.CallParams{
+	comp, err := llm.NewClient(nil).CallWithRetry(ctx, "memory-save", llm.CallParams{
 		Model:       sm.model,
 		Messages:    []llm.Message{llm.SystemMessage(promptText)},
 		Temperature: 0.0,

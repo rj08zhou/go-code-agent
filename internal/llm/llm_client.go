@@ -107,14 +107,14 @@ var TransientMsgHints = []string{
 }
 
 // isRetriableLLMError dispatches to the provider-specific classifier.
-func isRetriableLLMError(err error) bool {
+func isRetriableLLMError(prov Provider, err error) bool {
 	if err == nil {
 		return false
 	}
-	if activeProvider == nil {
+	if prov == nil {
 		return false
 	}
-	if fn, ok := retriableClassifiers[activeProvider.Name()]; ok {
+	if fn, ok := retriableClassifiers[prov.Name()]; ok {
 		return fn(err)
 	}
 	return false
@@ -146,9 +146,31 @@ func isRateLimitError(err error) bool {
 	return strings.Contains(msg, "429") || strings.Contains(msg, "too many requests") || strings.Contains(msg, "rate limit")
 }
 
-// CallLLMWithRetry runs a non-streaming LLM call with retries.
-func CallLLMWithRetry(ctx context.Context, source string, params CallParams) (*Completion, error) {
-	if activeProvider == nil {
+// Client wraps a Provider with the shared retry / timeout / usage
+// telemetry orchestration. The Provider interface itself only exposes
+// the atomic Call/Stream operations; the retry policy lives here, one
+// level up, so every backend shares it instead of reimplementing it.
+//
+// Use NewClient(nil) to target the active (main) provider selected at
+// startup; pass an explicit provider (e.g. llm.JudgeProvider(...)) to
+// route a single call to a different backend / endpoint.
+type Client struct {
+	provider Provider
+}
+
+// NewClient wraps p. A nil p falls back to the active (main) provider
+// selected at startup, so NewClient(nil).CallWithRetry(...) behaves like
+// the old package-level CallLLMWithRetry.
+func NewClient(p Provider) *Client {
+	if p == nil {
+		p = activeProvider
+	}
+	return &Client{provider: p}
+}
+
+// CallWithRetry runs a non-streaming LLM call with retries.
+func (c *Client) CallWithRetry(ctx context.Context, source string, params CallParams) (*Completion, error) {
+	if c.provider == nil {
 		return nil, fmt.Errorf("no active LLM provider")
 	}
 	var lastErr error
@@ -159,12 +181,12 @@ func CallLLMWithRetry(ctx context.Context, source string, params CallParams) (*C
 		// emitting bytes) freezes the whole agent loop with no
 		// subprocess and no audit trail.
 		attemptCtx, cancel := context.WithTimeout(ctx, infra.LlmCallTimeout)
-		resp, err := activeProvider.Call(attemptCtx, params)
+		resp, err := c.provider.Call(attemptCtx, params)
 		cancel()
 		if err == nil {
 			traceID := GetTraceID(ctx)
 			if usageRecordFn != nil {
-				usageRecordFn(source, activeProvider.Name(), params.Model,
+				usageRecordFn(source, c.provider.Name(), params.Model,
 					traceID, resp.Usage, time.Since(started))
 			}
 			return resp, nil
@@ -175,7 +197,7 @@ func CallLLMWithRetry(ctx context.Context, source string, params CallParams) (*C
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		if !isRetriableLLMError(err) || attempt == infra.LlmMaxRetries {
+		if !isRetriableLLMError(c.provider, err) || attempt == infra.LlmMaxRetries {
 			return nil, err
 		}
 		delay := backoffDelay(attempt, isRateLimitError(err))
@@ -190,14 +212,14 @@ func CallLLMWithRetry(ctx context.Context, source string, params CallParams) (*C
 	return nil, lastErr
 }
 
-// StreamLLMWithRetry runs a streaming LLM call with retries (stdout sink).
-func StreamLLMWithRetry(ctx context.Context, source string, params CallParams) (*StreamResult, error) {
-	return StreamLLMWithRetrySink(ctx, source, params, NewStdoutStreamSink())
+// StreamWithRetry runs a streaming LLM call with retries (stdout sink).
+func (c *Client) StreamWithRetry(ctx context.Context, source string, params CallParams) (*StreamResult, error) {
+	return c.StreamWithRetrySink(ctx, source, params, NewStdoutStreamSink())
 }
 
-// StreamLLMWithRetrySink is the full-control variant for custom sinks.
-func StreamLLMWithRetrySink(ctx context.Context, source string, params CallParams, sink StreamSink) (*StreamResult, error) {
-	if activeProvider == nil {
+// StreamWithRetrySink is the full-control variant for custom sinks.
+func (c *Client) StreamWithRetrySink(ctx context.Context, source string, params CallParams, sink StreamSink) (*StreamResult, error) {
+	if c.provider == nil {
 		return nil, fmt.Errorf("no active LLM provider")
 	}
 	var lastErr error
@@ -207,12 +229,12 @@ func StreamLLMWithRetrySink(ctx context.Context, source string, params CallParam
 		// when an upstream gateway stops emitting chunks; without this
 		// the for-range over Stream.Next() blocks forever.
 		attemptCtx, cancel := context.WithTimeout(ctx, infra.LlmCallTimeout)
-		sr, err := activeProvider.Stream(attemptCtx, params, sink)
+		sr, err := c.provider.Stream(attemptCtx, params, sink)
 		cancel()
 		if err == nil {
 			traceID := GetTraceID(ctx)
 			if usageRecordFn != nil {
-				usageRecordFn(source, activeProvider.Name(), params.Model,
+				usageRecordFn(source, c.provider.Name(), params.Model,
 					traceID, sr.Usage, time.Since(started))
 			}
 			return sr, nil
@@ -222,7 +244,7 @@ func StreamLLMWithRetrySink(ctx context.Context, source string, params CallParam
 		if sr != nil && sr.Content != "" {
 			traceID := GetTraceID(ctx)
 			if usageRecordFn != nil {
-				usageRecordFn(source, activeProvider.Name(), params.Model,
+				usageRecordFn(source, c.provider.Name(), params.Model,
 					traceID, sr.Usage, time.Since(started))
 			}
 			return sr, err
@@ -231,7 +253,7 @@ func StreamLLMWithRetrySink(ctx context.Context, source string, params CallParam
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		if !isRetriableLLMError(err) || attempt == infra.LlmMaxRetries {
+		if !isRetriableLLMError(c.provider, err) || attempt == infra.LlmMaxRetries {
 			return nil, err
 		}
 		delay := backoffDelay(attempt, isRateLimitError(err))
@@ -254,5 +276,3 @@ func truncateErr(err error) string {
 	}
 	return s
 }
-
-

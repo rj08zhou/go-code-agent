@@ -120,7 +120,7 @@ func agentLoop(ctx context.Context, messages *[]llm.Message) error {
 		preRound(ctx, messages, st)
 
 		// 3) LLM call.
-		sr, err := llm.StreamLLMWithRetry(ctx, "agent", llm.CallParams{Model: model, Messages: *messages, Tools: toolDefs, MaxTokens: infra.DefaultMaxOutputTokens})
+		sr, err := llm.NewClient(nil).StreamWithRetry(ctx, "agent", llm.CallParams{Model: model, Messages: *messages, Tools: toolDefs, MaxTokens: infra.DefaultMaxOutputTokens})
 		if err != nil {
 			return fmt.Errorf("API call failed: %w", err)
 		}
@@ -147,6 +147,7 @@ func agentLoop(ctx context.Context, messages *[]llm.Message) error {
 			if shouldRequestLesson(st) {
 				st.lessonsWritten = true
 				st.lessonRoundsRemaining = infra.LessonRoundsLimit
+				log.PrintDecision("memory", "task finished after a long run — asking the model to record lessons/preferences to long-term memory (persists across sessions)")
 				*messages = append(*messages, llm.UserMessage(app.PromptLoader.Load("auto_lesson")))
 				continue
 			}
@@ -162,9 +163,11 @@ func agentLoop(ctx context.Context, messages *[]llm.Message) error {
 			st.toolRounds, execResult.usedPlanning, execResult.usedThink, execResult.usedExplore,
 			originalTask,
 		); prompt != "" {
+			log.PrintDecision("plan", "injected a planning gate (enforcing think -> plan -> act before execution)")
 			*messages = append(*messages, llm.UserMessage(prompt))
 		}
 		if prompt := checkDAGDependency(st.toolRounds); prompt != "" {
+			log.PrintDecision("plan", "tasks created without dependencies — nudging the model to define a DAG before executing")
 			*messages = append(*messages, llm.UserMessage(prompt))
 		}
 
@@ -209,6 +212,10 @@ func agentLoop(ctx context.Context, messages *[]llm.Message) error {
 			st.roundsSinceLastComplete, st.roundsWithoutTodo,
 			infra.StuckThreshold, infra.ReflectInterval, app.Todo().HasOpenItems(),
 		)
+		if len(prompts) > 0 {
+			log.PrintDecision("reflect", fmt.Sprintf("self-correction triggered — injected %d reflection/strategy prompt(s) (consecutiveFailures=%d, roundsSinceComplete=%d)",
+				len(prompts), st.consecutiveFailures, st.roundsSinceLastComplete))
+		}
 		for _, p := range prompts {
 			*messages = append(*messages, llm.UserMessage(p))
 		}
@@ -246,14 +253,23 @@ func agentLoop(ctx context.Context, messages *[]llm.Message) error {
 // preRound: token compression, drain background notifications, pull inbox.
 func preRound(ctx context.Context, messages *[]llm.Message, st *loopState) {
 	// micro-compact is in-place and cheap; safe to run every round.
-	microCompact(*messages)
+	// Surface a decision event when it actually folds something — this
+	// used to be completely silent, so the user had no idea old tool
+	// results were being dropped from context.
+	if cleared := microCompact(*messages); cleared > 0 {
+		log.PrintDecision("context", fmt.Sprintf(
+			"micro-compacted %d old tool result(s) out of context (kept most recent %d)",
+			cleared, infra.KeepRecent))
+	}
 
 	if st.toolRounds-st.cachedTokensAt >= infra.TokenCheckInterval || st.cachedTokens == 0 {
 		st.cachedTokens = estimateTokens(*messages)
 		st.cachedTokensAt = st.toolRounds
 	}
 	if st.cachedTokens > infra.TokenThreshold {
-		log.PrintSystem("[auto-compact triggered]")
+		log.PrintDecision("context", fmt.Sprintf(
+			"context ~%d tokens exceeded threshold %d — auto-compacting history into a summary",
+			st.cachedTokens, infra.TokenThreshold))
 		*messages = autoCompact(ctx, *messages, system)
 		// After compaction the slice shrinks dramatically; force a
 		// fresh estimate next round.
@@ -504,7 +520,7 @@ func runJudgeIfApplicable(ctx context.Context, st *loopState, msgs *[]llm.Messag
 		return true
 	}
 
-	log.PrintSystem(fmt.Sprintf("[judge] score=%d approved=%v retry=%v reason=%s",
+	log.PrintDecision("judge", fmt.Sprintf("self-evaluated completion: score=%d approved=%v retry=%v — %s",
 		verdict.Score, verdict.Approved, verdict.ShouldRetry,
 		truncate(verdict.Reason, 120)))
 
@@ -524,7 +540,7 @@ func runJudgeIfApplicable(ctx context.Context, st *loopState, msgs *[]llm.Messag
 func finalizeMaxRounds(ctx context.Context, messages *[]llm.Message) error {
 	*messages = append(*messages, llm.UserMessage(
 		"<limit>Maximum tool rounds reached. Wrap up and respond now in plain text.</limit>"))
-	sr, err := llm.StreamLLMWithRetry(ctx, "agent-final", llm.CallParams{Model: model, Messages: *messages, Tools: nil})
+	sr, err := llm.NewClient(nil).StreamWithRetry(ctx, "agent-final", llm.CallParams{Model: model, Messages: *messages, Tools: nil})
 	if err != nil {
 		// Even on error, leave a closing assistant turn so the next
 		// REPL prompt isn't waiting on an unanswered user message.
