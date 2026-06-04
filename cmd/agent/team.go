@@ -195,7 +195,7 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name string, msgs *[]l
 			*msgs = append(*msgs, llm.UserMessage(string(data)))
 		}
 
-		sr, err := llm.StreamLLMWithRetrySink(ctx, "team", llm.CallParams{Model: model, Messages: *msgs, Tools: tools, MaxTokens: infra.DefaultMaxOutputTokens},
+		sr, err := llm.NewClient(nil).StreamWithRetrySink(ctx, "team", llm.CallParams{Model: model, Messages: *msgs, Tools: tools, MaxTokens: infra.DefaultMaxOutputTokens},
 			&llm.PrefixedStreamSink{Prefix: "[" + name + "]", Color: log.ColorDim})
 		if err != nil {
 			tm.setStatus(name, "shutdown")

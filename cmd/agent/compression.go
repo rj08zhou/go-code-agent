@@ -28,7 +28,9 @@ const compactedMarker = "[Compressed. "
 func estimateTokens(msgs []llm.Message) int { return llm.EstimateTokens(msgs) }
 
 // microCompact replaces old tool-result content with short placeholders.
-func microCompact(msgs []llm.Message) {
+// Returns the number of tool results folded this pass so the caller can
+// surface a decision event (this used to be completely silent).
+func microCompact(msgs []llm.Message) int {
 	// Build tool-call id -> name map for placeholder labels.
 	nameMap := map[string]string{}
 	for _, m := range msgs {
@@ -49,8 +51,9 @@ func microCompact(msgs []llm.Message) {
 		}
 	}
 	if len(toolMsgs) <= infra.KeepRecent {
-		return
+		return 0
 	}
+	cleared := 0
 	for _, ti := range toolMsgs[:len(toolMsgs)-infra.KeepRecent] {
 		if len(msgs[ti.index].Content) > 100 {
 			name := nameMap[ti.callID]
@@ -58,13 +61,17 @@ func microCompact(msgs []llm.Message) {
 				name = "unknown"
 			}
 			msgs[ti.index] = llm.ToolMessage(fmt.Sprintf("[cleared: %s]", name), ti.callID)
+			cleared++
 		}
 	}
+	return cleared
 }
 
 // autoCompact saves transcript to disk and replaces messages with an LLM summary.
 // Writes a checkpoint to HistoryStore so restarts resume from the summary.
 func autoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Message {
+	origCount := len(msgs)
+	origTokens := estimateTokens(msgs)
 	tDir := filepath.Join(app.SessionManager.Active().Dir(), session.SessionTranscriptsDir)
 	os.MkdirAll(tDir, 0o755)
 	tPath := filepath.Join(tDir, fmt.Sprintf("transcript_%d.jsonl", time.Now().Unix()))
@@ -82,7 +89,7 @@ func autoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 	if len(convText) > 80000 {
 		convText = convText[:80000]
 	}
-	resp, err := llm.CallLLMWithRetry(ctx, "compress", llm.CallParams{
+	resp, err := llm.NewClient(nil).CallWithRetry(ctx, "compress", llm.CallParams{
 		Model:    model,
 		Messages: []llm.Message{llm.UserMessage("Summarize for continuity:\n" + convText)},
 	})
@@ -102,6 +109,10 @@ func autoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 			log.PrintSystem(fmt.Sprintf("[history] checkpoint saved (covered %d entries)", covered))
 		}
 	}
+
+	log.PrintDecision("context", fmt.Sprintf(
+		"compacted %d messages (~%d tokens) into a %d-char summary; full transcript kept at %s",
+		origCount, origTokens, len(summary), tPath))
 
 	return []llm.Message{
 		llm.SystemMessage(sys),

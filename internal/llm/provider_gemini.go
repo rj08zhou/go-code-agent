@@ -40,4 +40,7 @@ func (p *geminiProvider) Stream(ctx context.Context, _ CallParams, _ StreamSink)
 
 func init() {
 	RegisterProvider(&geminiProvider{})
+	// Builder ignores credentials until the SDK is wired up; it exists
+	// so JUDGE_PROVIDER=gemini resolves here instead of nil.
+	RegisterProviderBuilder("gemini", func(_, _ string) Provider { return &geminiProvider{} })
 }
