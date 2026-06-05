@@ -64,11 +64,12 @@ func (ds *DAGScheduler) AddEdge(from, to int) string {
 
 	fromTask, err := ds.taskMgr.loadLocked(from)
 	if err != nil {
-		return err.Error()
+		// 返回用户友好的错误信息，便于 Agent 解析
+		return fmt.Sprintf("Error: task #%d does not exist", from)
 	}
 	toTask, err := ds.taskMgr.loadLocked(to)
 	if err != nil {
-		return err.Error()
+		return fmt.Sprintf("Error: task #%d does not exist", to)
 	}
 	if from == to {
 		return "Error: a task cannot depend on itself"
@@ -102,6 +103,14 @@ func (ds *DAGScheduler) AddEdge(from, to int) string {
 func (ds *DAGScheduler) RemoveEdge(from, to int) string {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
+
+	// 验证任务是否存在
+	if _, err := ds.taskMgr.loadLocked(from); err != nil {
+		return fmt.Sprintf("Error: task #%d does not exist", from)
+	}
+	if _, err := ds.taskMgr.loadLocked(to); err != nil {
+		return fmt.Sprintf("Error: task #%d does not exist", to)
+	}
 
 	edges := ds.loadEdges()
 	found := false
@@ -287,6 +296,10 @@ func (ds *DAGScheduler) TopoView() string {
 			t := taskInfo[id]
 			st, _ := t["status"].(string)
 			sub, _ := t["subject"].(string)
+			// 修复：处理空 subject 的情况
+			if strings.TrimSpace(sub) == "" {
+				sub = "(no subject)"
+			}
 			mk := markers[st]
 			if mk == "" {
 				mk = "[?]"

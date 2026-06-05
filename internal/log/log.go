@@ -1,13 +1,28 @@
 package log
 
 import (
+	"context"
 	"fmt"
-	"go-code-agent/utils"
+	"log/slog"
 	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
-// Unified output functions - consistent colored terminal output
+// LogEntry remains exported for backward compatibility with the
+// previous fileSink-based persistence path. New code should rely on
+// slog handlers (see SetFileHandler).
+type LogEntry struct {
+	TS      string `json:"ts"`
+	Level   string `json:"level"`
+	Message string `json:"message"`
+}
 
+// ANSI color codes — kept exported because some callers (and tests)
+// reach for them directly. New code should NOT format with these
+// manually; emit through Print* helpers and the ConsoleHandler decides
+// whether to apply color based on the destination writer.
 const (
 	ColorReset   = "\033[0m"
 	ColorGreen   = "\033[32m"
@@ -20,76 +35,220 @@ const (
 	ColorMagenta = "\033[35m"
 )
 
-// PrintAgent prints the LLM's final response in green.
-func PrintAgent(msg string) {
-	fmt.Printf("%s%s%s\n", ColorGreen, msg, ColorReset)
+// ---- logger plumbing ----------------------------------------------------
+//
+// The package keeps two slog handlers: one for the terminal (always on,
+// color-aware via ConsoleHandler), one optional file handler installed
+// by the cmd layer once a session is bootstrapped. They are combined
+// through a MultiHandler so every Print* call hits both sinks.
+//
+// The active logger is held in an atomic.Pointer so swapping sinks
+// (e.g. on session switch) is lock-free for hot path reads.
+
+var (
+	consoleHandler slog.Handler = NewConsoleHandler(os.Stdout)
+	fileHandler    atomic.Pointer[slog.Handler]
+	loggerPtr      atomic.Pointer[slog.Logger]
+	rebuildMu      sync.Mutex
+)
+
+func init() {
+	rebuildLogger()
 }
 
-// PrintAgentBegin starts streaming output in green (no newline).
+// rebuildLogger reconstructs the active slog.Logger from the current
+// console + file handler pair and atomically publishes it.
+func rebuildLogger() {
+	rebuildMu.Lock()
+	defer rebuildMu.Unlock()
+
+	handlers := []slog.Handler{consoleHandler}
+	if fh := fileHandler.Load(); fh != nil {
+		handlers = append(handlers, *fh)
+	}
+	logger := slog.New(NewMultiHandler(handlers...))
+	loggerPtr.Store(logger)
+}
+
+// logger returns the currently-installed slog.Logger.
+func logger() *slog.Logger {
+	return loggerPtr.Load()
+}
+
+// SetFileHandler installs (or clears, when h is nil) the slog handler
+// receiving every Print* call in addition to the console. Typical use
+// is slog.NewJSONHandler(file, nil) so records become JSONL.
+//
+// The cmd layer calls this once per session bootstrap; subsequent
+// session switches re-call it with a handler bound to the new file.
+func SetFileHandler(h slog.Handler) {
+	if h == nil {
+		fileHandler.Store(nil)
+	} else {
+		fileHandler.Store(&h)
+	}
+	rebuildLogger()
+}
+
+// ---- legacy fileSink shim ----------------------------------------------
+//
+// Earlier revisions exposed SetFileSink(func(LogEntry)) for callers
+// that wanted the raw entry. We keep the signature alive so existing
+// integration code keeps compiling, but route entries through the same
+// emit path. New callers should prefer SetFileHandler.
+
+var (
+	fileSink func(LogEntry)
+	sinkMu   sync.Mutex
+)
+
+// SetFileSink retains the legacy callback API. Prefer SetFileHandler
+// for new code. Pass nil to disable.
+func SetFileSink(fn func(LogEntry)) {
+	sinkMu.Lock()
+	defer sinkMu.Unlock()
+	fileSink = fn
+}
+
+// fanoutLegacy mirrors a record to the legacy callback (if installed),
+// preserving best-effort semantics: a panic in the user-supplied sink
+// must never crash the agent loop.
+func fanoutLegacy(level, msg string) {
+	sinkMu.Lock()
+	fn := fileSink
+	sinkMu.Unlock()
+	if fn == nil {
+		return
+	}
+	defer func() { recover() }()
+	fn(LogEntry{
+		TS:      nowRFC3339(),
+		Level:   level,
+		Message: msg,
+	})
+}
+
+// nowRFC3339 is split out to a tiny helper for symmetry with the old
+// fileSink path that stamped TS in RFC3339.
+func nowRFC3339() string {
+	return time.Now().Format(time.RFC3339)
+}
+
+// ---- streaming agent buffer --------------------------------------------
+// PrintAgentBegin/Delta/End run sequentially during streaming. We
+// buffer the full text so we can emit one slog record on End — the
+// console already saw the live characters via direct stdout writes.
+var agentBuf []byte
+
+// ---- Print* helpers ----------------------------------------------------
+
+// PrintAgent prints the LLM's final response in green (one-shot, not
+// streamed).
+func PrintAgent(msg string) {
+	logger().LogAttrs(context.Background(), slog.LevelInfo, msg,
+		slog.String("kind", "agent"))
+	fanoutLegacy("agent", msg)
+}
+
+// PrintAgentBegin starts streaming output: emit the green ANSI prefix
+// directly and reset the buffer. ConsoleHandler is bypassed because
+// per-token rendering is incompatible with slog's record-oriented model.
 func PrintAgentBegin() {
 	fmt.Print(ColorGreen)
+	agentBuf = nil
 }
 
-// PrintAgentDelta prints a streaming text delta (no newline, no color change).
+// PrintAgentDelta prints one streaming chunk verbatim and accumulates
+// it for the End-time record.
 func PrintAgentDelta(delta string) {
 	fmt.Print(delta)
+	agentBuf = append(agentBuf, []byte(delta)...)
 }
 
-// PrintAgentEnd finishes streaming output with color reset and newline.
+// PrintAgentEnd closes the streaming run with reset+newline and emits
+// one slog record carrying the full text. The "streaming"=true attr
+// tells ConsoleHandler to skip terminal output (live chars already
+// printed); only the file handler will persist it.
 func PrintAgentEnd() {
 	fmt.Println(ColorReset)
+	full := string(agentBuf)
+	logger().LogAttrs(context.Background(), slog.LevelInfo, full,
+		slog.String("kind", "agent"),
+		slog.Bool("streaming", true))
+	fanoutLegacy("agent", full)
+	agentBuf = nil
 }
 
-// PrintTool prints a tool execution result.
+// PrintTool prints a tool execution result (truncated for terminal
+// readability — full text still hits the file handler via the message).
 func PrintTool(name, output string) {
-	fmt.Printf("%s> %s%s: %s\n", ColorYellow, name, ColorReset, utils.Truncate(output, 200))
+	logger().LogAttrs(context.Background(), slog.LevelInfo, name+": "+output,
+		slog.String("kind", "tool"),
+		slog.String("name", name),
+		slog.String("output", output))
+	fanoutLegacy("tool", name+": "+output)
 }
 
 // PrintTeamTool prints a teammate's tool execution result.
 func PrintTeamTool(teammate, name, output string) {
-	fmt.Printf("  %s[%s] %s%s: %s\n", ColorDim, teammate, name, ColorReset, utils.Truncate(output, 120))
+	logger().LogAttrs(context.Background(), slog.LevelInfo, "["+teammate+"] "+name+": "+output,
+		slog.String("kind", "team_tool"),
+		slog.String("teammate", teammate),
+		slog.String("name", name),
+		slog.String("output", output))
+	fanoutLegacy("team_tool", "["+teammate+"] "+name+": "+output)
 }
 
 // PrintSubTool prints a subagent's tool execution result.
 func PrintSubTool(name, output string) {
-	fmt.Printf("  %s[subagent] %s%s: %s\n", ColorCyan, name, ColorReset, utils.Truncate(output, 120))
+	logger().LogAttrs(context.Background(), slog.LevelInfo, "[subagent] "+name+": "+output,
+		slog.String("kind", "sub_tool"),
+		slog.String("name", name),
+		slog.String("output", output))
+	fanoutLegacy("sub_tool", "[subagent] "+name+": "+output)
 }
 
-// PrintSystem prints an informational system message in dim.
+// PrintSystem prints an informational system message.
 func PrintSystem(msg string) {
-	fmt.Printf("%s  %s%s\n", ColorDim, msg, ColorReset)
+	logger().LogAttrs(context.Background(), slog.LevelInfo, msg,
+		slog.String("kind", "system"))
+	fanoutLegacy("system", msg)
 }
 
-// PrintError prints an error message to stderr in red.
+// PrintError prints an error message. We keep stderr as the visible
+// destination by writing directly there in addition to the slog path,
+// because ConsoleHandler points at stdout and shell redirection
+// expectations (2>err.log) must keep working.
 func PrintError(msg string) {
 	fmt.Fprintf(os.Stderr, "%sError: %s%s\n", ColorRed, msg, ColorReset)
+	// Mark streaming=true so ConsoleHandler does not double-print to
+	// stdout; only the file handler records the structured line.
+	logger().LogAttrs(context.Background(), slog.LevelError, msg,
+		slog.String("kind", "error"),
+		slog.Bool("streaming", true))
+	fanoutLegacy("error", msg)
 }
 
-// decisionSink, if set, receives every decision event in addition to the
-// terminal print. The cmd layer wires this to persist a replayable timeline
-// (decisions.jsonl) without coupling this package to session/file internals.
+// ---- decisions ---------------------------------------------------------
+
 var decisionSink func(kind, summary string)
 
-// SetDecisionSink installs a callback invoked for every PrintDecision call.
-// Pass nil to disable persistence. Safe to call once at startup.
+// SetDecisionSink installs a callback invoked for every PrintDecision
+// call (in addition to the regular slog path). Used by the cmd layer
+// to persist decisions.jsonl for replay.
 func SetDecisionSink(fn func(kind, summary string)) {
 	decisionSink = fn
 }
 
-// PrintDecision prints an autonomous-decision event in a distinct, scannable
-// format. These are actions the agent (or the loop) takes on its own —
-// planning, context compaction, memory writes, self-evaluation, reflection —
-// that the user would otherwise not see clearly. Surfacing them gives the user
-// a single, consistent "what did the agent decide on its own" timeline.
-//
-// In addition to printing, the event is forwarded to the decisionSink (if set)
-// so it can be persisted for after-the-fact replay (e.g. via /decisions).
-//
-// kind is a short stable tag, e.g. "plan", "context", "memory", "judge",
-// "reflect". summary is a one-line human description of the decision.
+// PrintDecision prints an autonomous-decision event.
 func PrintDecision(kind, summary string) {
-	fmt.Printf("%s%s◆ [%s]%s %s\n", ColorBold, ColorMagenta, kind, ColorReset, summary)
+	logger().LogAttrs(context.Background(), slog.LevelInfo, summary,
+		slog.String("kind", "decision"),
+		slog.String("tag", kind))
+	fanoutLegacy("decision", "["+kind+"] "+summary)
 	if decisionSink != nil {
 		decisionSink(kind, summary)
 	}
 }
+
+// ---- helpers -----------------------------------------------------------

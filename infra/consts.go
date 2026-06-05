@@ -7,8 +7,8 @@ const AppRootDirName = ".go-code-agent"
 // Project-wide configuration constants. All tunable thresholds and timeouts.
 
 const (
-	StuckThreshold         = 10    // rounds without completing a task = "stuck"
-	ReflectInterval        = 5     // periodic reflection every N tool rounds
+	StuckThreshold         = 20    // rounds without completing a task = "stuck" (raised from 10: 10 fired too often on long multi-step tasks)
+	ReflectInterval        = 20    // periodic reflection every N tool rounds (raised from 10: periodic+stuck were firing ~every 1-2 min)
 	MaxConsecutiveFailures = 3     // same tool failing → force strategy change
 	MaxRounds              = 100   // hard safety cap for agent loop
 	LessonThreshold        = 3     // min tool rounds before auto-lesson prompt
@@ -18,8 +18,8 @@ const (
 )
 
 const (
-	TokenThreshold = 100000 // autoCompact trigger (estimated total tokens)
-	KeepRecent     = 3      // microCompact keeps N most recent tool messages
+	TokenThreshold = 300000 // autoCompact trigger (estimated total tokens) - raised from 200000 to reduce compaction frequency
+	KeepRecent     = 15     // microCompact keeps N most recent tool messages - raised from 10 to retain more context
 	MaxOutputLen   = 500000 // max bytes per tool output (truncation limit, 500KB)
 )
 
@@ -29,10 +29,19 @@ const (
 )
 
 const (
-	LlmMaxRetries     = 3
-	LlmBaseDelay      = 1 * time.Second
-	LlmRateLimitDelay = 5 * time.Second  // 429 专用：更长的基础退避，避免反复触发限流
-	LlmMaxDelay       = 30 * time.Second // 最大退避上限（429 场景需要更长等待）
+	// LlmMaxRetries: most public LLM gateways throttle on a ~60s window;
+	// 3 retries (cumulative ~43s of backoff) cannot reliably outlast that
+	// window. Bumping to 5 pushes the cumulative wait to ~120s, which
+	// covers the typical rate-limit window.
+	LlmMaxRetries = 5
+	LlmBaseDelay  = 1 * time.Second
+	// LlmRateLimitDelay: 429-specific base backoff. Raised from 5s to 10s
+	// so we do not keep retrying inside the same throttle window (which
+	// only earns us another 429).
+	LlmRateLimitDelay = 10 * time.Second
+	// LlmMaxDelay: per-attempt backoff cap. Raised from 30s to 60s to
+	// match the rate-limit window length of typical LLM gateways.
+	LlmMaxDelay = 60 * time.Second
 
 	// LlmCallTimeout caps the wall-clock time of one provider Call/Stream
 	// attempt. Without it a hung backend (e.g. an OpenAI-compatible
@@ -49,6 +58,24 @@ const (
 	// in the normal case; the HTTP timeout is a hard backstop for
 	// whatever ignores ctx (older SDKs, custom transports).
 	LlmHTTPTimeout = 6 * time.Minute
+
+	// Process-wide LLM throttle. Both the main agent and every spawned
+	// subagent / teammate share one token-bucket + concurrency cap so
+	// that fan-out (a reflect that spawns 3 verifiers) cannot overwhelm
+	// the upstream gateway and trigger a 429 storm.
+	//
+	// Defaults are conservative; override via env vars at startup:
+	//   LLM_MAX_QPS         float, requests-per-second  (default 2.0)
+	//   LLM_MAX_BURST       int,   bucket capacity      (default 4)
+	//   LLM_MAX_CONCURRENCY int,   in-flight calls cap  (default 2)
+	LlmDefaultMaxQPS         = 2.0
+	LlmDefaultMaxBurst       = 4
+	LlmDefaultMaxConcurrency = 2
+
+	// SpawnMinInterval throttles teammate Spawn calls so that a single
+	// reflect step that fires off N subagents staggers their first LLM
+	// hit instead of all hitting the gateway at the same instant.
+	SpawnMinInterval = 750 * time.Millisecond
 )
 
 const (

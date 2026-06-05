@@ -3,15 +3,17 @@ module go-code-agent
 go 1.25.3
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.41.0 // indirect
+	github.com/anthropics/anthropic-sdk-go v1.41.0
+	github.com/chzyer/readline v1.5.1
+	github.com/openai/openai-go v1.12.0
+	golang.org/x/time v0.15.0
+)
+
+require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
-	github.com/chzyer/readline v1.5.1 // indirect
-	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
-	github.com/openai/openai-go v1.12.0 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/standard-webhooks/standard-webhooks/libraries v0.0.0-20260427160145-3afa6683f8b2 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect

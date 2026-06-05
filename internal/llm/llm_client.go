@@ -136,6 +136,27 @@ func backoffDelay(attempt int, isRateLimit bool) time.Duration {
 	return d - d/4 + jitter
 }
 
+// retryDelay merges the client-side exponential backoff with any
+// Retry-After hint from the upstream error. We always wait at least
+// the gateway's suggestion (capped at LlmMaxDelay so a hostile or
+// buggy server can't pin us forever) so we don't burn another retry
+// inside the same throttle window.
+func retryDelay(attempt int, err error) (time.Duration, time.Duration) {
+	rateLimited := isRateLimitError(err)
+	backoff := backoffDelay(attempt, rateLimited)
+	hint := retryAfterFromError(err)
+	if hint <= 0 {
+		return backoff, 0
+	}
+	if hint > infra.LlmMaxDelay {
+		hint = infra.LlmMaxDelay
+	}
+	if hint > backoff {
+		return hint, hint
+	}
+	return backoff, hint
+}
+
 // isRateLimitError checks if an error is a 429 rate-limit error by inspecting
 // the error message. This is provider-agnostic.
 func isRateLimitError(err error) bool {
@@ -173,8 +194,16 @@ func (c *Client) CallWithRetry(ctx context.Context, source string, params CallPa
 	if c.provider == nil {
 		return nil, fmt.Errorf("no active LLM provider")
 	}
+	lim := getLimiter()
 	var lastErr error
 	for attempt := 0; attempt <= infra.LlmMaxRetries; attempt++ {
+		// Process-wide throttle: bound QPS and parallelism BEFORE we
+		// hit the wire. release() runs even on error so a failing
+		// attempt still frees its concurrency slot.
+		release, acqErr := lim.Acquire(ctx)
+		if acqErr != nil {
+			return nil, acqErr
+		}
 		started := time.Now()
 		// Per-attempt deadline. Without this a hung backend (e.g. an
 		// OpenAI-compatible gateway holding the SSE socket open without
@@ -183,6 +212,7 @@ func (c *Client) CallWithRetry(ctx context.Context, source string, params CallPa
 		attemptCtx, cancel := context.WithTimeout(ctx, infra.LlmCallTimeout)
 		resp, err := c.provider.Call(attemptCtx, params)
 		cancel()
+		release()
 		if err == nil {
 			traceID := GetTraceID(ctx)
 			if usageRecordFn != nil {
@@ -200,9 +230,8 @@ func (c *Client) CallWithRetry(ctx context.Context, source string, params CallPa
 		if !isRetriableLLMError(c.provider, err) || attempt == infra.LlmMaxRetries {
 			return nil, err
 		}
-		delay := backoffDelay(attempt, isRateLimitError(err))
-		log.PrintSystem(fmt.Sprintf("[llm-retry] attempt %d/%d failed: %v - retrying in %s",
-			attempt+1, infra.LlmMaxRetries, truncateErr(err), delay.Round(100*time.Millisecond)))
+		delay, hint := retryDelay(attempt, err)
+		logRetryAttempt(attempt, err, delay, hint)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -222,8 +251,13 @@ func (c *Client) StreamWithRetrySink(ctx context.Context, source string, params 
 	if c.provider == nil {
 		return nil, fmt.Errorf("no active LLM provider")
 	}
+	lim := getLimiter()
 	var lastErr error
 	for attempt := 0; attempt <= infra.LlmMaxRetries; attempt++ {
+		release, acqErr := lim.Acquire(ctx)
+		if acqErr != nil {
+			return nil, acqErr
+		}
 		started := time.Now()
 		// Per-attempt deadline. Streaming calls can hang mid-response
 		// when an upstream gateway stops emitting chunks; without this
@@ -231,6 +265,7 @@ func (c *Client) StreamWithRetrySink(ctx context.Context, source string, params 
 		attemptCtx, cancel := context.WithTimeout(ctx, infra.LlmCallTimeout)
 		sr, err := c.provider.Stream(attemptCtx, params, sink)
 		cancel()
+		release()
 		if err == nil {
 			traceID := GetTraceID(ctx)
 			if usageRecordFn != nil {
@@ -256,9 +291,8 @@ func (c *Client) StreamWithRetrySink(ctx context.Context, source string, params 
 		if !isRetriableLLMError(c.provider, err) || attempt == infra.LlmMaxRetries {
 			return nil, err
 		}
-		delay := backoffDelay(attempt, isRateLimitError(err))
-		log.PrintSystem(fmt.Sprintf("[llm-retry] attempt %d/%d failed: %v - retrying in %s",
-			attempt+1, infra.LlmMaxRetries, truncateErr(err), delay.Round(100*time.Millisecond)))
+		delay, hint := retryDelay(attempt, err)
+		logRetryAttempt(attempt, err, delay, hint)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -268,11 +302,41 @@ func (c *Client) StreamWithRetrySink(ctx context.Context, source string, params 
 	return nil, lastErr
 }
 
-// truncateErr shortens error messages for logging.
-func truncateErr(err error) string {
-	s := err.Error()
-	if len(s) > 120 {
-		return s[:120] + "..."
+// logRetryAttempt emits a structured retry diagnostic. Unlike the old
+// version which truncated the error and dropped the Retry-After value,
+// it now records:
+//   - attempt index / cap
+//   - the chosen wait duration
+//   - any server-supplied Retry-After hint (so 1302/1305 etc. become
+//     greppable in session.log)
+//   - a longer-but-still-bounded slice of the error message, instead
+//     of the previous 120-char head that often cut off the upstream
+//     JSON code.
+func logRetryAttempt(attempt int, err error, delay, hint time.Duration) {
+	body := errSnippet(err, 400)
+	if hint > 0 {
+		log.PrintSystem(fmt.Sprintf("[llm-retry] attempt %d/%d failed (retry_after=%s, waiting %s): %s",
+			attempt+1, infra.LlmMaxRetries, hint.Round(100*time.Millisecond),
+			delay.Round(100*time.Millisecond), body))
+		return
 	}
-	return s
+	log.PrintSystem(fmt.Sprintf("[llm-retry] attempt %d/%d failed (waiting %s): %s",
+		attempt+1, infra.LlmMaxRetries, delay.Round(100*time.Millisecond), body))
+}
+
+// errSnippet returns a length-bounded view of err's message, preserving
+// enough tail for upstream JSON codes (e.g. {"code":"1302",...}) to
+// remain visible. Short errors are returned verbatim.
+func errSnippet(err error, max int) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if len(s) <= max {
+		return s
+	}
+	// Keep both head and tail so we still see "429 Too Many Requests"
+	// at the start AND the {"code":...} payload at the end.
+	half := (max - 5) / 2
+	return s[:half] + " ... " + s[len(s)-half:]
 }

@@ -60,6 +60,24 @@ export MODEL_ID="glm-4.7-flash"
 # Force provider regardless of MODEL_ID prefix
 export LLM_PROVIDER="anthropic"  # openai | anthropic | gemini
 ./agent
+
+# Enable LLM-as-Judge with default settings
+export JUDGE_ENABLED=1
+./agent
+
+# Enable Judge with custom model and threshold
+export JUDGE_ENABLED=1
+export JUDGE_MODEL=claude-haiku-4.5
+export JUDGE_MIN_SCORE=8
+./agent
+
+# Use a separate LLM service for judging (e.g., cheaper/faster model)
+export JUDGE_ENABLED=1
+export JUDGE_PROVIDER=openai
+export JUDGE_API_KEY="<judge-api-key>"
+export JUDGE_BASE_URL="https://api.deepseek.com"
+export JUDGE_MODEL="deepseek-chat"
+./agent
 ```
 
 ### Session Management
@@ -73,13 +91,9 @@ export LLM_PROVIDER="anthropic"  # openai | anthropic | gemini
 ### Optional Features
 
 ```bash
-# LLM-as-Judge: post-completion verification (configured via JUDGE_* env vars)
+# LLM-as-Judge: post-completion verification
+# (See "Running" section above for full configuration examples)
 JUDGE_ENABLED=1 ./agent
-JUDGE_ENABLED=1 JUDGE_MODEL=claude-haiku-4.5 JUDGE_MIN_SCORE=8 ./agent
-
-# Point the judge at a separate / cheaper endpoint
-JUDGE_ENABLED=1 JUDGE_PROVIDER=openai JUDGE_API_KEY=<key> \
-  JUDGE_BASE_URL=https://api.deepseek.com JUDGE_MODEL=deepseek-chat ./agent
 
 # Human-in-the-loop approval for high-risk operations
 ./agent --human
@@ -88,6 +102,8 @@ JUDGE_ENABLED=1 JUDGE_PROVIDER=openai JUDGE_API_KEY=<key> \
 # Git-stash-based snapshot/rollback for write tools
 SNAPSHOT_ENABLED=1 ./agent
 ```
+
+**💡 Judge Configuration**: For detailed judge setup (custom model, separate endpoint, etc.), refer to the [Running](#running) section which shows full `export` command examples.
 
 All persistent state is stored under `{workdir}/.go-code-agent/`. Sessions survive across restarts and crashes.
 
@@ -236,7 +252,7 @@ Session End:
 
 ### LLM-as-Judge Env Vars
 
-The judge is configured entirely through environment variables (no CLI flags):
+The judge is configured entirely through environment variables (no CLI flags). The judge can use a separate LLM backend with its own model, API key, and endpoint:
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
@@ -246,6 +262,16 @@ The judge is configured entirely through environment variables (no CLI flags):
 | `JUDGE_PROVIDER` | inferred | Explicit backend SDK (`openai` / `anthropic` / `gemini`) |
 | `JUDGE_API_KEY` | main key | Judge-only key (else the backend's standard key) |
 | `JUDGE_BASE_URL` | main url | Judge-only endpoint (else the backend's standard url) |
+
+**Judge Provider Resolution:**
+
+The judge uses `llm.JudgeProvider()` to dynamically select the LLM backend at runtime:
+
+1. **No JUDGE_* vars set** → Uses the same provider as the main agent (preserves backward compatibility)
+2. **JUDGE_API_KEY or JUDGE_BASE_URL set** → Creates an isolated provider instance with dedicated credentials
+3. **Only JUDGE_PROVIDER set** → Reuses the shared provider instance of that backend type
+
+This allows the judge to run on a different (often cheaper) model or even a completely separate LLM service without affecting the main agent's configuration.
 
 ### Tunable Constants (infra/consts.go)
 
@@ -260,8 +286,8 @@ All thresholds are centralized in one file for easy tuning:
 | | LessonThreshold | 3 | Min rounds before auto-lesson |
 | | SubagentMaxRounds | 30 | Subagent inner loop cap |
 | | TeammateWorkMaxRounds | 50 | Teammate work phase cap |
-| **Tokens** | TokenThreshold | 100,000 | autoCompact trigger |
-| | KeepRecent | 3 | microCompact keeps N recent tool msgs |
+| **Tokens** | TokenThreshold | 200,000 | autoCompact trigger |
+| | KeepRecent | 10 | microCompact keeps N recent tool msgs |
 | | MaxOutputLen | 50,000 | Max bytes per tool output |
 | | TokenCheckInterval | 3 | Re-check tokens every N rounds |
 | **Timing** | PerToolTimeout | 5 min | Hard ceiling per tool handler |
@@ -414,10 +440,15 @@ go-code-agent/
 | Tool | Description |
 |------|-------------|
 | `bash` | Execute shell commands (allowlist-gated, 120s timeout) |
-| `read_file` | Read file contents with optional line range |
+| `read_file` | Read file contents with optional line limit (optimized: buffered reading, memory-efficient) |
 | `write_file` | Create/overwrite a file (diff preview shown) |
-| `edit_file` | Surgical edit with search/replace (diff preview shown) |
+| `edit_file` | Surgical edit with search/replace (optimized: line-by-line processing, diff shown for files < 500KB) |
 | `delete_file` | Delete a file (requires confirmation if HITL enabled) |
+
+**Performance Optimizations**:
+- `read_file`: Uses `bufio.Scanner` for memory-efficient line-by-line reading. Stops early when line limit is reached.
+- `edit_file`: Processes files line-by-line instead of loading entire file into memory. Only generates diff preview for files < 500KB to avoid performance degradation on large files.
+- Both tools use dynamic buffer allocation and early-exit strategies for optimal performance.
 
 ### Reasoning
 

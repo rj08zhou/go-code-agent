@@ -41,6 +41,16 @@ type TeammateManager struct {
 	dagSched   *task.DAGScheduler
 	tasksDir   string
 	protocols  *team.ProtocolStore
+
+	// spawnMu serializes Spawn calls and lastSpawn enforces a minimum
+	// gap between consecutive spawns. A reflect step that decides to
+	// fan out 3 subagents would otherwise launch their goroutines (and
+	// their first LLM hits) within microseconds of each other,
+	// defeating the LLM token-bucket and inviting 429s. Staggering by
+	// SpawnMinInterval lets the upstream gateway's bucket refill
+	// between hits.
+	spawnMu   sync.Mutex
+	lastSpawn time.Time
 }
 
 func NewTeamMgr(dir string, bus *team.MessageBus, taskMgr *task.TaskManager, dagSched *task.DAGScheduler, tasksDir string, protocols *team.ProtocolStore) *TeammateManager {
@@ -82,6 +92,26 @@ func (tm *TeammateManager) setStatus(name, status string) {
 }
 
 func (tm *TeammateManager) Spawn(ctx context.Context, name, role, prompt string) string {
+	// Stagger consecutive spawns. Cheap per-process serialization: even
+	// when callers issue several Spawn() back-to-back from one reflect
+	// step, the goroutines start at least SpawnMinInterval apart so
+	// their first LLM calls don't all hit the gateway at the same
+	// instant. The wait is bounded by ctx.
+	tm.spawnMu.Lock()
+	if !tm.lastSpawn.IsZero() {
+		gap := time.Since(tm.lastSpawn)
+		if wait := infra.SpawnMinInterval - gap; wait > 0 {
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				tm.spawnMu.Unlock()
+				return fmt.Sprintf("Error: spawn cancelled: %v", ctx.Err())
+			}
+		}
+	}
+	tm.lastSpawn = time.Now()
+	tm.spawnMu.Unlock()
+
 	tm.mu.Lock()
 	idx := tm.findIndex(name)
 	if idx >= 0 {
@@ -122,13 +152,29 @@ func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, promp
 	)
 
 	// writeTools require an approved plan before execution.
+	// Note: `bash` is conditional — read-only inspection commands
+	// (ls/cat/find/grep/...) are exempted via IsReadOnlyBash so that
+	// read-only verifier subagents can run them without first going
+	// through submit_plan. See cmd/agent/security.go.
 	writeTools := map[string]bool{"bash": true, "write_file": true, "edit_file": true}
 	baseHandlers := coreToolHandlers()
 
 	execTool := func(toolName string, raw json.RawMessage) llm.ToolResult {
 		// Gate: block write operations until plan is approved.
 		if writeTools[toolName] && !team.HasApprovedPlan(tm.protocols, name) {
-			return llm.MkErr("You must submit_plan and get lead approval before executing write operations.")
+			// Carve out read-only bash invocations.
+			if toolName == "bash" {
+				var args struct {
+					Command string `json:"command"`
+				}
+				if err := json.Unmarshal(raw, &args); err == nil && IsReadOnlyBash(args.Command) {
+					// Fall through; treat as a non-write tool call.
+				} else {
+					return llm.MkErr("You must submit_plan and get lead approval before executing write operations.")
+				}
+			} else {
+				return llm.MkErr("You must submit_plan and get lead approval before executing write operations.")
+			}
 		}
 		// Try shared base handlers first.
 		if h, ok := baseHandlers[toolName]; ok {

@@ -69,6 +69,12 @@ type loopState struct {
 	// last-known token estimate, refreshed every tokenCheckInterval rounds
 	cachedTokens   int
 	cachedTokensAt int // toolRounds value when cachedTokens was computed
+
+	// reflectLastTriggered records the toolRounds value at which each
+	// reflection trigger kind last fired. Used by reflect() to
+	// suppress duplicate prompts within a kind-specific cool-down
+	// window. nil-safe: allocated lazily on first use.
+	reflectLastTriggered map[string]int
 }
 
 // ----------------------------------------------------------------------------
@@ -151,7 +157,7 @@ func agentLoop(ctx context.Context, messages *[]llm.Message) error {
 				*messages = append(*messages, llm.UserMessage(app.PromptLoader.Load("auto_lesson")))
 				continue
 			}
-			return nil
+			return finalizeTurn(st)
 		}
 
 		// 5) Run tools, gathering classification + judge data.
@@ -206,15 +212,32 @@ func agentLoop(ctx context.Context, messages *[]llm.Message) error {
 		}
 
 		// 10) Reflection module (see reflection.go).
-		prompts, resetFailures, resetTodoNag, resetStuck := reflect(
+		if st.reflectLastTriggered == nil {
+			st.reflectLastTriggered = make(map[string]int)
+		}
+		prompts, resetFailures, resetTodoNag, resetStuck, triggered := reflect(
 			st.consecutiveFailures, st.lastFailedTool, infra.MaxConsecutiveFailures,
 			st.toolRounds, st.totalFailures,
 			st.roundsSinceLastComplete, st.roundsWithoutTodo,
 			infra.StuckThreshold, infra.ReflectInterval, app.Todo().HasOpenItems(),
+			st.reflectLastTriggered,
 		)
+		// Record the round at which each kind fired so the next
+		// invocation can honor its cool-down. Only stamp kinds that
+		// actually emitted a prompt this round.
+		for _, kind := range triggered {
+			st.reflectLastTriggered[kind] = st.toolRounds
+		}
 		if len(prompts) > 0 {
-			log.PrintDecision("reflect", fmt.Sprintf("self-correction triggered — injected %d reflection/strategy prompt(s) (consecutiveFailures=%d, roundsSinceComplete=%d)",
-				len(prompts), st.consecutiveFailures, st.roundsSinceLastComplete))
+			// Determine reflection type based on consecutiveFailures
+			reflectKind := "reflection"
+			if st.consecutiveFailures >= infra.MaxConsecutiveFailures {
+				reflectKind = "strategy-change"
+			} else if st.consecutiveFailures > 0 {
+				reflectKind = "self-correction"
+			}
+			log.PrintDecision("reflect", fmt.Sprintf("%s triggered — injected %d reflection/strategy prompt(s) (consecutiveFailures=%d, roundsSinceComplete=%d, kinds=%v)",
+				reflectKind, len(prompts), st.consecutiveFailures, st.roundsSinceLastComplete, triggered))
 		}
 		for _, p := range prompts {
 			*messages = append(*messages, llm.UserMessage(p))
@@ -240,10 +263,31 @@ func agentLoop(ctx context.Context, messages *[]llm.Message) error {
 		if st.lessonsWritten {
 			st.lessonRoundsRemaining--
 			if st.lessonRoundsRemaining <= 0 {
-				return nil
+				return finalizeTurn(st)
 			}
 		}
 	}
+}
+
+// finalizeTurn emits a concise end-of-turn summary so the user can see
+// the loop completed a full request cycle instead of silently dropping
+// back to the prompt. It is the single normal-completion exit: every
+// non-error `return nil` from agentLoop should flow through here so the
+// closing signal stays consistent across exit paths.
+func finalizeTurn(st *loopState) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "turn complete — %d tool round(s)", st.toolRounds)
+	if st.totalFailures > 0 {
+		fmt.Fprintf(&b, ", %d tool failure(s)", st.totalFailures)
+	}
+	if app != nil && app.DagSched() != nil {
+		if ps := app.DagSched().ProgressSummary(); ps != "" {
+			b.WriteString(" — ")
+			b.WriteString(ps)
+		}
+	}
+	log.PrintDecision("turn", b.String())
+	return nil
 }
 
 // ----------------------------------------------------------------------------
@@ -252,14 +296,15 @@ func agentLoop(ctx context.Context, messages *[]llm.Message) error {
 
 // preRound: token compression, drain background notifications, pull inbox.
 func preRound(ctx context.Context, messages *[]llm.Message, st *loopState) {
-	// micro-compact is in-place and cheap; safe to run every round.
-	// Surface a decision event when it actually folds something — this
-	// used to be completely silent, so the user had no idea old tool
-	// results were being dropped from context.
-	if cleared := microCompact(*messages); cleared > 0 {
-		log.PrintDecision("context", fmt.Sprintf(
-			"micro-compacted %d old tool result(s) out of context (kept most recent %d)",
-			cleared, infra.KeepRecent))
+	// micro-compact: only run every N rounds to avoid excessive context loss.
+	// Surface a decision event when it actually folds something.
+	const microCompactInterval = 6 // run microCompact every 6 rounds (raised from 3: was compacting ~1x/min, too noisy)
+	if st.toolRounds%microCompactInterval == 0 {
+		if cleared := microCompact(*messages); cleared > 0 {
+			log.PrintDecision("context", fmt.Sprintf(
+				"micro-compacted %d old tool result(s) out of context (kept most recent %d)",
+				cleared, infra.KeepRecent))
+		}
 	}
 
 	if st.toolRounds-st.cachedTokensAt >= infra.TokenCheckInterval || st.cachedTokens == 0 {
