@@ -144,6 +144,7 @@ func main() {
 		os.Exit(1)
 	}
 	llm.SetProvider(prov)
+	log.PrintSystem(fmt.Sprintf("[llm-throttle] %s", llm.DescribeLimiter()))
 
 	// ---- Session ----
 	promptsDir := utils.JoinWorkdir(workdir, "prompts")
@@ -190,6 +191,10 @@ func main() {
 	// decisions.jsonl for after-the-fact replay via /decisions.
 	initDecisionLog()
 
+	// Persist all Print* calls (agent, tool, system, error, decision…)
+	// to the active session's session.log for after-the-fact review.
+	initFileLog()
+
 	// ---- Judge + HITL ----
 	// The judge is configured entirely via JUDGE_* env vars so its model,
 	// endpoint and credentials live in one place (see judgeConfigFromEnv
@@ -223,6 +228,7 @@ func main() {
 	go func() {
 		<-sigCh
 		fmt.Println("\n[cleaning up...]")
+		shutdownFileLog()
 		shutdownTeammates()
 		if app != nil && app.SessionManager.Active() != nil {
 			app.SessionManager.Deactivate(app.SessionManager.Active())

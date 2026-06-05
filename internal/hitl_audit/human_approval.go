@@ -551,8 +551,15 @@ func (h *HITLManager) RequestApproval(req HITLRequest) HITLResponse {
 func (h *HITLManager) decide(req HITLRequest, mode HITLMode) HITLResponse {
 	switch mode {
 	case HITLModeAutoApprove:
-		log.PrintSystem(fmt.Sprintf("[hitl] auto-approve: %s (%s) - %s",
-			req.ToolName, req.RiskLevel, req.Reason))
+		// Only surface high-risk approvals on the console; low/medium are
+		// pure noise in auto-approve mode (e.g. routine `bash` calls that
+		// merely "require review"). The full trail — including low/medium —
+		// is still persisted to hitl_audit.jsonl by RequestApproval, so the
+		// audit record is never lost; we only quiet the interactive output.
+		if req.RiskLevel == "high" {
+			log.PrintSystem(fmt.Sprintf("[hitl] auto-approve: %s (%s) - %s",
+				req.ToolName, req.RiskLevel, req.Reason))
+		}
 		return HITLResponse{Decision: HITLApprove}
 
 	case HITLModeAutoReject:

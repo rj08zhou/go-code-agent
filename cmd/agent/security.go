@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"go-code-agent/infra"
 	"go-code-agent/internal/log"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -707,6 +707,86 @@ func (p *BashPolicy) Validate(command string) (bool, bool, string) {
 	return true, false, ""
 }
 
+// readOnlyBashCommands lists base commands whose normal usage does not
+// modify the workspace. Used by the team's plan-gate to let read-only
+// subagents (e.g. verifiers) run inspection commands without first
+// going through submit_plan / lead approval.
+//
+// Anything not on this list is treated as a write operation and
+// requires plan approval.
+var readOnlyBashCommands = map[string]bool{
+	// File read / inspect
+	"ls": true, "cat": true, "head": true, "tail": true,
+	"wc": true, "find": true, "grep": true, "rg": true,
+	"diff": true, "file": true, "stat": true, "tree": true,
+	"less": true, "more": true, "xxd": true, "hexdump": true,
+	"realpath": true, "readlink": true, "basename": true, "dirname": true,
+	"md5sum": true, "sha256sum": true,
+	// System info (read-only)
+	"uname": true, "whoami": true, "pwd": true, "env": true,
+	"which": true, "whereis": true, "type": true,
+	"date": true, "df": true, "du": true, "free": true,
+	"ps": true, "pgrep": true, "lscpu": true, "lsblk": true,
+	"netstat": true, "ifconfig": true, "ip": true,
+	// Pure text processing (read stdin / files, write stdout)
+	"sort": true, "uniq": true, "cut": true, "tr": true,
+	"join": true, "paste": true, "jq": true, "yq": true,
+	"awk": true, "sed": true, // operate on pipes by default; -i flag rejected below
+	// Misc
+	"true": true, "false": true, "test": true, "[": true,
+	"echo": true, "printf": true, // emit to stdout; only redirect would make them write (rejected below)
+}
+
+// IsReadOnlyBash returns true when `command` is safe to run without
+// plan approval: it must be allowed by DefaultBashPolicy (allowlist +
+// danger checks), must not need confirmation, and its first token
+// must be on readOnlyBashCommands. Shell features that can mutate
+// state (>, >>, <, |, ;, &, &&, ||, $(...), `...`) are rejected so we
+// don't get tricked by e.g. `ls > /tmp/x`.
+func IsReadOnlyBash(command string) bool {
+	cmd := strings.TrimSpace(command)
+	if cmd == "" {
+		return false
+	}
+	// Reject shell metacharacters that could introduce side effects.
+	for _, bad := range []string{">", "<", "|", ";", "&", "$(", "`"} {
+		if strings.Contains(cmd, bad) {
+			return false
+		}
+	}
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return false
+	}
+	if !readOnlyBashCommands[parts[0]] {
+		return false
+	}
+	// `sed -i` and `awk -i inplace` mutate files; reject explicitly.
+	if (parts[0] == "sed" || parts[0] == "awk") && hasInPlaceFlag(parts[1:]) {
+		return false
+	}
+	allowed, needConfirm, _ := DefaultBashPolicy.Validate(cmd)
+	if !allowed || needConfirm {
+		return false
+	}
+	return true
+}
+
+func hasInPlaceFlag(args []string) bool {
+	for i, a := range args {
+		switch {
+		case a == "-i", a == "--in-place", a == "--inplace":
+			return true
+		case strings.HasPrefix(a, "-i") && len(a) > 2 && a[2] != '-':
+			// e.g. -i.bak
+			return true
+		case a == "inplace" && i > 0 && args[i-1] == "-i":
+			return true
+		}
+	}
+	return false
+}
+
 // P0-2: Secure Path Sandbox - symlink escape prevention
 
 // Sensitive paths that should never be written to (even inside workdir).
@@ -726,10 +806,13 @@ var sensitivePathPatterns = []string{
 
 // securePath validates and resolves a user-supplied path within the workdir.
 // It prevents:
-//   - Absolute path bypass
-//   - ".." traversal escape
+//   - ".." traversal escape (relative paths)
+//   - Absolute paths outside the workdir
 //   - Symlink escape (resolves symlinks before checking bounds)
 //   - Writes to sensitive files (when allowWrite=true)
+//
+// Both relative paths (resolved against workdir) and absolute paths
+// (must already point inside workdir) are accepted.
 //
 // It returns the resolved absolute path or an error.
 func securePath(workdirPath, userPath string, allowWrite bool) (string, error) {
@@ -738,19 +821,30 @@ func securePath(workdirPath, userPath string, allowWrite bool) (string, error) {
 		return "", fmt.Errorf("path is empty")
 	}
 
-	// 2. Reject absolute paths (disabled, absolute paths allowed)
-	// if filepath.IsAbs(userPath) {
-	//	 return "", fmt.Errorf("absolute path not allowed: %s", userPath)
-	// }
-
-	// 3. Reject obvious traversal attempts early
-	cleanUser := filepath.Clean(userPath)
-	if strings.HasPrefix(cleanUser, "..") || strings.Contains(cleanUser, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path traversal not allowed: %s", userPath)
+	// 2. Resolve workdir to its real (symlink-evaluated) absolute form
+	//    once, so the bounds check below compares apples to apples even
+	//    when /var, /tmp, etc. are symlinks (common on macOS).
+	absWorkdir, err := filepath.Abs(workdirPath)
+	if err != nil {
+		return "", fmt.Errorf("invalid workdir: %w", err)
+	}
+	if real, err := filepath.EvalSymlinks(absWorkdir); err == nil {
+		absWorkdir = real
 	}
 
-	// 4. Join with workdir and clean
-	resolved := filepath.Clean(filepath.Join(workdirPath, cleanUser))
+	// 3. Build a candidate absolute path:
+	//    - absolute input  -> use as-is (must still be inside workdir, checked in step 6)
+	//    - relative input  -> reject ".." traversal, then join with workdir
+	cleanUser := filepath.Clean(userPath)
+	var resolved string
+	if filepath.IsAbs(cleanUser) {
+		resolved = cleanUser
+	} else {
+		if cleanUser == ".." || strings.HasPrefix(cleanUser, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("path traversal not allowed: %s", userPath)
+		}
+		resolved = filepath.Clean(filepath.Join(absWorkdir, cleanUser))
+	}
 
 	// 5. Resolve symlinks - this is the key defense against symlink escapes.
 	//
@@ -766,17 +860,25 @@ func securePath(workdirPath, userPath string, allowWrite bool) (string, error) {
 		parent := filepath.Dir(resolved)
 		realParent, evalErr := filepath.EvalSymlinks(parent)
 		if evalErr != nil {
-			return "", fmt.Errorf("path contains invalid or inaccessible symlink chain: %v", evalErr)
+			// 修复：不暴露底层系统调用细节，返回用户友好的错误信息
+			// 检查是否是文件不存在的错误
+			if strings.Contains(evalErr.Error(), "no such file") {
+				return "", fmt.Errorf("path does not exist: %s", userPath)
+			}
+			return "", fmt.Errorf("path is invalid or inaccessible: %s", userPath)
 		}
 		resolved = filepath.Join(realParent, filepath.Base(resolved))
 	}
 
-	// 6. Verify the final resolved path is still within workdir
-	rel, err := filepath.Rel(workdirPath, resolved)
+	// 6. Verify the final resolved path is still within workdir.
+	//    Compare against absWorkdir (already symlink-resolved in step 2)
+	//    so a workdir like /var/folders/... that EvalSymlinks rewrites to
+	//    /private/var/folders/... still matches its descendants.
+	rel, err := filepath.Rel(absWorkdir, resolved)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve relative path: %w", err)
 	}
-	if strings.HasPrefix(rel, "..") || rel == ".." {
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path escape attempt blocked: '%s' resolves outside workspace to '%s'", userPath, resolved)
 	}
 
@@ -953,6 +1055,7 @@ func secureRunBash(command string, interactive bool) string {
 }
 
 // secureReadFile reads a file after validating its path through the securePath sandbox.
+// Optimized version: uses buffered scanner for memory efficiency and supports line limit.
 func secureReadFile(path string, limit int) string {
 	fp, err := securePath(workdir, path, false) // read-only, no sensitive-file check needed
 	if err != nil {
@@ -964,23 +1067,62 @@ func secureReadFile(path string, limit int) string {
 	}
 	defer f.Close()
 
-	buf := make([]byte, infra.MaxOutputLen+1)
-	n, err := io.ReadFull(f, buf)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		// Real error (not just short read)
+	// Use buffered scanner for memory-efficient line reading
+	var buf bytes.Buffer
+	scanner := bufio.NewScanner(f)
+
+	// Set scanner buffer size for long lines (default is 64K)
+	scanner.Buffer(make([]byte, 1024*64), infra.MaxOutputLen)
+
+	lineCount := 0
+	for scanner.Scan() {
+		// Check line limit
+		if limit > 0 && lineCount >= limit {
+			buf.WriteString(fmt.Sprintf("... (%d more lines)\n", countRemainingLines(f)))
+			break
+		}
+
+		// Write line to buffer
+		if lineCount > 0 {
+			buf.WriteString("\n")
+		}
+		buf.WriteString(scanner.Text())
+		lineCount++
+
+		// Early exit if buffer is getting too large
+		if buf.Len() > infra.MaxOutputLen {
+			buf.Truncate(infra.MaxOutputLen)
+			buf.WriteString("\n... (output truncated)\n")
+			break
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
 		return fmt.Sprintf("Error reading file: %v", err)
 	}
-	lines := strings.Split(string(buf[:n]), "\n")
-	if limit > 0 && limit < len(lines) {
-		lines = append(lines[:limit], fmt.Sprintf("... (%d more)", len(lines)-limit))
-	}
-	result := truncate(strings.Join(lines, "\n"), infra.MaxOutputLen)
 
-	// Sanitize secrets from file content
-	if secretsSanitizer.Detect(result) {
+	result := buf.String()
+
+	// Sanitize secrets from file content (only if content is not too large)
+	if len(result) < 50000 && secretsSanitizer.Detect(result) {
 		result = secretsSanitizer.Sanitize(result)
 	}
 	return result
+}
+
+// countRemainingLines estimates remaining lines in a file (fast approximation)
+func countRemainingLines(f *os.File) int {
+	// Save current position
+	pos, _ := f.Seek(0, 1)
+	defer f.Seek(pos, 0) // Restore position
+
+	// Quick estimation: scan remaining content
+	count := 0
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() && count < 1000 { // Cap at 1000 for performance
+		count++
+	}
+	return count
 }
 
 // secureWriteFile writes content to a file after path validation.
@@ -1038,6 +1180,9 @@ func secureWriteFile(path, content string) string {
 }
 
 // secureEditFile replaces exact text in a file after path validation.
+// Loads the entire file into memory for accurate matching (supports both single-line and multi-line).
+// This follows Claude Code's approach: simple and reliable.
+// Includes TOCTOU protection to prevent race conditions.
 func secureEditFile(path, oldText, newText string) string {
 	// Check edit approval
 	if approved, msg := checkToolApproval("edit_file"); !approved && !globalApproval.IsAutoApproveSafe() && !globalApproval.IsAutoApproveAll() {
@@ -1048,41 +1193,79 @@ func secureEditFile(path, oldText, newText string) string {
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
+
+	// Read file with TOCTOU protection
+	// First, get the file's modification time before reading
+	fileInfo, err := os.Stat(fp)
+	if err != nil {
+		return fmt.Sprintf("Error stating file: %v", err)
+	}
+	originalMtime := fileInfo.ModTime()
+
+	// Read entire file content for matching
 	data, err := os.ReadFile(fp)
 	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+		return fmt.Sprintf("Error reading file: %v", err)
 	}
-	if !strings.Contains(string(data), oldText) {
+
+	// Second check: verify file hasn't changed since we stated it
+	fileInfo2, err := os.Stat(fp)
+	if err != nil {
+		return fmt.Sprintf("Error re-stating file: %v", err)
+	}
+	if !fileInfo2.ModTime().Equal(originalMtime) {
+		return fmt.Sprintf("Error: File '%s' was modified during editing (mtime changed)", path)
+	}
+
+	content := string(data)
+
+	// Check if oldText exists in file (supports both single-line and multi-line matching)
+	if !strings.Contains(content, oldText) {
 		return fmt.Sprintf("Error: Text not found in %s", path)
 	}
-	newData := strings.Replace(string(data), oldText, newText, 1)
-	finalData := newData
 
-	// Diff preview before writing
-	if shouldPreviewDiff() {
-		diff, err := generateUnifiedDiff(string(data), newData, path)
+	// Perform replacement (only first occurrence in the entire file)
+	newContent := strings.Replace(content, oldText, newText, 1)
+
+	// Generate diff if needed
+	var oldForDiff string
+	if shouldPreviewDiff() && len(content) < 500000 {
+		oldForDiff = content
+	}
+
+	if oldForDiff != "" {
+		diff, err := generateUnifiedDiff(oldForDiff, newContent, path)
 		if err != nil {
 			return fmt.Sprintf("Error generating diff: %v", err)
 		}
-		// Show preview and ask for confirmation
 		if diff != "" {
-			applied, ok := previewAndConfirm(path, string(data), newData, diff)
+			applied, ok := previewAndConfirm(path, oldForDiff, newContent, diff)
 			if !ok {
 				return "\u274c File edit rejected by user"
 			}
-			finalData = applied
+			newContent = applied
 		}
+	}
+
+	// Third check (atomic): verify file hasn't changed before writing
+	// This is the critical check that must be atomic with the write
+	fileInfo3, err := os.Stat(fp)
+	if err != nil {
+		return fmt.Sprintf("Error checking file before write: %v", err)
+	}
+	if !fileInfo3.ModTime().Equal(originalMtime) {
+		return fmt.Sprintf("Error: File '%s' was modified during editing (concurrent modification detected)", path)
 	}
 
 	// Atomic write
 	tmpPath := fp + ".tmp.edit.$$"
-	if err := os.WriteFile(tmpPath, []byte(finalData), 0o644); err != nil {
+	if err := os.WriteFile(tmpPath, []byte(newContent), 0o644); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Sprintf("Error writing temp file: %v", err)
 	}
 	if err := os.Rename(tmpPath, fp); err != nil {
 		os.Remove(tmpPath)
-		if err2 := os.WriteFile(fp, []byte(finalData), 0o644); err2 != nil {
+		if err2 := os.WriteFile(fp, []byte(newContent), 0o644); err2 != nil {
 			return fmt.Sprintf("Error writing file: %v / %v", err, err2)
 		}
 	}

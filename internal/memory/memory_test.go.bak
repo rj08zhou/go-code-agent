@@ -1,0 +1,961 @@
+package memory
+
+import (
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"go-code-agent/infra"
+)
+
+// ========== 工具函数测试 ==========
+
+func TestTokenize(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{
+			name:     "英文字符",
+			input:    "hello world test",
+			expected: []string{"hello", "world", "test"},
+		},
+		{
+			name:     "数字",
+			input:    "test123 abc456",
+			expected: []string{"test123", "abc456"},
+		},
+		{
+			name:     "中文字符",
+			input:    "你好世界测试",
+			expected: []string{"你好", "世界", "测试"},
+		},
+		{
+			name:     "混合字符",
+			input:    "hello 你好 world 世界",
+			expected: []string{"hello", "你好", "world", "世界"},
+		},
+		{
+			name:     "短词",
+			input:    "a b c",
+			expected: []string{"a", "b", "c"},
+		},
+		{
+			name:     "单个字符",
+			input:    "a",
+			expected: []string{"a"},
+		},
+		{
+			name:     "空字符串",
+			input:    "",
+			expected: []string{},
+		},
+		{
+			name:     "无匹配字符",
+			input:    "!@#$%^&*()",
+			expected: []string{},
+		},
+		{
+			name:     "包含标点",
+			input:    "hello, world!",
+			expected: []string{"hello", "world"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tokenize(tt.input)
+			sort.Strings(result)
+			sort.Strings(tt.expected)
+			if !equalStringSlices(result, tt.expected) {
+				t.Errorf("tokenize(%q) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestFNVHash(t *testing.T) {
+	// Expected values are the FNV-1a 64-bit hash of each input — i.e.
+	// the exact algorithm fnvHash() implements (offset 14695981039346656037,
+	// prime 1099511628211, xor-then-multiply per byte). Pinning these
+	// catches any accidental swap to plain FNV-1 or to the stdlib
+	// hash/fnv (which would silently change every score in the search
+	// pipeline).
+	tests := []struct {
+		name     string
+		input    string
+		expected uint64
+	}{
+		{
+			name:     "空字符串",
+			input:    "",
+			expected: 14695981039346656037,
+		},
+		{
+			name:     "简单字符串",
+			input:    "hello",
+			expected: 11831194018420276491,
+		},
+		{
+			name:     "重复字符串",
+			input:    "hello",
+			expected: 11831194018420276491,
+		},
+		{
+			name:     "不同字符串",
+			input:    "world",
+			expected: 5717881983045765875,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := fnvHash(tt.input)
+			if result != tt.expected {
+				t.Errorf("fnvHash(%q) = %d, want %d", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestVectorCosine(t *testing.T) {
+	tests := []struct {
+		name     string
+		a        []float64
+		b        []float64
+		expected float64
+	}{
+		{
+			name:     "相同向量",
+			a:        []float64{1, 0, 0},
+			b:        []float64{1, 0, 0},
+			expected: 1.0,
+		},
+		{
+			name:     "正交向量",
+			a:        []float64{1, 0},
+			b:        []float64{0, 1},
+			expected: 0.0,
+		},
+		{
+			name:     "部分重叠",
+			a:        []float64{1, 2, 3},
+			b:        []float64{1, 1, 1},
+			// dot=6, |a|=√14, |b|=√3 → 6/√42 ≈ 0.9258200997725515
+			expected: 0.9258200997725515,
+		},
+		{
+			name:     "反向向量",
+			a:        []float64{1, -1},
+			b:        []float64{-1, 1},
+			expected: -1.0,
+		},
+		{
+			name:     "空向量",
+			a:        []float64{},
+			b:        []float64{},
+			expected: 0.0,
+		},
+		{
+			name:     "零向量",
+			a:        []float64{0, 0},
+			b:        []float64{0, 0},
+			expected: 0.0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := vectorCosine(tt.a, tt.b)
+			// Use tolerance for floating point comparison
+			if diff := result - tt.expected; diff < -0.000001 || diff > 0.000001 {
+				t.Errorf("vectorCosine(%v, %v) = %f, want %f", tt.a, tt.b, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestJaccardSimilarity(t *testing.T) {
+	tests := []struct {
+		name     string
+		a        []string
+		b        []string
+		expected float64
+	}{
+		{
+			name:     "完全相同",
+			a:        []string{"a", "b", "c"},
+			b:        []string{"a", "b", "c"},
+			expected: 1.0,
+		},
+		{
+			name:     "一个为空",
+			a:        []string{"a", "b"},
+			b:        []string{},
+			expected: 0.0,
+		},
+		{
+			name:     "完全不同",
+			a:        []string{"a", "b"},
+			b:        []string{"c", "d"},
+			expected: 0.0,
+		},
+		{
+			name:     "部分重叠",
+			a:        []string{"a", "b", "c"},
+			b:        []string{"b", "c", "d"},
+			expected: 0.5,
+		},
+		{
+			name:     "无重叠",
+			a:        []string{"a", "b"},
+			b:        []string{"c", "d", "e"},
+			expected: 0.0,
+		},
+		{
+			name:     "相同元素但顺序不同",
+			a:        []string{"a", "b", "c"},
+			b:        []string{"c", "b", "a"},
+			expected: 1.0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := jaccardSimilarity(tt.a, tt.b)
+			if result < tt.expected-0.000001 || result > tt.expected+0.000001 {
+				t.Errorf("jaccardSimilarity(%v, %v) = %f, want %f", tt.a, tt.b, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestHashVector(t *testing.T) {
+	tests := []struct {
+		name     string
+		text     string
+		dim      int
+		expected []float64
+	}{
+		{
+			name:     "简单文本",
+			text:     "hello world",
+			dim:      64,
+			expected: []float64{}, // 长度超过 1 才会保留
+		},
+		{
+			name:     "短词",
+			text:     "a b c",
+			dim:      64,
+			expected: []float64{}, // 单字符会被过滤
+		},
+		{
+			name:     "单个字符",
+			text:     "a",
+			dim:      64,
+			expected: []float64{}, // 单字符会被过滤
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := hashVector(tt.text, tt.dim)
+			if len(result) != tt.dim {
+				t.Errorf("hashVector(%q, %d) length = %d, want %d", tt.text, tt.dim, len(result), tt.dim)
+			}
+			// Check normalization
+			sum := 0.0
+			for _, v := range result {
+				sum += v * v
+			}
+			norm := 1.0
+			if sum > 0 {
+				norm = sum
+			}
+			if norm > 1.000001 || norm < 0.999999 {
+				t.Errorf("hashVector(%q, %d) norm = %f, want ~1.0", tt.text, tt.dim, norm)
+			}
+		})
+	}
+}
+
+func TestBM25Score(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    []string
+		doc      []string
+		df       map[string]int
+		n        int
+		avgdl    float64
+		expected float64
+	}{
+		{
+			name:     "简单匹配",
+			query:    []string{"hello"},
+			doc:      []string{"hello", "world"},
+			df:       map[string]int{"hello": 1, "world": 1},
+			n:        2,
+			avgdl:    1.5,
+			expected: 0.0, // BM25 会过滤掉 docTF=0 的情况，实际应该计算
+		},
+		{
+			name:     "文档包含查询词",
+			query:    []string{"test", "hello"},
+			doc:      []string{"hello", "world", "test"},
+			df:       map[string]int{"hello": 2, "world": 2, "test": 1},
+			n:        2,
+			avgdl:    2.0,
+			expected: 0.0, // 实际计算
+		},
+		{
+			name:     "文档不包含查询词",
+			query:    []string{"hello"},
+			doc:      []string{"world", "test"},
+			df:       map[string]int{"hello": 1, "world": 1, "test": 1},
+			n:        2,
+			avgdl:    1.5,
+			expected: 0.0,
+		},
+		{
+			name:     "空文档",
+			query:    []string{"hello"},
+			doc:      []string{},
+			df:       map[string]int{"hello": 1},
+			n:        1,
+			avgdl:    1.0,
+			expected: 0.0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := bm25Score(tt.query, tt.doc, tt.df, tt.n, tt.avgdl)
+			if result < 0 {
+				t.Errorf("bm25Score(%v, %v, ...) = %f, want non-negative", tt.query, tt.doc, result)
+			}
+		})
+	}
+}
+
+func TestMergeHybridResults(t *testing.T) {
+	vecResults := []scoredChunk{
+		{Chunk: memoryChunk{Text: "vec1"}, Score: 0.8},
+		{Chunk: memoryChunk{Text: "vec2"}, Score: 0.6},
+	}
+
+	kwResults := []scoredChunk{
+		{Chunk: memoryChunk{Text: "vec2"}, Score: 0.7},
+		{Chunk: memoryChunk{Text: "vec3"}, Score: 0.5},
+	}
+
+	result := mergeHybridResults(vecResults, kwResults, 0.5, 0.5)
+
+	if len(result) != 3 {
+		t.Errorf("mergeHybridResults returned %d results, want 3", len(result))
+	}
+
+	// vec2 should have combined score
+	foundVec2 := false
+	for _, r := range result {
+		if r.Chunk.Text == "vec2" {
+			// Score should be 0.6*0.5 + 0.7*0.5 = 0.65
+			if r.Score < 0.64 || r.Score > 0.66 {
+				t.Errorf("vec2 score = %f, want ~0.65", r.Score)
+			}
+			foundVec2 = true
+		}
+	}
+	if !foundVec2 {
+		t.Error("vec2 result not found in merged results")
+	}
+}
+
+func TestDecayRateForCategory(t *testing.T) {
+	tests := []struct {
+		name     string
+		category string
+		expected float64
+	}{
+		{
+			name:     "change_log",
+			category: "change_log",
+			expected: 0.003,
+		},
+		{
+			name:     "context",
+			category: "context",
+			expected: 0.02,
+		},
+		{
+			name:     "fact",
+			category: "fact",
+			expected: 0.01,
+		},
+		{
+			name:     "lesson",
+			category: "lesson",
+			expected: 0.01,
+		},
+		{
+			name:     "preference",
+			category: "preference",
+			expected: 0.01,
+		},
+		{
+			name:     "unknown",
+			category: "unknown",
+			expected: 0.01,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := decayRateForCategory(tt.category)
+			if result != tt.expected {
+				t.Errorf("decayRateForCategory(%q) = %f, want %f", tt.category, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestMMRRerank(t *testing.T) {
+	results := []scoredChunk{
+		{Chunk: memoryChunk{Text: "A"}, Score: 0.9},
+		{Chunk: memoryChunk{Text: "B"}, Score: 0.8},
+		{Chunk: memoryChunk{Text: "C"}, Score: 0.7},
+		{Chunk: memoryChunk{Text: "D"}, Score: 0.6},
+	}
+
+	// lambda=0.7 should favor relevance but also diversity
+	reranked := mmrRerank(results, 0.7)
+
+	if len(reranked) != len(results) {
+		t.Errorf("mmrRerank returned %d results, want %d", len(reranked), len(results))
+	}
+
+	// Check that all results are unique
+	texts := make(map[string]bool)
+	for _, r := range reranked {
+		if texts[r.Chunk.Text] {
+			t.Error("mmrRerank produced duplicate results")
+		}
+		texts[r.Chunk.Text] = true
+	}
+}
+
+func TestDeduplicateResults(t *testing.T) {
+	tests := []struct {
+		name        string
+		results     []scoredChunk
+		threshold   float64
+		expectedLen int
+	}{
+		{
+			name:        "无重复",
+			results:     []scoredChunk{{Chunk: memoryChunk{Text: "A"}, Score: 0.8}, {Chunk: memoryChunk{Text: "B"}, Score: 0.7}},
+			threshold:   0.5,
+			expectedLen: 2,
+		},
+		{
+			name:        "完全相同",
+			results:     []scoredChunk{{Chunk: memoryChunk{Text: "A"}, Score: 0.8}, {Chunk: memoryChunk{Text: "A"}, Score: 0.7}},
+			threshold:   0.5,
+			expectedLen: 1,
+		},
+		{
+			name:        "高度相似",
+			results:     []scoredChunk{{Chunk: memoryChunk{Text: "hello world"}, Score: 0.8}, {Chunk: memoryChunk{Text: "hello world!"}, Score: 0.7}},
+			threshold:   0.8,
+			expectedLen: 1,
+		},
+		{
+			name:        "轻微相似",
+			results:     []scoredChunk{{Chunk: memoryChunk{Text: "hello world"}, Score: 0.8}, {Chunk: memoryChunk{Text: "hello world test"}, Score: 0.7}},
+			threshold:   0.9,
+			expectedLen: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := deduplicateResults(tt.results, tt.threshold)
+			if len(result) != tt.expectedLen {
+				t.Errorf("deduplicateResults returned %d results, want %d", len(result), tt.expectedLen)
+			}
+		})
+	}
+}
+
+func TestParseEvergreenCategory(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          string
+		expectedCategory string
+		expectedText    string
+	}{
+		{
+			name:           "带类别前缀",
+			input:          "[preference] user likes dark mode",
+			expectedCategory: "preference",
+			expectedText:    "user likes dark mode",
+		},
+		{
+			name:           "带 lesson 类别",
+			input:          "[lesson] always use context manager",
+			expectedCategory: "lesson",
+			expectedText:    "always use context manager",
+		},
+		{
+			name:           "不带类别前缀",
+			input:          "just a plain fact",
+			expectedCategory: "fact",
+			expectedText:    "just a plain fact",
+		},
+		{
+			name:           "空段落",
+			input:          "",
+			expectedCategory: "fact",
+			expectedText:    "",
+		},
+		{
+			name:           "空格开头",
+			input:          "  [preference]  spaced category",
+			expectedCategory: "preference",
+			expectedText:    "spaced category",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			category, text := parseEvergreenCategory(tt.input)
+			if category != tt.expectedCategory {
+				t.Errorf("parseEvergreenCategory(%q) category = %q, want %q", tt.input, category, tt.expectedCategory)
+			}
+			if text != tt.expectedText {
+				t.Errorf("parseEvergreenCategory(%q) text = %q, want %q", tt.input, text, tt.expectedText)
+			}
+		})
+	}
+}
+
+func TestCategoryWeight(t *testing.T) {
+	tests := []struct {
+		name     string
+		category string
+		expected float64
+	}{
+		{
+			name:     "preference",
+			category: "preference",
+			expected: 1.5,
+		},
+		{
+			name:     "lesson",
+			category: "lesson",
+			expected: 1.3,
+		},
+		{
+			name:     "change_log",
+			category: "change_log",
+			expected: 1.2,
+		},
+		{
+			name:     "fact",
+			category: "fact",
+			expected: 1.0,
+		},
+		{
+			name:     "context",
+			category: "context",
+			expected: 0.8,
+		},
+		{
+			name:     "unknown",
+			category: "unknown",
+			expected: 0.7,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := categoryWeight(tt.category)
+			if result != tt.expected {
+				t.Errorf("categoryWeight(%q) = %f, want %f", tt.category, result, tt.expected)
+			}
+		})
+	}
+}
+
+// ========== MemoryStore 集成测试 ==========
+
+func TestNewMemoryStore(t *testing.T) {
+	// Create a temporary directory for testing
+	tmpDir := t.TempDir()
+	store := NewMemoryStore(tmpDir)
+
+	if store == nil {
+		t.Fatal("NewMemoryStore returned nil")
+	}
+	if store.workspaceDir != filepath.Join(tmpDir, ".go-code-agent") {
+		t.Errorf("workspaceDir = %s, want %s", store.workspaceDir, filepath.Join(tmpDir, ".go-code-agent"))
+	}
+}
+
+func TestWriteMemory(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewMemoryStore(tmpDir)
+
+	tests := []struct {
+		name        string
+		content     string
+		category    string
+		expectError bool
+	}{
+		{
+			name:        "正常写入",
+			content:     "test memory content",
+			category:    "fact",
+			expectError: false,
+		},
+		{
+			name:        "带类别写入",
+			content:     "user preference: likes dark mode",
+			category:    "preference",
+			expectError: false,
+		},
+		{
+			name:        "空内容",
+			content:     "",
+			category:    "fact",
+			expectError: false, // 空内容也会写入，只是 token 可能为空
+		},
+		{
+			name:        "超长内容",
+			content:     strings.Repeat("a", infra.MaxMemoryContentLen+1),
+			category:    "fact",
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := store.WriteMemory(tt.content, tt.category)
+			if tt.expectError {
+				if !strings.Contains(result, "Error") {
+					t.Errorf("WriteMemory(%q, %q) = %q, want error", tt.content, tt.category, result)
+				}
+			} else {
+				if strings.Contains(result, "Error") {
+					t.Errorf("WriteMemory(%q, %q) = %q, want success", tt.content, tt.category, result)
+				}
+			}
+		})
+	}
+}
+
+func TestTryReplaceDuplicate(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewMemoryStore(tmpDir)
+
+	// Write an initial memory. The two strings below share 3 of 4 unique
+	// tokens (jaccard = 0.75) which is above DeduplicateThreshold (0.7),
+	// so the second WriteMemory must replace the first instead of
+	// appending a new entry.
+	store.WriteMemory("original content stays here", "fact")
+
+	result := store.WriteMemory("original content stays here also", "fact")
+	if !strings.Contains(result, "updated") {
+		t.Errorf("WriteMemory should detect and replace duplicate, got: %s", result)
+	}
+}
+
+func TestLoadEvergreen(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewMemoryStore(tmpDir)
+
+	// MemoryStore reads MEMORY.md from {workspace}/.go-code-agent/, not
+	// from the bare workspace dir. Mirror that layout so the test
+	// actually exercises the loader instead of silently reading nothing.
+	memoryContent := `# MEMORY
+
+[preference] user likes dark mode
+[lesson] always use context managers
+
+plain fact about the project`
+	memPath := filepath.Join(tmpDir, infra.AppRootDirName, "MEMORY.md")
+	if err := os.MkdirAll(filepath.Dir(memPath), 0o755); err != nil {
+		t.Fatalf("Failed to mkdir for MEMORY.md: %v", err)
+	}
+	if err := os.WriteFile(memPath, []byte(memoryContent), 0o644); err != nil {
+		t.Fatalf("Failed to write MEMORY.md: %v", err)
+	}
+
+	result := store.LoadEvergreen()
+	if result != memoryContent {
+		t.Errorf("LoadEvergreen() = %q, want %q", result, memoryContent)
+	}
+}
+
+func TestGetStats(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewMemoryStore(tmpDir)
+
+	// Same path note as TestLoadEvergreen — write under .go-code-agent/.
+	memoryContent := `[preference] user likes dark mode`
+	memPath := filepath.Join(tmpDir, infra.AppRootDirName, "MEMORY.md")
+	if err := os.MkdirAll(filepath.Dir(memPath), 0o755); err != nil {
+		t.Fatalf("Failed to mkdir for MEMORY.md: %v", err)
+	}
+	if err := os.WriteFile(memPath, []byte(memoryContent), 0o644); err != nil {
+		t.Fatalf("Failed to write MEMORY.md: %v", err)
+	}
+
+	// Write to daily memory
+	store.WriteMemory("daily fact", "fact")
+	store.WriteMemory("another daily fact", "lesson")
+
+	evergreenChars, dailyFiles, dailyEntries := store.GetStats()
+
+	if evergreenChars == 0 {
+		t.Error("GetStats should count evergreen characters")
+	}
+	if dailyFiles != 1 {
+		t.Errorf("GetStats dailyFiles = %d, want 1", dailyFiles)
+	}
+	if dailyEntries != 2 {
+		t.Errorf("GetStats dailyEntries = %d, want 2", dailyEntries)
+	}
+}
+
+func TestDeleteMemory(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewMemoryStore(tmpDir)
+
+	// Write some memories
+	store.WriteMemory("memory to delete", "fact")
+	store.WriteMemory("keep this one", "lesson")
+
+	// Delete the first memory
+	result := store.DeleteMemory("memory to delete", "")
+	if !strings.Contains(result, "Deleted") {
+		t.Errorf("DeleteMemory failed: %s", result)
+	}
+
+	// Verify the deleted memory is gone
+	_, _, dailyEntries := store.GetStats()
+	// Should have 1 daily entry now (the lesson one)
+	if dailyEntries != 1 {
+		t.Errorf("DeleteMemory should remove the entry, got %d entries", dailyEntries)
+	}
+}
+
+func TestHybridSearch(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewMemoryStore(tmpDir)
+
+	// Write various memories
+	store.WriteMemory("user likes dark mode", "preference")
+	store.WriteMemory("always use context managers", "lesson")
+	store.WriteMemory("code review best practices", "fact")
+	store.WriteMemory("API endpoint design", "context")
+
+	// Search for "context managers"
+	results := store.HybridSearch("context managers", 10)
+	if len(results) == 0 {
+		t.Error("HybridSearch should find results")
+	}
+
+	// Verify results are returned
+	for _, r := range results {
+		if r.Snippet == "" {
+			t.Error("Result should have snippet")
+		}
+		if r.Score < 0 || r.Score > 1 {
+			t.Errorf("Result score = %f, want in [0, 1]", r.Score)
+		}
+	}
+}
+
+func TestHybridSearchFiltered(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewMemoryStore(tmpDir)
+
+	// Write memories with different categories
+	store.WriteMemory("preference content", "preference")
+	store.WriteMemory("lesson content", "lesson")
+	store.WriteMemory("fact content", "fact")
+
+	// Category filter: every result's path label must carry the
+	// [preference] tag (paths look like "2026-05-28.jsonl [preference]").
+	results := store.HybridSearchFiltered("content", 10, 0, "preference")
+	for _, r := range results {
+		if !strings.Contains(r.Path, "[preference]") {
+			t.Errorf("Filtered search should only return preference, got %s", r.Path)
+		}
+	}
+
+	// Within-days filter: today's writes are within 1 day, so we expect
+	// at least one hit.
+	results = store.HybridSearchFiltered("content", 10, 1, "")
+	if len(results) == 0 {
+		t.Error("HybridSearchFiltered with withinDays=1 should still return today's writes")
+	}
+}
+
+func TestFilterChunks(t *testing.T) {
+	// Use dates relative to "today" so the within-days assertions hold
+	// regardless of when the suite is run. The original test hard-coded
+	// 2024-01-01 / 2024-01-15 dates, which silently broke the moment
+	// real-world time advanced past those windows.
+	now := time.Now().UTC()
+	dayLabel := func(daysAgo int) string {
+		return now.AddDate(0, 0, -daysAgo).Format("2006-01-02") + ".jsonl"
+	}
+	old := dayLabel(60)    // outside any reasonable within-days filter
+	recent := dayLabel(2)  // within 7-day filter, outside 1-day filter
+	chunks := []memoryChunk{
+		{Path: "MEMORY.md [fact]", Text: "evergreen fact", Category: "fact"},
+		{Path: old + " [fact]", Text: "old fact", Category: "fact"},
+		{Path: recent + " [fact]", Text: "recent fact", Category: "fact"},
+		{Path: recent + " [context]", Text: "recent context", Category: "context"},
+	}
+
+	// No filter
+	result := filterChunks(chunks, 0, "")
+	if len(result) != len(chunks) {
+		t.Errorf("filterChunks with no filters = %d, want %d", len(result), len(chunks))
+	}
+
+	// Category filter
+	result = filterChunks(chunks, 0, "fact")
+	if len(result) != 3 {
+		t.Errorf("filterChunks with category filter = %d, want 3", len(result))
+	}
+
+	// Within-days filter: 7 days keeps evergreen + recent fact + recent
+	// context (3); old fact is excluded.
+	result = filterChunks(chunks, 7, "")
+	if len(result) != 3 {
+		t.Errorf("filterChunks with 7-day filter = %d, want 3", len(result))
+	}
+
+	// Within-days filter: 1 day keeps only evergreen (no daily file is
+	// from today in this fixture).
+	result = filterChunks(chunks, 1, "")
+	if len(result) != 1 {
+		t.Errorf("filterChunks with 1-day filter = %d, want 1", len(result))
+	}
+
+	// Both filters: 30-day window + context category → only the recent
+	// context chunk.
+	result = filterChunks(chunks, 30, "context")
+	if len(result) != 1 {
+		t.Errorf("filterChunks with both filters = %d, want 1", len(result))
+	}
+}
+
+func TestConcurrentAccess(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewMemoryStore(tmpDir)
+
+	// Concurrent writes
+	writesDone := make(chan struct{})
+	for i := 0; i < 10; i++ {
+		go func(idx int) {
+			store.WriteMemory(string(rune('a'+idx)), "fact")
+			writesDone <- struct{}{}
+		}(i)
+	}
+	for i := 0; i < 10; i++ {
+		<-writesDone
+	}
+
+	// Concurrent reads — each reader must signal completion, otherwise
+	// the wait loop below blocks forever (the original version reused a
+	// single channel that the readers never sent on, deadlocking the
+	// test until -timeout fired).
+	readsDone := make(chan struct{})
+	for i := 0; i < 10; i++ {
+		go func() {
+			store.HybridSearch("test", 10)
+			readsDone <- struct{}{}
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		<-readsDone
+	}
+}
+
+// ========== 辅助函数 ==========
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ========== 缺失的测试用例 ==========
+
+func TestCleanExpired(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewMemoryStore(tmpDir)
+
+	// Create a memory directory structure
+	memoryDir := filepath.Join(store.memoryDir)
+	
+	// Create files from 30 days ago, 7 days ago, and today
+	now := time.Now().UTC()
+	oldDate := now.AddDate(0, 0, -30).Format("2006-01-02")
+	weekAgo := now.AddDate(0, 0, -7).Format("2006-01-02")
+	today := now.Format("2006-01-02")
+
+	for _, date := range []string{oldDate, weekAgo, today} {
+		path := filepath.Join(memoryDir, date+".jsonl")
+		os.WriteFile(path, []byte("test content"), 0o644)
+	}
+
+	// Verify all files exist
+	files, _ := filepath.Glob(filepath.Join(memoryDir, "*.jsonl"))
+	if len(files) != 3 {
+		t.Errorf("Expected 3 files, got 0", len(files))
+	}
+
+	// Clean expired (older than MemoryTTLDays, which is 90 days)
+	// This should not remove anything yet
+	store.cleanExpired()
+	files, _ = filepath.Glob(filepath.Join(memoryDir, "*.jsonl"))
+	if len(files) != 3 {
+		t.Errorf("After cleanExpired, expected 3 files, got 0", len(files))
+	}
+
+	// Manually set MemoryTTLDays to 20 for testing
+	// Note: This requires modifying infra consts or we just test the logic
+	// by checking that files older than cutoff are removed
+	cutoff := now.AddDate(0, 0, -20)
+	files, _ = filepath.Glob(filepath.Join(memoryDir, "*.jsonl"))
+	removed := 0
+	for _, f := range files {
+		base := strings.TrimSuffix(filepath.Base(f), ".jsonl")
+		fileDate, err := time.Parse("2006-01-02", base)
+		if err != nil {
+			continue
+		}
+		if fileDate.Before(cutoff) {
+			os.Remove(f)
+			removed++
+		}
+	}
+	if removed != 1 {
+		t.Errorf("Expected to remove 1 file, removed 0", removed)
+	}
+}
