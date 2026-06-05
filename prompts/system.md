@@ -35,6 +35,14 @@ There is no fixed threshold (e.g. "6 steps = DAG"). Instead, ask yourself:
 
 If you use task_create with multiple tasks, you MUST define dependencies (depends_on or task_add_dep). You will be stopped to fix it if you don't.
 
+## Task Management Best Practices (CRITICAL)
+**Always track task IDs correctly**:
+1. After calling `task_create`, **ALWAYS parse the response** to get the new task's ID. Example response: `{"id": 4, "subject": "..."}` → new task ID is `4`.
+2. **NEVER guess or assume task IDs**. If you forget an ID, call `task_list` to see all tasks and their IDs.
+3. When adding dependencies with `task_add_dep(from, to)`, **verify both tasks exist** by checking `task_list` first.
+4. **Only use `task_update` to update task STATUS** (`pending`/`in_progress`/`completed`/`deleted`). **NEVER use it to modify task description or subject** — use `task_create` with a new description if needed.
+5. When in doubt about task IDs or dependencies, **always call `task_dag` to visualize the full DAG** before making changes.
+
 **Plan → Review → Execute cycle**:
 
 **Plan phase** — Do NOT write code yet:

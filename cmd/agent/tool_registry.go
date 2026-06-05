@@ -122,7 +122,7 @@ func initTools() {
 	toolDefs = append(toolDefs,
 		toolDef("task_create", "Create a persistent file task. Optionally specify depends_on to set DAG dependencies.", map[string]any{"subject": strProp(), "description": strProp(), "depends_on": intArrayProp()}, []string{"subject"}),
 		toolDef("task_get", "Get task details by ID.", map[string]any{"task_id": intProp()}, []string{"task_id"}),
-		toolDef("task_update", "Update task status. Use task_add_dep/task_remove_dep for dependencies.", map[string]any{"task_id": intProp(), "status": enumProp("pending", "in_progress", "completed", "deleted")}, []string{"task_id"}),
+		toolDef("task_update", "Update task STATUS only (pending/in_progress/completed/deleted). Cannot modify description or subject - use task_create for new tasks with different descriptions.", map[string]any{"task_id": intProp(), "status": enumProp("pending", "in_progress", "completed", "deleted")}, []string{"task_id"}),
 		toolDef("task_list", "List all tasks.", map[string]any{}, nil),
 	)
 	toolHandlers["task_create"] = func(ctx context.Context, r json.RawMessage) ToolResult {

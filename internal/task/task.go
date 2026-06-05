@@ -15,6 +15,64 @@ import (
 //
 // Pure CRUD; graph operations and scheduling are in DAGScheduler (task_scheduler.go).
 
+// Task status constants. Using named constants instead of bare string
+// literals lets the compiler catch typos (e.g. "in-progress" vs
+// "in_progress") and gives the state machine below an enumerable set
+// of legal values.
+//
+// NOTE: these string values are persisted in task_*.json on disk.
+// Renaming them requires a data migration.
+const (
+	StatusPending    = "pending"
+	StatusInProgress = "in_progress"
+	StatusCompleted  = "completed"
+	StatusDeleted    = "deleted"
+)
+
+// validStatuses is the set of all status values Update() will accept.
+// Anything outside this set (e.g. "foo", "in-progress") is rejected
+// outright so it cannot reach disk and corrupt downstream consumers.
+var validStatuses = map[string]bool{
+	StatusPending:    true,
+	StatusInProgress: true,
+	StatusCompleted:  true,
+	StatusDeleted:    true,
+}
+
+// validStatusTransitions encodes the task state machine: from a given
+// current status, which target statuses are reachable via Update().
+//
+// Rationale per allowed transition:
+//   - pending → in_progress: normal start (also performed by Claim()).
+//   - pending → completed:   trivial tasks finished without a claim step.
+//   - in_progress → completed: normal finish.
+//   - in_progress → pending:   release back to the queue after a transient
+//     failure so another worker can pick it up.
+//   - * → deleted:           tombstoning is always allowed.
+//
+// Notably forbidden:
+//   - completed → anything except deleted: completed is a terminal state.
+//     "Reviving" a finished task hides bugs and confuses progress
+//     tracking; if a task truly needs redoing, create a new one.
+//   - pending → pending / in_progress → in_progress / completed → completed:
+//     no-op self-transitions are silently allowed by the caller and never
+//     consult this table.
+var validStatusTransitions = map[string]map[string]bool{
+	StatusPending: {
+		StatusInProgress: true,
+		StatusCompleted:  true,
+		StatusDeleted:    true,
+	},
+	StatusInProgress: {
+		StatusCompleted: true,
+		StatusPending:   true,
+		StatusDeleted:   true,
+	},
+	StatusCompleted: {
+		StatusDeleted: true,
+	},
+}
+
 type TaskManager struct {
 	dir      string
 	mu       sync.Mutex
@@ -99,7 +157,7 @@ func (tm *TaskManager) Create(subject, desc string, dependsOn []int) string {
 	id := tm.nextID()
 	t := map[string]any{
 		"id": float64(id), "subject": subject, "description": desc,
-		"status": "pending", "owner": nil,
+		"status": StatusPending, "owner": nil,
 	}
 	tm.save(t)
 	tm.mu.Unlock()
@@ -132,8 +190,32 @@ func (tm *TaskManager) Update(id int, status string) string {
 		return err.Error()
 	}
 	if status != "" {
+		// 1. Reject any status not in the whitelist. Without this, a typo
+		//    like "in-progress" or a stray value like "foo" would silently
+		//    land on disk and break downstream consumers (markers map,
+		//    state-machine assumptions).
+		if !validStatuses[status] {
+			tm.mu.Unlock()
+			return fmt.Sprintf("Error: invalid status %q (allowed: pending|in_progress|completed|deleted)", status)
+		}
+
+		// 2. Validate the transition. Self-transitions (status == current)
+		//    are treated as no-ops and skip the table lookup, so a caller
+		//    re-sending the same status never gets an error.
+		oldStatus, _ := t["status"].(string)
+		if oldStatus == "" {
+			oldStatus = StatusPending
+		}
+		if status != oldStatus {
+			allowed, known := validStatusTransitions[oldStatus]
+			if !known || !allowed[status] {
+				tm.mu.Unlock()
+				return fmt.Sprintf("Error: invalid status transition for task #%d: %s → %s", id, oldStatus, status)
+			}
+		}
+
 		t["status"] = status
-		if status == "deleted" {
+		if status == StatusDeleted {
 			os.Remove(tm.taskPath(id))
 			tm.mu.Unlock()
 			// Delegate edge cleanup to DAGScheduler.
@@ -168,7 +250,7 @@ func (tm *TaskManager) ListAll() string {
 		dagPreds[e.To] = append(dagPreds[e.To], e.From)
 	}
 
-	markers := map[string]string{"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+	markers := map[string]string{StatusPending: "[ ]", StatusInProgress: "[>]", StatusCompleted: "[x]"}
 	var lines []string
 	for _, e := range entries {
 		data, _ := os.ReadFile(e)
@@ -223,7 +305,7 @@ func (tm *TaskManager) Claim(id int, owner string) (string, bool) {
 		return fmt.Sprintf("Error: task #%d already claimed by %s (status=%s)", id, existing, status), false
 	}
 	t["owner"] = owner
-	t["status"] = "in_progress"
+	t["status"] = StatusInProgress
 	tm.save(t)
 	return fmt.Sprintf("Claimed task #%d for %s", id, owner), true
 }

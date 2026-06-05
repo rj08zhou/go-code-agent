@@ -82,7 +82,7 @@ func parseArgs(raw json.RawMessage, target any) string {
 // Set writeTools=true to include write_file, edit_file, delete_file.
 func coreToolDefs(writeTools bool) []llm.ToolDef {
 	defs := []llm.ToolDef{
-		toolDef("bash", "Run a shell command (allowlisted commands only).", map[string]any{"command": strProp()}, []string{"command"}),
+		toolDef("bash", "Execute a shell command (e.g., ls, pwd, go build, git status). ONLY for shell commands - use read_file to read files, NOT bash.", map[string]any{"command": strProp()}, []string{"command"}),
 		toolDef("read_file", "Read file contents.", map[string]any{"path": strProp(), "limit": intProp()}, []string{"path"}),
 	}
 	if writeTools {

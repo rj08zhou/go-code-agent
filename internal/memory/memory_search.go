@@ -297,7 +297,12 @@ func decayRateForCategory(cat string) float64 {
 // temporalDecayByCategory applies per-category decay rates.
 // Chunks whose Path lacks a date (evergreen MEMORY.md) are not decayed.
 func temporalDecayByCategory(results []scoredChunk) []scoredChunk {
-	now := time.Now().UTC()
+	return temporalDecayByCategoryWithNow(results, time.Now().UTC())
+}
+
+// temporalDecayByCategoryWithNow applies per-category decay rates using a fixed reference time.
+// Useful for testing with deterministic time.
+func temporalDecayByCategoryWithNow(results []scoredChunk, now time.Time) []scoredChunk {
 	for i := range results {
 		path := results[i].Chunk.Path
 		m := dateInPathRe.FindString(path)
@@ -393,6 +398,31 @@ func (ms *MemoryStore) HybridSearchFiltered(query string, topK int, withinDays i
 	if len(chunks) == 0 {
 		return nil
 	}
+
+	// Empty query: return all chunks (useful for "show all memories")
+	if query == "" {
+		var results []searchResult
+		for i, c := range chunks {
+			if i >= topK {
+				break
+			}
+			score := categoryWeight(c.Category)
+			if score > 1 {
+				score = 1
+			}
+			snippet := c.Text
+			if len(snippet) > 200 {
+				snippet = snippet[:200] + "..."
+			}
+			results = append(results, searchResult{
+				Path:    c.Path,
+				Score:   math.Round(score*10000) / 10000,
+				Snippet: snippet,
+			})
+		}
+		return results
+	}
+
 	kw := ms.keywordSearch(query, chunks, 10)
 	vec := ms.vectorSearch(query, chunks, 10)
 	merged := mergeHybridResults(vec, kw, infra.HybridVectorWeight, infra.HybridKeywordWeight)
