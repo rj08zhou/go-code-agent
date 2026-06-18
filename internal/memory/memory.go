@@ -190,8 +190,10 @@ func (ms *MemoryStore) tryReplaceDuplicate(content, category string, newTokens [
 }
 
 // LoadEvergreen reads the long-term MEMORY.md file.
+// Located under {workspaceDir}/memory/MEMORY.md (same parent as daily/*.jsonl).
 func (ms *MemoryStore) LoadEvergreen() string {
-	data, err := os.ReadFile(filepath.Join(ms.workspaceDir, "MEMORY.md"))
+	path := filepath.Join(ms.workspaceDir, "memory", "MEMORY.md")
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}

@@ -72,9 +72,22 @@ Use memory_write to save important information. Always specify the correct categ
 - fact: project facts, architecture decisions, dependencies (standard)
 - context: temporary context, current task details (lowest priority, decays fast)
 
-Use memory_search to recall past information before starting related work. Optional filters:
+### Recalling memory (IMPORTANT)
+There is NO automatic per-turn recall. Relevant past memory is surfaced ONLY when you
+call memory_search yourself. So you MUST proactively call it whenever history could matter.
+Concretely, call memory_search before you start work in these situations:
+- Starting a new task or sub-task, or the user references something from "before" / "last time".
+- You need project facts, prior decisions, conventions, or the user's stated preferences.
+- Reviewing code changes (see Security Review Protocol below).
+- You are uncertain and historical context would reduce guessing.
+
+Skip it only for pure chit-chat or fully self-contained requests with no historical bearing.
+When in doubt, search — a cheap memory_search beats acting on stale assumptions.
+
+Optional filters:
 - within_days=N — only consider the last N days (key for review workflows)
 - category=... — narrow to one class
+- top_k=N — limit number of results
 
 Use memory_delete when the user says a memory is wrong, outdated, or asks to forget something.
 When correcting a memory, delete the old one first, then write the new version.
