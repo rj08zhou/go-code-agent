@@ -1066,11 +1066,12 @@ plain fact about the project`
 	hasFact := false
 	for _, c := range chunks {
 		if strings.Contains(c.Path, "MEMORY.md") {
-			if c.Category == "preference" {
+			switch c.Category {
+			case "preference":
 				hasPreference = true
-			} else if c.Category == "lesson" {
+			case "lesson":
 				hasLesson = true
-			} else if c.Category == "fact" {
+			case "fact":
 				hasFact = true
 			}
 		}
@@ -1086,9 +1087,10 @@ plain fact about the project`
 	hasYesterdayContext := false
 	for _, c := range chunks {
 		if strings.Contains(c.Path, todayStr+".jsonl") {
-			if c.Category == "fact" {
+			switch c.Category {
+			case "fact":
 				hasTodayFact = true
-			} else if c.Category == "lesson" {
+			case "lesson":
 				hasTodayLesson = true
 			}
 		}
@@ -1151,9 +1153,10 @@ func TestTryReplaceDuplicate_DifferentCategory(t *testing.T) {
 	factCount := 0
 	lessonCount := 0
 	for _, c := range chunks {
-		if c.Category == "fact" {
+		switch c.Category {
+		case "fact":
 			factCount++
-		} else if c.Category == "lesson" {
+		case "lesson":
 			lessonCount++
 		}
 	}

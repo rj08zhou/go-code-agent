@@ -316,7 +316,7 @@ func sessionSwitchTo(oldHistory []llm.Message, id, newTitle string) []llm.Messag
 	))
 
 	// Rebuild system prompt for the new session.
-	system = buildSystemPrompt("")
+	system = buildSystemPrompt()
 	app.System = system
 
 	conv := bootConversation(next, system)
