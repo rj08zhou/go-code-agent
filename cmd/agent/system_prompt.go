@@ -10,8 +10,14 @@ import (
 // System prompt assembly + memory auto-recall.
 
 // buildSystemPrompt assembles the system prompt with dynamic sections:
-// evergreen memory, DAG resume context, and auto-recalled memories.
-func buildSystemPrompt(memoryContext string) string {
+// evergreen memory and DAG resume context.
+//
+// Note: per-turn semantic recall was intentionally removed. Evergreen
+// MEMORY.md is loaded once at session start (resident), and relevant
+// daily memories are surfaced on-demand by the model via the
+// `memory_search` tool — mirroring how Claude Code / Cursor / CodeBuddy
+// avoid blindly re-recalling on every user turn.
+func buildSystemPrompt() string {
 	raw := app.PromptLoader.Load("system")
 	if raw == "" {
 		log.PrintSystem("ERROR: prompts/system.md not found, using minimal fallback")
@@ -38,23 +44,5 @@ func buildSystemPrompt(memoryContext string) string {
 		prompt += "\n\n" + rc
 	}
 
-	// Inject auto-recalled memories.
-	if memoryContext != "" {
-		prompt += "\n\n## Recalled Memories\n\n" + memoryContext
-	}
 	return prompt
-}
-
-// memoryRecall searches memory for context relevant to the user's message.
-func memoryRecall(userMessage string) string {
-	results := memStore.HybridSearch(userMessage, 3)
-	if len(results) == 0 {
-		return ""
-	}
-	log.PrintSystem("[auto-recall] Found relevant memories")
-	var lines []string
-	for _, r := range results {
-		lines = append(lines, fmt.Sprintf("- [%s] %s", r.Path, r.Snippet))
-	}
-	return strings.Join(lines, "\n")
 }

@@ -5,7 +5,7 @@
 //	┌──────────────────────────────────────────────────────────────┐
 //	│                      USER INPUT (REPL)                       │
 //	│   slash commands → repl_commands.go (short-circuit)          │
-//	│   user message  → memoryRecall → buildSystemPrompt           │
+//	│   user message  → agentLoop (memory via memory_search tool)  │
 //	└──────────────────────────┬───────────────────────────────────┘
 //	                           │
 //	                           ▼
@@ -182,7 +182,7 @@ func main() {
 		session.TasksDir(), session.Protocols,
 	))
 
-	system = buildSystemPrompt("")
+	system = buildSystemPrompt()
 	app.System = system
 
 	initTools()
@@ -299,11 +299,6 @@ func main() {
 			conv = newConv
 			continue
 		}
-
-		memoryContext := memoryRecall(query)
-		system = buildSystemPrompt(memoryContext)
-		app.System = system
-		conv[0] = llm.SystemMessage(system)
 
 		conv = append(conv, llm.UserMessage(query))
 		hs := app.History()

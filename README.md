@@ -115,7 +115,7 @@ All persistent state is stored under `{workdir}/.go-code-agent/`. Sessions survi
 ┌──────────────────────────────────────────────────────────────────┐
 │                        USER INPUT (REPL)                         │
 │   slash commands → repl_commands.go (short-circuit)              │
-│   user message  → memoryRecall → buildSystemPrompt              │
+│   user message  → agentLoop (memory via memory_search tool)     │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
@@ -172,8 +172,9 @@ All subsystems are owned by `AppContext` (app.go):
 ```
 user msg
   │
-  ├─ memoryRecall(query)         ← BM25+vector hybrid search, top-3 injected
-  ├─ buildSystemPrompt(context)  ← system.md template + skills + memory + tasks
+  ├─ buildSystemPrompt()         ← system.md template + skills + evergreen memory + tasks
+  │      (evergreen MEMORY.md loaded once at session start; daily memories
+  │       recalled on-demand by the model via the memory_search tool)
   │
   ▼
 agentLoop(ctx, &conv)
