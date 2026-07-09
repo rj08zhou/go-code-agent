@@ -32,6 +32,24 @@ type DAGScheduler struct {
 	dir     string       // directory containing dag_edges.json
 	taskMgr *TaskManager // back-reference for loading tasks
 	mu      sync.Mutex
+
+	// In-memory cache of dag_edges.json. loadEdges() used to re-read
+	// and re-parse this file on every single DAG query (ReadyTasks,
+	// IsReady, TopoView, ProgressSummary, ...); with it warm this drops
+	// to one read for the lifetime of the process (until an edge
+	// mutates, which writes through immediately).
+	//
+	// Guarded by its own mutex (edgesMu) rather than ds.mu: loadEdges
+	// is also called directly by TaskManager.ListAll without holding
+	// ds.mu, so the cache must be safe under that access pattern too.
+	//
+	// loadEdges always hands back a freshly-allocated slice (copy of
+	// the cache) so a caller doing `edges = append(edges, ...)` before
+	// saveEdges can never alias — and corrupt — the cached backing
+	// array.
+	edgesMu     sync.RWMutex
+	edgesCache  []dagEdge
+	edgesLoaded bool
 }
 
 func NewDAGScheduler(dir string, tm *TaskManager) *DAGScheduler {
@@ -42,19 +60,45 @@ func (ds *DAGScheduler) edgesPath() string {
 	return ds.dir + "/dag_edges.json"
 }
 
+// loadEdges returns a defensive copy of the cached edge list, lazily
+// warming the cache from disk on first access.
 func (ds *DAGScheduler) loadEdges() []dagEdge {
-	data, err := os.ReadFile(ds.edgesPath())
-	if err != nil {
-		return nil
+	ds.edgesMu.RLock()
+	if ds.edgesLoaded {
+		out := make([]dagEdge, len(ds.edgesCache))
+		copy(out, ds.edgesCache)
+		ds.edgesMu.RUnlock()
+		return out
 	}
-	var edges []dagEdge
-	json.Unmarshal(data, &edges)
-	return edges
+	ds.edgesMu.RUnlock()
+
+	ds.edgesMu.Lock()
+	defer ds.edgesMu.Unlock()
+	if !ds.edgesLoaded { // re-check: another goroutine may have won the race
+		data, err := os.ReadFile(ds.edgesPath())
+		var edges []dagEdge
+		if err == nil {
+			json.Unmarshal(data, &edges)
+		}
+		ds.edgesCache = edges
+		ds.edgesLoaded = true
+	}
+	out := make([]dagEdge, len(ds.edgesCache))
+	copy(out, ds.edgesCache)
+	return out
 }
 
+// saveEdges persists edges to disk and writes through to the cache.
 func (ds *DAGScheduler) saveEdges(edges []dagEdge) {
 	data, _ := json.MarshalIndent(edges, "", "  ")
 	os.WriteFile(ds.edgesPath(), data, 0o644)
+
+	stored := make([]dagEdge, len(edges))
+	copy(stored, edges)
+	ds.edgesMu.Lock()
+	ds.edgesCache = stored
+	ds.edgesLoaded = true
+	ds.edgesMu.Unlock()
 }
 
 // AddEdge adds a dependency: `from` must finish before `to` can start.

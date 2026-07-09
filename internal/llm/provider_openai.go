@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -288,10 +287,10 @@ func openAIIsRetriable(err error) bool {
 // JUDGE_BASE_URL).
 func newOpenAIProvider(apiKey, baseURL string) Provider {
 	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
+		apiKey = infra.Cfg.OpenAIAPIKey
 	}
 	if baseURL == "" {
-		baseURL = os.Getenv("OPENAI_BASE_URL")
+		baseURL = infra.Cfg.OpenAIBaseURL
 	}
 	var opts []option.RequestOption
 	if apiKey != "" {

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"go-code-agent/infra"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/log"
+	"go-code-agent/internal/logging"
 	"go-code-agent/internal/memory"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/utils"
@@ -127,9 +127,9 @@ func (sm *SessionManager) Deactivate(s *Session) {
 	}
 	// Best-effort: save session insights to long-term memory.
 	if msg, err := sm.SaveToMemory(context.Background(), s); err != nil {
-		log.PrintSystem(fmt.Sprintf("[session] SaveToMemory error: %v", err))
+		logging.PrintSystem(fmt.Sprintf("[session] SaveToMemory error: %v", err))
 	} else if msg != "" {
-		log.PrintSystem(fmt.Sprintf("[session] %s", msg))
+		logging.PrintSystem(fmt.Sprintf("[session] %s", msg))
 	}
 }
 
@@ -182,9 +182,16 @@ func (sm *SessionManager) SaveToMemory(ctx context.Context, s *Session) (string,
 		"session_history": hist.String(),
 	})
 
+	// UserMessage, not SystemMessage: this is a one-shot instruction
+	// with no real conversation, but some OpenAI-compatible endpoints
+	// (observed with GLM/bigmodel.cn) reject a messages array that
+	// contains only a system-role turn with 400 "messages 参数非法" -
+	// they require at least one user message. A lone user message
+	// works identically on Anthropic/OpenAI too, so this is safe
+	// across all providers.
 	comp, err := llm.NewClient(nil).CallWithRetry(ctx, "memory-save", llm.CallParams{
 		Model:       sm.model,
-		Messages:    []llm.Message{llm.SystemMessage(promptText)},
+		Messages:    []llm.Message{llm.UserMessage(promptText)},
 		Temperature: 0.0,
 	})
 	if err != nil {
@@ -456,6 +463,20 @@ func (sm *SessionManager) Render() string {
 
 // Boot helper.
 
+// BootstrapOrCreate extends BootstrapSession's resolution policy with
+// the CLI's --new-session override: forceNew (with no explicit id)
+// always creates a fresh session, bypassing the most-recent fallback
+// below. Otherwise defers entirely to BootstrapSession's own chain
+// (explicit id > most recent > fresh). Single source of truth for
+// "which session do we start with" - previously this forceNew rule
+// lived in main.go, split from the rest of the same policy here.
+func (sm *SessionManager) BootstrapOrCreate(forceNew bool, explicitID string) (*Session, error) {
+	if forceNew && explicitID == "" {
+		return sm.NewSession("New session")
+	}
+	return sm.BootstrapSession(explicitID)
+}
+
 // BootstrapSession picks the right session to activate at startup:
 // explicit id > most recent active > brand new.
 func (sm *SessionManager) BootstrapSession(explicitID string) (*Session, error) {
@@ -485,7 +506,7 @@ func (sm *SessionManager) BootstrapSession(explicitID string) (*Session, error) 
 			_ = sm.SetActive(id)
 			return s, nil
 		}
-		log.PrintSystem(fmt.Sprintf("[session] could not load %s: %v - creating fresh", id, err))
+		logging.PrintSystem(fmt.Sprintf("[session] could not load %s: %v - creating fresh", id, err))
 	}
 
 	// 3. Fresh session.

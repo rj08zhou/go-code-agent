@@ -3,8 +3,8 @@ package llm
 import (
 	"errors"
 	"fmt"
-	"go-code-agent/internal/log"
-	"os"
+	"go-code-agent/infra"
+	"go-code-agent/internal/logging"
 	"strings"
 	"sync"
 )
@@ -27,15 +27,15 @@ func (s *stdoutStreamSink) OnTextDelta(text string) {
 		return
 	}
 	if !s.started {
-		log.PrintAgentBegin()
+		logging.PrintAgentBegin()
 		s.started = true
 	}
-	log.PrintAgentDelta(text)
+	logging.PrintAgentDelta(text)
 }
 
 func (s *stdoutStreamSink) OnDone() {
 	if s.started {
-		log.PrintAgentEnd()
+		logging.PrintAgentEnd()
 		s.started = false
 	}
 }
@@ -51,7 +51,7 @@ func (SilentStreamSink) OnDone()            {}
 // without conflicting with the main agent's output.
 type PrefixedStreamSink struct {
 	Prefix  string // e.g. "  [sub]" or "  [alice]"
-	Color   string // ANSI color code (e.g. log.ColorCyan)
+	Color   string // ANSI color code (e.g. logging.ColorCyan)
 	started bool
 }
 
@@ -68,7 +68,7 @@ func (s *PrefixedStreamSink) OnTextDelta(text string) {
 
 func (s *PrefixedStreamSink) OnDone() {
 	if s.started {
-		fmt.Println(log.ColorReset)
+		fmt.Println(logging.ColorReset)
 		s.started = false
 	}
 }
@@ -106,7 +106,7 @@ func RegisterProviderBuilder(name string, fn func(apiKey, baseURL string) Provid
 // PickProvider chooses the active backend. Called once from main.
 func PickProvider(modelID string) (Provider, error) {
 	// 1. explicit override wins.
-	if name := strings.ToLower(strings.TrimSpace(os.Getenv("LLM_PROVIDER"))); name != "" {
+	if name := strings.ToLower(infra.Cfg.LLMProvider); name != "" {
 		if p, ok := providerRegistry[name]; ok {
 			return p, nil
 		}
@@ -157,7 +157,7 @@ func ProviderForModel(modelID string) Provider {
 	// 1. explicit global override wins - keeps parity with PickProvider
 	//    so an OpenAI-compatible gateway hosting "claude-*" models is
 	//    not mis-routed to the anthropic SDK.
-	if name := strings.ToLower(strings.TrimSpace(os.Getenv("LLM_PROVIDER"))); name != "" {
+	if name := strings.ToLower(infra.Cfg.LLMProvider); name != "" {
 		if p, ok := providerRegistry[name]; ok {
 			return p
 		}
@@ -204,9 +204,9 @@ var (
 // active (main) provider. It never errors; ambiguous cases fall back to
 // the active provider so the judge degrades gracefully.
 func JudgeProvider(modelID string) Provider {
-	judgeName := strings.ToLower(strings.TrimSpace(os.Getenv("JUDGE_PROVIDER")))
-	apiKey := strings.TrimSpace(os.Getenv("JUDGE_API_KEY"))
-	baseURL := strings.TrimSpace(os.Getenv("JUDGE_BASE_URL"))
+	judgeName := strings.ToLower(infra.Cfg.JudgeProvider)
+	apiKey := infra.Cfg.JudgeAPIKey
+	baseURL := infra.Cfg.JudgeBaseURL
 
 	// No judge-specific config at all -> preserve the prior behaviour
 	// (honours LLM_PROVIDER, model-id prefix, active-provider fallback).
