@@ -3,10 +3,10 @@ package task
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 )
@@ -77,6 +77,33 @@ type TaskManager struct {
 	dir      string
 	mu       sync.Mutex
 	dagSched *DAGScheduler // set after construction via SetScheduler
+
+	// In-memory cache mirroring task_*.json on disk.
+	//
+	// Every DAG/task query used to re-glob + re-read every task file on
+	// every call (ReadyTasks, IsReady, OnComplete, TopoView,
+	// ProgressSummary, ResumeContext, ...). For a session with N tasks
+	// that's O(N) disk reads *per query*, and callers like the
+	// teammate idle-poll loop (cmd/agent/team.go) call IsReady once per
+	// pending task every PollInterval — O(N²) reads per poll tick.
+	//
+	// The cache is a plain write-through map: every write path (save,
+	// delete) updates it right after the matching disk write, so reads
+	// never observe stale data without needing invalidation logic.
+	//
+	// It is guarded by its own mutex (cacheMu) rather than tm.mu,
+	// because DAGScheduler reads tasks via loadLocked/loadAllLocked
+	// while holding *its own* mutex (ds.mu) — not tm.mu, by existing
+	// design (see task_scheduler.go). An independent RWMutex lets both
+	// call paths stay race-free without introducing cross-locking
+	// between tm.mu and ds.mu.
+	//
+	// Map values are always defensive copies (see cloneTaskMap) so
+	// callers mutating a returned task (Update/Claim do this in place)
+	// never corrupt the cached entry or a concurrent reader's view.
+	cacheMu     sync.RWMutex
+	cache       map[int]map[string]any
+	cacheLoaded bool
 }
 
 func NewTaskManager(dir string) *TaskManager {
@@ -93,26 +120,83 @@ func (tm *TaskManager) taskPath(id int) string {
 	return filepath.Join(tm.dir, fmt.Sprintf("task_%d.json", id))
 }
 
+// cloneTaskMap returns a shallow copy. Task fields are all scalars
+// (id, subject, description, status, owner), so a shallow copy is
+// enough to give every caller an independent map safe to mutate.
+func cloneTaskMap(t map[string]any) map[string]any {
+	c := make(map[string]any, len(t))
+	maps.Copy(c, t)
+	return c
+}
+
+// ensureCache lazily builds the cache from disk on first access.
+// Double-checked locking: cheap RLock fast-path once warm.
+func (tm *TaskManager) ensureCache() {
+	tm.cacheMu.RLock()
+	loaded := tm.cacheLoaded
+	tm.cacheMu.RUnlock()
+	if loaded {
+		return
+	}
+	tm.cacheMu.Lock()
+	defer tm.cacheMu.Unlock()
+	if tm.cacheLoaded { // re-check: another goroutine may have won the race
+		return
+	}
+	cache := make(map[int]map[string]any)
+	for _, t := range tm.loadAllFromDiskUncached() {
+		if idf, ok := t["id"].(float64); ok {
+			cache[int(idf)] = t
+		}
+	}
+	tm.cache = cache
+	tm.cacheLoaded = true
+}
+
+// cachePut writes-through a saved task into the cache. Stores a clone
+// so later in-place mutation of the caller's map (Update/Claim) can't
+// silently rewrite the cached entry.
+func (tm *TaskManager) cachePut(id int, t map[string]any) {
+	stored := cloneTaskMap(t)
+	tm.cacheMu.Lock()
+	if tm.cache == nil {
+		tm.cache = make(map[int]map[string]any)
+	}
+	tm.cache[id] = stored
+	tm.cacheMu.Unlock()
+}
+
+// cacheDelete removes a task from the cache after its file is removed.
+func (tm *TaskManager) cacheDelete(id int) {
+	tm.cacheMu.Lock()
+	delete(tm.cache, id)
+	tm.cacheMu.Unlock()
+}
+
+// nextID returns the next unused task ID, from the (now warm) cache
+// instead of re-globbing the directory on every Create call.
 func (tm *TaskManager) nextID() int {
-	entries, _ := filepath.Glob(filepath.Join(tm.dir, "task_*.json"))
+	tm.ensureCache()
+	tm.cacheMu.RLock()
+	defer tm.cacheMu.RUnlock()
 	maxID := 0
-	for _, e := range entries {
-		base := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(e), "task_"), ".json")
-		if n, _ := strconv.Atoi(base); n > maxID {
-			maxID = n
+	for id := range tm.cache {
+		if id > maxID {
+			maxID = id
 		}
 	}
 	return maxID + 1
 }
 
 func (tm *TaskManager) load(id int) (map[string]any, error) {
-	data, err := os.ReadFile(tm.taskPath(id))
-	if err != nil {
+	tm.ensureCache()
+	tm.cacheMu.RLock()
+	t, ok := tm.cache[id]
+	tm.cacheMu.RUnlock()
+	if !ok {
 		return nil, fmt.Errorf("task %d not found", id)
 	}
-	var t map[string]any
-	json.Unmarshal(data, &t)
-	return t, nil
+	return cloneTaskMap(t), nil
 }
 
 // loadLocked reads a task without acquiring tm.mu (caller must hold DAGScheduler.mu).
@@ -124,11 +208,7 @@ func (tm *TaskManager) save(t map[string]any) {
 	id := int(t["id"].(float64))
 	data, _ := json.MarshalIndent(t, "", "  ")
 	os.WriteFile(tm.taskPath(id), data, 0o644)
-}
-
-// loadAll loads all task files (sorted by ID). Caller must hold tm.mu.
-func (tm *TaskManager) loadAll() []map[string]any {
-	return tm.loadAllFromDisk()
+	tm.cachePut(id, t)
 }
 
 // loadAllLocked reads all tasks without acquiring tm.mu (caller must hold DAGScheduler.mu).
@@ -136,7 +216,30 @@ func (tm *TaskManager) loadAllLocked() []map[string]any {
 	return tm.loadAllFromDisk()
 }
 
+// loadAllFromDisk returns all tasks sorted by ID from the cache,
+// lazily warming it from disk on first access. Name kept for minimal
+// diff at call sites; despite the name it no longer touches disk on
+// every call (see ensureCache / the cache fields on TaskManager).
 func (tm *TaskManager) loadAllFromDisk() []map[string]any {
+	tm.ensureCache()
+	tm.cacheMu.RLock()
+	defer tm.cacheMu.RUnlock()
+	ids := make([]int, 0, len(tm.cache))
+	for id := range tm.cache {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	result := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		result = append(result, cloneTaskMap(tm.cache[id]))
+	}
+	return result
+}
+
+// loadAllFromDiskUncached performs the actual glob + read of every
+// task_*.json file. Only ever called by ensureCache while it holds
+// cacheMu for writing, to (re)build the cache from ground truth.
+func (tm *TaskManager) loadAllFromDiskUncached() []map[string]any {
 	entries, _ := filepath.Glob(filepath.Join(tm.dir, "task_*.json"))
 	sort.Strings(entries)
 	var result []map[string]any
@@ -217,6 +320,7 @@ func (tm *TaskManager) Update(id int, status string) string {
 		t["status"] = status
 		if status == StatusDeleted {
 			os.Remove(tm.taskPath(id))
+			tm.cacheDelete(id)
 			tm.mu.Unlock()
 			// Delegate edge cleanup to DAGScheduler.
 			if tm.dagSched != nil {
@@ -234,9 +338,8 @@ func (tm *TaskManager) Update(id int, status string) string {
 func (tm *TaskManager) ListAll() string {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	entries, _ := filepath.Glob(filepath.Join(tm.dir, "task_*.json"))
-	sort.Strings(entries)
-	if len(entries) == 0 {
+	tasks := tm.loadAllFromDisk() // cache-backed; no per-call disk scan
+	if len(tasks) == 0 {
 		return "No tasks."
 	}
 
@@ -252,10 +355,7 @@ func (tm *TaskManager) ListAll() string {
 
 	markers := map[string]string{StatusPending: "[ ]", StatusInProgress: "[>]", StatusCompleted: "[x]"}
 	var lines []string
-	for _, e := range entries {
-		data, _ := os.ReadFile(e)
-		var t map[string]any
-		json.Unmarshal(data, &t)
+	for _, t := range tasks {
 		st, _ := t["status"].(string)
 		id := int(t["id"].(float64))
 		sub, _ := t["subject"].(string)

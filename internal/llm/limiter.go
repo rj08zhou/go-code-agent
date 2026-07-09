@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"go-code-agent/infra"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,9 +44,9 @@ var (
 // rejected by construction.
 func getLimiter() *llmLimiter {
 	limiterOnce.Do(func() {
-		qps := envFloat("LLM_MAX_QPS", infra.LlmDefaultMaxQPS)
-		burst := envInt("LLM_MAX_BURST", infra.LlmDefaultMaxBurst)
-		conc := envInt("LLM_MAX_CONCURRENCY", infra.LlmDefaultMaxConcurrency)
+		qps := infra.Cfg.LLMMaxQPS
+		burst := infra.Cfg.LLMMaxBurst
+		conc := infra.Cfg.LLMMaxConcurrency
 
 		l := &llmLimiter{}
 		if qps > 0 {
@@ -94,32 +93,6 @@ func (l *llmLimiter) Acquire(ctx context.Context) (release func(), err error) {
 		return func() { once.Do(func() { <-l.sem }) }, nil
 	}
 	return noop, nil
-}
-
-// envFloat parses a positive float env var, falling back to dflt on
-// missing / malformed input. A value <= 0 is treated as "disable".
-func envFloat(key string, dflt float64) float64 {
-	s := strings.TrimSpace(os.Getenv(key))
-	if s == "" {
-		return dflt
-	}
-	v, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return dflt
-	}
-	return v
-}
-
-func envInt(key string, dflt int) int {
-	s := strings.TrimSpace(os.Getenv(key))
-	if s == "" {
-		return dflt
-	}
-	v, err := strconv.Atoi(s)
-	if err != nil {
-		return dflt
-	}
-	return v
 }
 
 // 429 helpers — Retry-After parsing.

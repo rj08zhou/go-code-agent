@@ -6,7 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"go-code-agent/infra"
-	"go-code-agent/internal/log"
+	"go-code-agent/internal/logging"
 	"math/rand"
 	"strings"
 	"time"
@@ -315,12 +315,12 @@ func (c *Client) StreamWithRetrySink(ctx context.Context, source string, params 
 func logRetryAttempt(attempt int, err error, delay, hint time.Duration) {
 	body := errSnippet(err, 400)
 	if hint > 0 {
-		log.PrintSystem(fmt.Sprintf("[llm-retry] attempt %d/%d failed (retry_after=%s, waiting %s): %s",
+		logging.PrintSystem(fmt.Sprintf("[llm-retry] attempt %d/%d failed (retry_after=%s, waiting %s): %s",
 			attempt+1, infra.LlmMaxRetries, hint.Round(100*time.Millisecond),
 			delay.Round(100*time.Millisecond), body))
 		return
 	}
-	log.PrintSystem(fmt.Sprintf("[llm-retry] attempt %d/%d failed (waiting %s): %s",
+	logging.PrintSystem(fmt.Sprintf("[llm-retry] attempt %d/%d failed (waiting %s): %s",
 		attempt+1, infra.LlmMaxRetries, delay.Round(100*time.Millisecond), body))
 }
 
@@ -340,3 +340,5 @@ func errSnippet(err error, max int) string {
 	half := (max - 5) / 2
 	return s[:half] + " ... " + s[len(s)-half:]
 }
+
+
