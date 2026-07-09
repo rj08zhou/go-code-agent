@@ -222,17 +222,6 @@ func (r *UsageRecorder) Record(source, provider, model, traceID string, u llm.Us
 	_ = f.Sync()
 }
 
-// Path returns the on-disk usage log path (empty if disabled).
-// Used by main.go's welcome banner.
-func (r *UsageRecorder) Path() string {
-	if r == nil {
-		return ""
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.path
-}
-
 // Render returns a human-readable summary of usage rollups.
 func (r *UsageRecorder) Render() string {
 	if r == nil {

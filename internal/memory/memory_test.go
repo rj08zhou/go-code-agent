@@ -469,7 +469,7 @@ func TestLoadEvergreen(t *testing.T) {
 	store := NewMemoryStore(tmpDir)
 
 	// Create a MEMORY.md file
-	evergreenPath := filepath.Join(store.workspaceDir, "MEMORY.md")
+	evergreenPath := filepath.Join(store.workspaceDir, "memory", "MEMORY.md")
 	err := os.WriteFile(evergreenPath, []byte("# Test Memory\n\n[preference] user likes dark mode\n\n[lesson] always use context managers"), 0o644)
 	if err != nil {
 		t.Fatalf("Failed to write MEMORY.md: %v", err)
@@ -568,7 +568,7 @@ func TestGetStats(t *testing.T) {
 	tmpDir := t.TempDir()
 	store := NewMemoryStore(tmpDir)
 
-	evergreenPath := filepath.Join(store.workspaceDir, "MEMORY.md")
+	evergreenPath := filepath.Join(store.workspaceDir, "memory", "MEMORY.md")
 	err := os.WriteFile(evergreenPath, []byte("[fact] initial fact"), 0o644)
 	if err != nil {
 		t.Fatalf("Failed to write MEMORY.md: %v", err)
@@ -878,15 +878,24 @@ func TestDeduplicateResults(t *testing.T) {
 }
 
 func TestFilterChunks(t *testing.T) {
+	// Dates must be relative to time.Now() (what filterChunks's cutoff is
+	// computed from), not hardcoded absolute strings - a fixed date like
+	// "2026-06-05" only satisfies withinDays=2 on the day it was written
+	// and silently starts failing every day after, once real time moves
+	// past it (this is exactly what happened here).
+	now := time.Now().UTC()
+	today := now.Format("2006-01-02")
+	yesterday := now.AddDate(0, 0, -1).Format("2006-01-02")
+	old := now.AddDate(0, 0, -3).Format("2006-01-02") // outside the 2-day window
 	chunks := []memoryChunk{
-		{Path: "2026-06-05.jsonl", Text: "today's memory", Category: "fact"},
-		{Path: "2026-06-04.jsonl", Text: "yesterday's memory", Category: "fact"},
-		{Path: "2026-06-03.jsonl", Text: "old memory", Category: "fact"},
+		{Path: today + ".jsonl", Text: "today's memory", Category: "fact"},
+		{Path: yesterday + ".jsonl", Text: "yesterday's memory", Category: "fact"},
+		{Path: old + ".jsonl", Text: "old memory", Category: "fact"},
 		{Path: "MEMORY.md", Text: "evergreen memory", Category: "fact"},
 	}
 
 	// Test withinDays filter
-	// Should return: today (06-05), yesterday (06-04), and MEMORY.md (evergreen, always included)
+	// Should return: today, yesterday, and MEMORY.md (evergreen, always included)
 	filtered := filterChunks(chunks, 2, "")
 	if filtered == nil {
 		t.Fatal("filterChunks returned nil")
@@ -921,7 +930,7 @@ func TestHybridSearch(t *testing.T) {
 	tmpDir := t.TempDir()
 	store := NewMemoryStore(tmpDir)
 
-	evergreenPath := filepath.Join(store.workspaceDir, "MEMORY.md")
+	evergreenPath := filepath.Join(store.workspaceDir, "memory", "MEMORY.md")
 	err := os.WriteFile(evergreenPath, []byte("[fact] evergreen memory"), 0o644)
 	if err != nil {
 		t.Fatalf("Failed to write MEMORY.md: %v", err)
@@ -1027,7 +1036,7 @@ func TestLoadAllChunksFromDisk(t *testing.T) {
 [lesson] always use context managers
 
 plain fact about the project`
-	memPath := filepath.Join(store.workspaceDir, "MEMORY.md")
+	memPath := filepath.Join(store.workspaceDir, "memory", "MEMORY.md")
 	if err := os.WriteFile(memPath, []byte(memoryContent), 0o644); err != nil {
 		t.Fatalf("Failed to write MEMORY.md: %v", err)
 	}
@@ -1220,7 +1229,7 @@ func TestRebuildCache_WithEvergreen(t *testing.T) {
 
 	// Write MEMORY.md
 	memoryContent := `[preference] user likes dark mode`
-	memPath := filepath.Join(store.workspaceDir, "MEMORY.md")
+	memPath := filepath.Join(store.workspaceDir, "memory", "MEMORY.md")
 	if err := os.WriteFile(memPath, []byte(memoryContent), 0o644); err != nil {
 		t.Fatalf("Failed to write MEMORY.md: %v", err)
 	}
@@ -1251,7 +1260,7 @@ func TestGetStats_MultipleDays(t *testing.T) {
 
 	// Write MEMORY.md
 	memoryContent := `[preference] user likes dark mode`
-	memPath := filepath.Join(store.workspaceDir, "MEMORY.md")
+	memPath := filepath.Join(store.workspaceDir, "memory", "MEMORY.md")
 	if err := os.WriteFile(memPath, []byte(memoryContent), 0o644); err != nil {
 		t.Fatalf("Failed to write MEMORY.md: %v", err)
 	}

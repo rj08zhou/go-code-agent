@@ -120,7 +120,7 @@ All persistent state is stored under `{workdir}/.go-code-agent/`. Sessions survi
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                   ORCHESTRATION (agent_loop.go)                  │
+│                ORCHESTRATION (internal/agent, loop.go)           │
 │                                                                  │
 │  Pre-round:   microCompact → tokenCheck → drain bg/inbox        │
 │  Gates:       think-gate → planning-gate → write-gate           │
@@ -133,7 +133,7 @@ All persistent state is stored under `{workdir}/.go-code-agent/`. Sessions survi
 │  LLM PROVIDERS           │   │  TOOL DISPATCH                    │
 │  (provider_*.go)         │   │  (tool_registry + MCP)            │
 │                          │   │                                   │
-│  openai / anthropic /    │   │  30+ built-in + mcp__* tools      │
+│  openai / anthropic /    │   │  32 built-in + mcp__* tools        │
 │  gemini (stub)           │   │  security gate → HITL gate →      │
 │  + retry (exp backoff)   │   │  timeout → snapshot/rollback      │
 └──────────────────────────┘   └────────────────┬──────────────────┘
@@ -159,9 +159,23 @@ All persistent state is stored under `{workdir}/.go-code-agent/`. Sessions survi
 
 ### Component Ownership
 
-All subsystems are owned by `AppContext` (app.go):
-- **Workdir-global** (persist for process lifetime): `MemoryStore`, `MCPManager`, `SkillLoader`, `PromptLoader`
-- **Per-session** (rebound on session switch): `TaskManager`, `DAGScheduler`, `MessageBus`, `ProtocolStore`, `HistoryStore`, `TeammateManager`
+`AppContext` (`internal/agent/app.go`) is the single root object holding
+every piece of process-/session-scoped state; `main.go` only ever
+constructs one (`agent.NewApp(model, workdir, bashValidate)`) and reaches
+everything else through it — no subsystem lives as a bare package
+variable outside the tool registry.
+
+- **Process-wide config** (fields on `AppContext`, built once by `NewApp`): `Model`, `Workdir`, `System` (rebuilt per-session)
+- **Workdir-global subsystems** (fields on `AppContext`, persist for process lifetime): `Skills`, `MemStore`, `MCPMgr`, `PromptLoader`, `SessionManager`, `Snapshot`, `Judge`
+- **Per-session** (rebound on session switch, reached via `SessionManager.Active()`): `TaskManager`, `DAGScheduler`, `MessageBus`, `ProtocolStore`, `HistoryStore`, `TeammateManager`
+- **Compile-time capability table** (package-level, not per-instance): `ToolDefs` / `ToolHandlers` / `ToolSecurityMap`, populated once by `InitTools()`
+
+Lifecycle is driven by three `AppContext` methods, each collapsing a
+sequence that used to be duplicated across `main.go` and
+`repl_commands.go`:
+- `NewApp(model, workdir, bashValidate)` — constructs every workdir-global subsystem in one call
+- `ActivateSession(sess)` — binds `sess` into `SessionManager`, rebuilds `TeamMgr`, regenerates `System`
+- `DeactivateActiveSession()` — shuts down teammates, flushes the active session to memory
 
 ---
 
@@ -181,7 +195,7 @@ agentLoop(ctx, &conv)
   │
   ├─ [preRound]
   │    ├─ microCompact: collapse old tool results to summaries
-  │    ├─ tokenCheck: if > 100K tokens → autoCompact (LLM summarization)
+  │    ├─ tokenCheck: if > 300K tokens → autoCompact (LLM summarization)
   │    ├─ drain background results → inject as tool messages
   │    └─ drain team inbox → inject as user messages
   │
@@ -281,21 +295,29 @@ All thresholds are centralized in one file for easy tuning:
 | Category | Constant | Value | Description |
 |----------|----------|-------|-------------|
 | **Loop** | MaxRounds | 100 | Hard safety cap for agent loop |
-| | StuckThreshold | 10 | Rounds without progress = stuck |
-| | ReflectInterval | 5 | Periodic reflection every N rounds |
+| | StuckThreshold | 20 | Rounds without progress = stuck |
+| | ReflectInterval | 20 | Periodic reflection every N rounds |
 | | MaxConsecutiveFailures | 3 | Same tool failing → strategy change |
 | | LessonThreshold | 3 | Min rounds before auto-lesson |
 | | SubagentMaxRounds | 30 | Subagent inner loop cap |
 | | TeammateWorkMaxRounds | 50 | Teammate work phase cap |
-| **Tokens** | TokenThreshold | 200,000 | autoCompact trigger |
-| | KeepRecent | 10 | microCompact keeps N recent tool msgs |
-| | MaxOutputLen | 50,000 | Max bytes per tool output |
+| | DefaultMaxOutputTokens | 16,384 | Default max output tokens per LLM call |
+| **Tokens** | TokenThreshold | 300,000 | autoCompact trigger |
+| | KeepRecent | 15 | microCompact keeps N recent tool msgs |
+| | MaxOutputLen | 500,000 | Max bytes per tool output (500KB) |
 | | TokenCheckInterval | 3 | Re-check tokens every N rounds |
 | **Timing** | PerToolTimeout | 5 min | Hard ceiling per tool handler |
 | | BashTimeout | 120s | bash / background_run timeout |
-| | LlmMaxRetries | 3 | LLM call retry attempts |
+| | LlmMaxRetries | 5 | LLM call retry attempts |
 | | LlmBaseDelay | 1s | Exponential backoff base |
-| | LlmMaxDelay | 8s | Exponential backoff cap |
+| | LlmRateLimitDelay | 10s | 429-specific base backoff |
+| | LlmMaxDelay | 60s | Exponential backoff cap |
+| | LlmCallTimeout | 5 min | Wall-clock cap per provider Call/Stream attempt |
+| | LlmHTTPTimeout | 6 min | Underlying HTTP transport timeout (backstop) |
+| | LlmDefaultMaxQPS | 2.0 | Process-wide LLM throttle (requests/sec) |
+| | LlmDefaultMaxBurst | 4 | Token-bucket burst capacity |
+| | LlmDefaultMaxConcurrency | 2 | Max in-flight LLM calls process-wide |
+| | SpawnMinInterval | 750ms | Stagger between teammate/subagent spawns |
 | **Memory** | MemoryTTLDays | 90 | Daily files auto-deleted after this |
 | | MaxEvergreenChars | 8,000 | MEMORY.md injection truncation |
 | | DeduplicateThreshold | 0.7 | Jaccard similarity for dedup |
@@ -320,24 +342,27 @@ All thresholds are centralized in one file for easy tuning:
 
 ```
 go-code-agent/
-├── cmd/agent/                    # Application layer (package main)
-│   ├── main.go                   # Entry point: flags, init, REPL loop
-│   ├── app.go                    # AppContext: root object holding all subsystems
-│   ├── agent_loop.go             # Core multi-round execution loop
-│   ├── plan.go                   # Think-gate + planning-gate logic
-│   ├── reflection.go             # Mini-reflect, strategy-change, stuck detection
-│   ├── judge.go                  # LLM-as-Judge post-completion verifier
-│   ├── compression.go            # microCompact + autoCompact (token management)
-│   ├── subagent.go               # Read-only sub-agent spawner (task tool)
-│   ├── team.go                   # TeammateManager: WORK/IDLE autonomous loop
-│   ├── tool_registry.go          # Tool definitions (30+ tools registered here)
-│   ├── tool_base.go              # Base tool handlers (bash, files, think, etc.)
-│   ├── repl_commands.go          # Slash-command dispatcher (/session, /tasks, etc.)
-│   ├── system_prompt.go          # System prompt assembly + memory recall
-│   ├── security.go               # Bash policy, path sandbox, secrets sanitizer, diff preview
-│   └── snapshot.go               # Saga-pattern snapshot/rollback via git-stash
+├── cmd/agent/                    # Application layer (package main) - composition root only
+│   ├── main.go                   # Entry point: flags, wiring, REPL loop, SIGINT cleanup
+│   └── repl_commands.go          # Slash-command dispatcher (/session, /tasks, etc.)
 │
-├── internal/                     # Reusable infrastructure packages
+├── internal/                     # Reusable infrastructure + the agent engine
+│   ├── agent/                    # The agent engine (package agent)
+│   │   ├── app.go                #   AppContext: root object + NewApp/ActivateSession/DeactivateActiveSession
+│   │   ├── loop.go               #   Core multi-round execution loop (Run)
+│   │   ├── plan.go               #   Think-gate + planning-gate logic
+│   │   ├── reflection.go         #   Mini-reflect, strategy-change, stuck detection
+│   │   ├── judge.go              #   LLM-as-Judge post-completion verifier
+│   │   ├── decisions.go          #   Autonomous-decision audit trail (decisions.jsonl, /decisions)
+│   │   ├── compression.go        #   microCompact + autoCompact (token management)
+│   │   ├── subagent.go           #   Read-only sub-agent spawner (task tool)
+│   │   ├── team.go               #   TeammateManager: WORK/IDLE autonomous loop
+│   │   ├── tool_registry.go      #   Tool definitions (30+ tools registered here)
+│   │   ├── tool_base.go          #   Base tool handlers (bash, files, think, etc.)
+│   │   ├── system_prompt.go      #   System prompt assembly + memory recall
+│   │   ├── security.go           #   Tool security registry, checkToolApproval, HITL gate glue
+│   │   ├── snapshot.go           #   Saga-pattern snapshot/rollback via git-stash
+│   │   └── log_file.go           #   Per-session file logging (session.log)
 │   ├── llm/                      # LLM abstraction layer
 │   │   ├── llm_types.go          #   Neutral types: Message, ToolCall, ToolDef, Role
 │   │   ├── llm_client.go         #   Retry wrapper, trace ID, streaming interface
@@ -345,14 +370,14 @@ go-code-agent/
 │   │   ├── provider_openai.go    #   OpenAI/compatible backend (streaming + tools)
 │   │   ├── provider_anthropic.go #   Anthropic backend (streaming + tools)
 │   │   ├── provider_gemini.go    #   Gemini stub (placeholder)
-│   │   └── tool_helpers.go       #   Tool parameter extraction helpers
+│   │   └── tool_helpers.go       #   Tool parameter extraction helpers (MkOk/MkErr/ParseArgs)
 │   ├── session/                  # Session lifecycle
 │   │   ├── session.go            #   Per-session aggregate (owns task/team/history)
-│   │   └── session_manager.go    #   CRUD, bootstrap, activate/deactivate, index
+│   │   └── session_manager.go    #   CRUD, BootstrapOrCreate, activate/deactivate, index
 │   ├── history/                  # Conversation persistence
 │   │   └── history.go            #   Append-only JSONL + checkpoint compaction
-│   ├── hitl_audit/               # Human-in-the-loop + audit
-│   │   ├── hitl_audit.go         #   Audit log (JSONL) + approval gate
+│   ├── hitlaudit/                # Human-in-the-loop + audit
+│   │   ├── hitlaudit.go          #   Audit log (JSONL) + approval gate
 │   │   └── human_approval.go     #   4-mode approval logic + risk classification
 │   ├── task/                     # Task management
 │   │   ├── task.go               #   TaskManager: CRUD, file persistence
@@ -374,14 +399,14 @@ go-code-agent/
 │   │   └── background.go         #   Goroutine pool + result collection
 │   ├── usage/                    # Token usage telemetry
 │   │   └── usage.go              #   UsageRecorder: per-call JSONL logging
-│   └── log/                      # Terminal output
-│       └── log.go                #   Colored output helpers (system/error/tool/llm)
+│   └── logging/                  # Terminal output
+│       └── log.go                #   Colored output helpers (system/error/tool/agent)
 │
 ├── infra/                        # Cross-cutting constants
 │   └── consts.go                 # All tunable thresholds in one place
 │
 ├── utils/                        # Shared utilities
-│   └── utils.go                  # Path helpers (JoinWorkdir, etc.)
+│   └── utils.go                  # Path helpers (JoinWorkdir, Truncate, etc.)
 │
 ├── prompts/                      # Prompt templates (*.md)
 │   ├── system.md                 # Main system prompt template
@@ -422,15 +447,18 @@ go-code-agent/
 | `/compact` | Manually trigger conversation compaction (LLM summarization) |
 | `/tasks` | List all tasks in current session with status |
 | `/dag` | Show DAG execution plan (topological stages) |
+| `/decisions` | Show the active session's autonomous-decision audit trail (decisions.jsonl) |
 | `/team` | List active teammates with state (WORK/IDLE) |
 | `/inbox` | Read the lead agent's inbox messages |
 | `/memory` | Show memory statistics (evergreen chars, daily files, entries) |
 | `/search <query>` | Search memories with hybrid BM25+vector |
 | `/mcp` | List connected MCP servers and their tools |
 | `/mcp connect <name> <cmd>` | Connect a new MCP server at runtime |
+| `/mcp disconnect <name>` | Disconnect an MCP server at runtime |
 | `/usage` | Token usage summary (by source, model, session) |
 | `/approve [safe\|danger\|off]` | Toggle auto-approval level for tool calls |
 | `/security` | Show current security configuration status |
+| `/security test-bash <cmd>` | Dry-run a command through the bash allowlist/danger-pattern policy |
 
 ---
 
@@ -536,8 +564,8 @@ LLM_PROVIDER env set?
 ### Retry Strategy
 
 All providers share the same retry wrapper:
-- **Max retries**: 3
-- **Backoff**: exponential (1s → 2s → 4s → 8s cap)
+- **Max retries**: 5
+- **Backoff**: exponential (1s → 2s → 4s → 8s → 16s cap 60s)
 - **Retryable**: 429 (rate limit), 500/502/503 (server errors), network timeouts
 - **Non-retryable**: 400 (bad request), 401 (auth), 404
 
@@ -688,23 +716,25 @@ user message → extract keywords → hybrid search → top-3 results
 ### Lifecycle
 
 ```
-NewSession(title)
-  → creates directory: .go-code-agent/sessions/<uuid>/
-  → subdirs: tasks/, team/, history/, transcripts/
+SessionManager.BootstrapOrCreate(forceNew, explicitID)
+  → forceNew (no explicit id): NewSession("New session")
+  → otherwise: BootstrapSession resolves explicit id > most recent > fresh
+  → NewSession creates directory: .go-code-agent/sessions/<uuid>/
+    subdirs: tasks/, team/, history/, transcripts/
   │
-Activate(session)
-  → loads TaskManager, DAGScheduler, MessageBus, ProtocolStore
-  → loads HistoryStore, restores conversation
-  → constructs TeammateManager
+AppContext.ActivateSession(session)
+  → SessionManager.Activate: binds session, persists it as active in the index
+  → rebuilds TeammateManager from the session's Bus/TaskMgr/DagSched/Protocols
+  → regenerates System (system prompt) for the now-active session
   │
 Work (multiple turns)
   → history appended as JSONL (fsync on each write)
   → tasks persisted as JSON files
   │
-Deactivate(session)
-  → session_to_memory prompt → extracts learnings
-  → saves to MemoryStore for future recall
-  → updates session index (last-active timestamp)
+AppContext.DeactivateActiveSession()
+  → ShutdownTeammates: stops all running teammates
+  → SessionManager.Deactivate: session_to_memory prompt extracts learnings,
+    saves to MemoryStore, updates session index (last-active timestamp)
   │
 Archive(session)
   → marks as archived in index
@@ -815,11 +845,11 @@ Each MCP server has a circuit breaker:
 
 ### microCompact (every round)
 
-Collapses old tool result messages to brief summaries, keeping only the N most recent (default 3) in full. This prevents unbounded context growth during long tool-use sessions.
+Collapses old tool result messages to brief summaries, keeping only the N most recent (default 15) in full. This prevents unbounded context growth during long tool-use sessions.
 
 ### autoCompact (threshold-triggered)
 
-When estimated total tokens exceed 100K:
+When estimated total tokens exceed 300K:
 1. Sends the full conversation to LLM with a "summarize" instruction
 2. Replaces all messages (except system + recent) with a single checkpoint message
 3. Checkpoint is persisted to history JSONL for crash recovery
