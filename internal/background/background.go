@@ -62,6 +62,7 @@ func (bg *BackgroundManager) Run(command string, timeout int) string {
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "sh", "-c", command)
 		cmd.Dir = bg.workdir
+		utils.SetNewProcessGroup(cmd)
 		output, err := cmd.CombinedOutput()
 
 		status, result := "completed", strings.TrimSpace(string(output))

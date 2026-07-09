@@ -120,7 +120,7 @@ SNAPSHOT_ENABLED=1 ./agent
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                   ORCHESTRATION (agent_loop.go)                  │
+│                ORCHESTRATION (internal/agent, loop.go)           │
 │                                                                  │
 │  Pre-round:   microCompact → tokenCheck → drain bg/inbox        │
 │  Gates:       think-gate → planning-gate → write-gate           │
@@ -133,7 +133,7 @@ SNAPSHOT_ENABLED=1 ./agent
 │  LLM PROVIDERS           │   │  TOOL DISPATCH                    │
 │  (provider_*.go)         │   │  (tool_registry + MCP)            │
 │                          │   │                                   │
-│  openai / anthropic /    │   │  30+ built-in + mcp__* tools      │
+│  openai / anthropic /    │   │  32 built-in + mcp__* tools        │
 │  gemini (stub)           │   │  security gate → HITL gate →      │
 │  + retry (exp backoff)   │   │  timeout → snapshot/rollback      │
 └──────────────────────────┘   └────────────────┬──────────────────┘
@@ -159,9 +159,20 @@ SNAPSHOT_ENABLED=1 ./agent
 
 ### 组件所有权
 
-所有子系统由 `AppContext`（`app.go`）统一管理：
-- **工作目录全局**（进程生命周期内持久）：`MemoryStore`、`MCPManager`、`SkillLoader`、`PromptLoader`
-- **每会话**（会话切换时重新绑定）：`TaskManager`、`DAGScheduler`、`MessageBus`、`ProtocolStore`、`HistoryStore`、`TeammateManager`
+`AppContext`（`internal/agent/app.go`）是持有全部进程级/会话级状态的唯一
+根对象；`main.go` 只构造一次（`agent.NewApp(model, workdir, bashValidate)`），
+其余全部通过它访问——除工具注册表外，没有任何子系统以裸包变量形式存在。
+
+- **进程级配置**（`AppContext` 字段，由 `NewApp` 一次性构造）：`Model`、`Workdir`、`System`（每会话重建）
+- **工作目录全局子系统**（`AppContext` 字段，进程生命周期内持久）：`Skills`、`MemStore`、`MCPMgr`、`PromptLoader`、`SessionManager`、`Snapshot`、`Judge`
+- **每会话**（会话切换时重新绑定，经 `SessionManager.Active()` 访问）：`TaskManager`、`DAGScheduler`、`MessageBus`、`ProtocolStore`、`HistoryStore`、`TeammateManager`
+- **编译期能力表**（包级、非实例级）：`ToolDefs` / `ToolHandlers` / `ToolSecurityMap`，由 `InitTools()` 一次性填充
+
+生命周期由 `AppContext` 的三个方法驱动，每个都收敛了此前在 `main.go` 与
+`repl_commands.go` 之间重复的一段流程：
+- `NewApp(model, workdir, bashValidate)` —— 一次调用构造全部工作目录全局子系统
+- `ActivateSession(sess)` —— 把 `sess` 绑定进 `SessionManager`，重建 `TeamMgr`，重新生成 `System`
+- `DeactivateActiveSession()` —— 关闭全部 teammate，把当前活跃会话落盘到记忆
 
 ---
 
@@ -181,7 +192,7 @@ agentLoop(ctx, &conv)
   │
   ├─ [preRound]
   │    ├─ microCompact: 将旧的工具结果折叠为摘要
-  │    ├─ tokenCheck: 超过 100K tokens → autoCompact（LLM 摘要）
+  │    ├─ tokenCheck: 超过 300K tokens → autoCompact（LLM 摘要）
   │    ├─ drain background results → 注入为工具消息
   │    └─ drain team inbox → 注入为用户消息
   │
@@ -274,21 +285,29 @@ Judge 使用 `llm.JudgeProvider()` 在运行时动态选择 LLM 后端：
 | 分类 | 常量 | 值 | 说明 |
 |------|------|-----|------|
 | **循环** | MaxRounds | 100 | Agent 循环硬性安全上限 |
-|  | StuckThreshold | 10 | 多少轮无进展判定为 stuck |
-|  | ReflectInterval | 5 | 每 N 轮周期性反思 |
+|  | StuckThreshold | 20 | 多少轮无进展判定为 stuck |
+|  | ReflectInterval | 20 | 每 N 轮周期性反思 |
 |  | MaxConsecutiveFailures | 3 | 同一工具连续失败 → 策略变更 |
 |  | LessonThreshold | 3 | 自动总结经验最少轮数 |
 |  | SubagentMaxRounds | 30 | 子 Agent 内循环上限 |
 |  | TeammateWorkMaxRounds | 50 | Teammate 工作阶段上限 |
-| **Token** | TokenThreshold | 200,000 | autoCompact 触发阈值 |
-|  | KeepRecent | 10 | microCompact 保留最近 N 条工具消息 |
-|  | MaxOutputLen | 50,000 | 每条工具输出最大字节数 |
+|  | DefaultMaxOutputTokens | 16,384 | 每次 LLM 调用默认最大输出 token 数 |
+| **Token** | TokenThreshold | 300,000 | autoCompact 触发阈值 |
+|  | KeepRecent | 15 | microCompact 保留最近 N 条工具消息 |
+|  | MaxOutputLen | 500,000 | 每条工具输出最大字节数（500KB） |
 |  | TokenCheckInterval | 3 | 每 N 轮重新检查 token 数 |
 | **超时** | PerToolTimeout | 5 min | 每个工具处理器硬性上限 |
 |  | BashTimeout | 120s | bash / background_run 超时 |
-|  | LlmMaxRetries | 3 | LLM 调用重试次数 |
+|  | LlmMaxRetries | 5 | LLM 调用重试次数 |
 |  | LlmBaseDelay | 1s | 指数退避基数 |
-|  | LlmMaxDelay | 8s | 指数退避上限 |
+|  | LlmRateLimitDelay | 10s | 429 专用基础退避时间 |
+|  | LlmMaxDelay | 60s | 指数退避上限 |
+|  | LlmCallTimeout | 5 min | 单次 provider Call/Stream 调用的墙钟上限 |
+|  | LlmHTTPTimeout | 6 min | 底层 HTTP 传输超时（兜底） |
+|  | LlmDefaultMaxQPS | 2.0 | 进程级 LLM 限流（每秒请求数） |
+|  | LlmDefaultMaxBurst | 4 | 令牌桶突发容量 |
+|  | LlmDefaultMaxConcurrency | 2 | 进程级最大并发 LLM 调用数 |
+|  | SpawnMinInterval | 750ms | teammate/subagent 生成之间的错峰间隔 |
 | **记忆** | MemoryTTLDays | 90 | 日常文件超过此天数自动删除 |
 |  | MaxEvergreenChars | 8,000 | MEMORY.md 注入截断长度 |
 |  | DeduplicateThreshold | 0.7 | 去重 Jaccard 相似度阈值 |
@@ -313,24 +332,27 @@ Judge 使用 `llm.JudgeProvider()` 在运行时动态选择 LLM 后端：
 
 ```
 go-code-agent/
-├── cmd/agent/                    # 应用层（package main）
-│   ├── main.go                   # 入口：标志解析、初始化、REPL 循环
-│   ├── app.go                    # AppContext：持有所有子系统的根对象
-│   ├── agent_loop.go             # 核心多轮执行循环
-│   ├── plan.go                   # Think-gate + planning-gate 逻辑
-│   ├── reflection.go             # Mini-reflect、strategy-change、stuck 检测
-│   ├── judge.go                  # LLM-as-Judge 完成后验证器
-│   ├── compression.go            # microCompact + autoCompact（token 管理）
-│   ├── subagent.go               # 只读子 Agent 生成器（task 工具）
-│   ├── team.go                   # TeammateManager：WORK/IDLE 自治循环
-│   ├── tool_registry.go          # 工具定义（30+ 工具在此注册）
-│   ├── tool_base.go              # 基础工具处理器（bash、文件、think 等）
-│   ├── repl_commands.go          # 斜杠命令派发器（/session、/tasks 等）
-│   ├── system_prompt.go          # 系统提示词组装
-│   ├── security.go               # Bash 策略、路径沙箱、密钥脱敏、diff 预览
-│   └── snapshot.go               # 基于 git-stash 的 Saga 模式快照/回滚
+├── cmd/agent/                    # 应用层（package main）—— 只做组装，不含业务逻辑
+│   ├── main.go                   # 入口：标志解析、依赖组装、REPL 循环、SIGINT 清理
+│   └── repl_commands.go          # 斜杠命令派发器（/session、/tasks 等）
 │
-├── internal/                     # 可复用基础设施包
+├── internal/                     # 可复用基础设施 + Agent 引擎
+│   ├── agent/                    # Agent 引擎（package agent）
+│   │   ├── app.go                #   AppContext：根对象 + NewApp/ActivateSession/DeactivateActiveSession
+│   │   ├── loop.go               #   核心多轮执行循环（Run）
+│   │   ├── plan.go               #   Think-gate + planning-gate 逻辑
+│   │   ├── reflection.go         #   Mini-reflect、strategy-change、stuck 检测
+│   │   ├── judge.go              #   LLM-as-Judge 完成后验证器
+│   │   ├── decisions.go          #   自主决策审计轨迹（decisions.jsonl，/decisions）
+│   │   ├── compression.go        #   microCompact + autoCompact（token 管理）
+│   │   ├── subagent.go           #   只读子 Agent 生成器（task 工具）
+│   │   ├── team.go               #   TeammateManager：WORK/IDLE 自治循环
+│   │   ├── tool_registry.go      #   工具定义（30+ 工具在此注册）
+│   │   ├── tool_base.go          #   基础工具处理器（bash、文件、think 等）
+│   │   ├── system_prompt.go      #   系统提示词组装
+│   │   ├── security.go           #   工具安全注册表、checkToolApproval、HITL 门控 glue
+│   │   ├── snapshot.go           #   基于 git-stash 的 Saga 模式快照/回滚
+│   │   └── log_file.go           #   每会话文件日志（session.log）
 │   ├── llm/                      # LLM 抽象层
 │   │   ├── llm_types.go          #   中立类型：Message、ToolCall、ToolDef、Role
 │   │   ├── llm_client.go         #   重试包装器、trace ID、流式接口
@@ -338,14 +360,14 @@ go-code-agent/
 │   │   ├── provider_openai.go    #   OpenAI/兼容后端（流式 + 工具）
 │   │   ├── provider_anthropic.go #   Anthropic 后端（流式 + 工具）
 │   │   ├── provider_gemini.go    #   Gemini 占位（预留）
-│   │   └── tool_helpers.go       #   工具参数提取辅助函数
+│   │   └── tool_helpers.go       #   工具参数提取辅助函数（MkOk/MkErr/ParseArgs）
 │   ├── session/                  # 会话生命周期
 │   │   ├── session.go            #   每会话聚合根（拥有 task/team/history）
-│   │   └── session_manager.go    #   CRUD、bootstrap、activate/deactivate、索引
+│   │   └── session_manager.go    #   CRUD、BootstrapOrCreate、activate/deactivate、索引
 │   ├── history/                  # 对话持久化
 │   │   └── history.go            #   Append-only JSONL + checkpoint 压缩
-│   ├── hitl_audit/               # 人工确认 + 审计
-│   │   ├── hitl_audit.go         #   审计日志（JSONL）+ 审批门控
+│   ├── hitlaudit/                # 人工确认 + 审计
+│   │   ├── hitlaudit.go          #   审计日志（JSONL）+ 审批门控
 │   │   └── human_approval.go     #   4 种模式审批逻辑 + 风险分类
 │   ├── task/                     # 任务管理
 │   │   ├── task.go               #   TaskManager：CRUD、文件持久化
@@ -367,14 +389,14 @@ go-code-agent/
 │   │   └── background.go         #   Goroutine 池 + 结果收集
 │   ├── usage/                    # Token 用量遥测
 │   │   └── usage.go              #   UsageRecorder：每次调用的 JSONL 日志
-│   └── log/                      # 终端输出
-│       └── log.go                #   彩色输出辅助函数（system/error/tool/llm）
+│   └── logging/                  # 终端输出
+│       └── log.go                #   彩色输出辅助函数（system/error/tool/agent）
 │
 ├── infra/                        # 横切常量
 │   └── consts.go                 # 所有可调阈值集中在此
 │
 ├── utils/                        # 共享工具函数
-│   └── utils.go                  # 路径辅助函数（JoinWorkdir 等）
+│   └── utils.go                  # 路径辅助函数（JoinWorkdir、Truncate 等）
 │
 ├── prompts/                      # 提示词模板（*.md）
 │   ├── system.md                 # 主系统提示词模板
@@ -415,15 +437,18 @@ go-code-agent/
 | `/compact` | 手动触发对话压缩（LLM 摘要） |
 | `/tasks` | 列出当前会话中所有任务及其状态 |
 | `/dag` | 展示 DAG 执行计划（拓扑阶段） |
+| `/decisions` | 显示当前会话的自主决策审计轨迹（decisions.jsonl） |
 | `/team` | 列出活跃 teammates 及其状态（WORK/IDLE） |
 | `/inbox` | 读取主导 Agent 的收件箱消息 |
 | `/memory` | 显示记忆统计（常驻字符数、日常文件数、条目数） |
 | `/search <query>` | 用混合 BM25+向量搜索记忆 |
 | `/mcp` | 列出已连接的 MCP 服务器及其工具 |
 | `/mcp connect <name> <cmd>` | 运行时连接新的 MCP 服务器 |
+| `/mcp disconnect <name>` | 运行时断开某个 MCP 服务器 |
 | `/usage` | Token 用量汇总（按来源、模型、会话） |
 | `/approve [safe\|danger\|off]` | 切换工具调用的自动审批级别 |
 | `/security` | 显示当前安全配置状态 |
+| `/security test-bash <cmd>` | 对某条命令试跑 bash 白名单/危险模式检测 |
 
 ---
 
@@ -529,8 +554,8 @@ LLM_PROVIDER 环境变量已设置？
 ### 重试策略
 
 所有提供商共享相同的重试包装器：
-- **最大重试次数**：3
-- **退避策略**：指数退避（1s → 2s → 4s → 8s 上限）
+- **最大重试次数**：5
+- **退避策略**：指数退避（1s → 2s → 4s → 8s → 16s 上限 60s）
 - **可重试**：429（速率限制）、500/502/503（服务器错误）、网络超时
 - **不可重试**：400（错误请求）、401（认证失败）、404
 
@@ -681,23 +706,25 @@ task_dag() 输出：
 ### 生命周期
 
 ```
-NewSession(title)
-  → 创建目录：.go-code-agent/sessions/<uuid>/
-  → 子目录：tasks/、team/、history/、transcripts/
+SessionManager.BootstrapOrCreate(forceNew, explicitID)
+  → forceNew（且无显式 id）：NewSession("New session")
+  → 否则：BootstrapSession 解析 显式 id > 最近活跃 > 全新会话
+  → NewSession 创建目录：.go-code-agent/sessions/<uuid>/
+    子目录：tasks/、team/、history/、transcripts/
   │
-Activate(session)
-  → 加载 TaskManager、DAGScheduler、MessageBus、ProtocolStore
-  → 加载 HistoryStore，恢复对话
-  → 构建 TeammateManager
+AppContext.ActivateSession(session)
+  → SessionManager.Activate：绑定 session，落盘为索引中的活跃会话
+  → 用该会话的 Bus/TaskMgr/DagSched/Protocols 重建 TeammateManager
+  → 为当前活跃会话重新生成 System（系统提示词）
   │
 Work（多轮）
   → 历史以 JSONL 追加（每次写入 fsync）
   → 任务以 JSON 文件持久化
   │
-Deactivate(session)
-  → session_to_memory 提示词 → 提取经验
-  → 保存到 MemoryStore 供未来召回
-  → 更新会话索引（最后活跃时间戳）
+AppContext.DeactivateActiveSession()
+  → ShutdownTeammates：关闭所有运行中的 teammate
+  → SessionManager.Deactivate：session_to_memory 提示词提取经验，
+    保存到 MemoryStore，更新会话索引（最后活跃时间戳）
   │
 Archive(session)
   → 在索引中标记为已归档
@@ -808,11 +835,11 @@ Teammates 在执行写操作前必须提交执行计划：
 
 ### microCompact（每轮）
 
-将旧的工具结果消息折叠为简短摘要，仅保留最近 N 条（默认 3 条）完整内容。这防止了长时间使用工具期间上下文无限增长。
+将旧的工具结果消息折叠为简短摘要，仅保留最近 N 条（默认 15 条）完整内容。这防止了长时间使用工具期间上下文无限增长。
 
 ### autoCompact（阈值触发）
 
-当估计的总 token 数超过 100K 时：
+当估计的总 token 数超过 300K 时：
 1. 将完整对话发送给 LLM，附带"总结"指令
 2. 用一条 checkpoint 消息替换所有消息（system + 最近除外）
 3. Checkpoint 持久化到历史 JSONL 以供崩溃恢复

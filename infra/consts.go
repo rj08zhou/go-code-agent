@@ -21,6 +21,33 @@ const (
 	TokenThreshold = 300000 // autoCompact trigger (estimated total tokens) - raised from 200000 to reduce compaction frequency
 	KeepRecent     = 15     // microCompact keeps N most recent tool messages - raised from 10 to retain more context
 	MaxOutputLen   = 500000 // max bytes per tool output (truncation limit, 500KB)
+
+	// KeepRecentMessages is how many of the most recent conversation
+	// messages AutoCompact keeps VERBATIM (progressive compaction): only
+	// the older prefix is summarized. The actual split is snapped to a
+	// safe turn boundary (never orphaning a tool_call/tool_result pair),
+	// so this is a target, not an exact count. Distinct from KeepRecent
+	// above, which governs microCompact's tool-result folding.
+	KeepRecentMessages = 20
+
+	// CompactionThresholdFrac: AutoCompact fires when estimated tokens
+	// exceed this fraction of the model's context window (see
+	// ContextWindowTokens). Kept below 1.0 to leave headroom for the
+	// next turn's output + the summarization call itself. The absolute
+	// TokenThreshold above is still honored as an upper cap.
+	CompactionThresholdFrac = 0.75
+)
+
+// Model context-window sizes (in tokens), used to make the compaction
+// threshold model-aware instead of a single hard-coded number. These
+// are deliberately conservative round numbers matched by model-id
+// prefix in ContextWindowTokens; an exact figure is unnecessary since
+// CompactionThresholdFrac already leaves headroom.
+const (
+	ContextWindowClaude  = 200000
+	ContextWindowGPT     = 128000
+	ContextWindowGemini  = 1000000
+	ContextWindowDefault = 128000
 )
 
 const (
@@ -117,6 +144,23 @@ const (
 // finish far below it.
 const (
 	PerToolTimeout = 5 * time.Minute // hard ceiling per tool handler call
+
+	// SubagentTimeout is the task tool's own (more generous) hard
+	// ceiling, overriding PerToolTimeout for that one tool. A read-only
+	// subagent exploring a real codebase (many read_file/bash rounds)
+	// routinely needs longer than the general-purpose 5-minute ceiling;
+	// see SubagentSoftDeadlineBuffer below for how it avoids actually
+	// hitting this hard limit in the common case.
+	SubagentTimeout = 10 * time.Minute
+
+	// SubagentSoftDeadlineBuffer: runSubagent checks its own elapsed
+	// time against (deadline - this buffer) before starting each new
+	// round, so it can stop itself and return a summary of progress
+	// so far instead of being hard-killed by SubagentTimeout with its
+	// entire investigation discarded (the failure mode we're fixing:
+	// a task call that ran out of PerToolTimeout used to throw away
+	// every file it had already read).
+	SubagentSoftDeadlineBuffer = 30 * time.Second
 
 	// estimateTokens is O(N); recomputing every round on long sessions
 	// is wasteful. We re-check at most every TokenCheckInterval rounds.

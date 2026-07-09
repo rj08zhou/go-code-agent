@@ -6,8 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strings"
+
+	"go-code-agent/infra"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -141,6 +142,25 @@ func buildAnthropicMessages(msgs []Message) ([]anthropic.TextBlockParam, []anthr
 			}
 			appendUserBlocks([]anthropic.ContentBlockParamUnion{{OfToolResult: &tr}})
 		}
+	}
+
+	// Prompt caching: place one cache_control breakpoint on the LAST
+	// system block. Anthropic builds its cache prefix in the fixed
+	// order tools -> system -> messages, and a breakpoint caches
+	// everything up to and including that block - so this single
+	// breakpoint covers the entire static prefix (all tool defs + the
+	// whole system prompt: system.md + evergreen memory + resume
+	// context), which is identical on every turn of a session and is
+	// by far the largest repeated chunk of input. On a cache hit those
+	// input tokens are billed at a large discount (surfaced via
+	// Usage.CachedReadTokens, which we already record).
+	//
+	// Safe to always set: if the prefix is below the model's minimum
+	// cacheable size (~1024 tokens; 2048 for Haiku) Anthropic silently
+	// ignores the breakpoint rather than erroring, so short-prompt
+	// callers (judge, memory-save, subagent) are unaffected.
+	if n := len(systemBlocks); n > 0 {
+		systemBlocks[n-1].CacheControl = anthropic.NewCacheControlEphemeralParam()
 	}
 	return systemBlocks, out
 }
@@ -431,10 +451,10 @@ func anthropicIsRetriable(err error) bool {
 // default startup registration and the judge's dedicated-endpoint path.
 func newAnthropicProvider(apiKey, baseURL string) Provider {
 	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+		apiKey = infra.Cfg.AnthropicAPIKey
 	}
 	if baseURL == "" {
-		baseURL = os.Getenv("ANTHROPIC_BASE_URL")
+		baseURL = infra.Cfg.AnthropicBaseURL
 	}
 	var opts []option.RequestOption
 	if apiKey != "" {

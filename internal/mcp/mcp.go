@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"go-code-agent/infra"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/log"
+	"go-code-agent/internal/logging"
 	"go-code-agent/utils"
 	"os"
 	"os/exec"
@@ -111,14 +111,14 @@ func (m *MCPManager) LoadConfig(dir string) {
 	}
 	var cfg mcpConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		log.PrintSystem(fmt.Sprintf("[mcp] Warning: invalid .mcp.json: %v", err))
+		logging.PrintSystem(fmt.Sprintf("[mcp] Warning: invalid .mcp.json: %v", err))
 		return
 	}
 	for name, srv := range cfg.Servers {
 		if err := m.Connect(name, srv.Command, srv.Args, srv.Env); err != nil {
-			log.PrintSystem(fmt.Sprintf("[mcp] Failed to connect '%s': %v", name, err))
+			logging.PrintSystem(fmt.Sprintf("[mcp] Failed to connect '%s': %v", name, err))
 		} else {
-			log.PrintSystem(fmt.Sprintf("[mcp] Connected '%s' (%d tools)", name, len(m.servers[name].Tools)))
+			logging.PrintSystem(fmt.Sprintf("[mcp] Connected '%s' (%d tools)", name, len(m.servers[name].Tools)))
 		}
 	}
 }
@@ -511,7 +511,7 @@ func (m *MCPManager) pingAll() {
 		s.bMu.Unlock()
 		if err != nil {
 			s.breakerOnFail("health: " + err.Error())
-			log.PrintSystem(fmt.Sprintf("[mcp] health-check failed for '%s': %v", s.Name, err))
+			logging.PrintSystem(fmt.Sprintf("[mcp] health-check failed for '%s': %v", s.Name, err))
 		} else {
 			s.breakerOnSuccess()
 		}

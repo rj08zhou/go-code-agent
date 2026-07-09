@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go-code-agent/infra"
-	"go-code-agent/internal/log"
+	"go-code-agent/internal/logging"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,6 +29,19 @@ type memoryChunk struct {
 	Path     string
 	Text     string
 	Category string
+
+	// File/Line locate this chunk's exact source line for in-place
+	// rewrite (tryReplaceDuplicate) or removal (DeleteMemory) without
+	// re-scanning every daily file on disk. Line is the 0-indexed
+	// position within strings.Split(fileContents, "\n") — the same
+	// convention every read/rewrite site in this file uses.
+	//
+	// File is empty for chunks parsed out of the evergreen MEMORY.md:
+	// those are not per-line JSONL records and are not eligible for
+	// WriteMemory's dedup-replace or DeleteMemory (both only ever
+	// touch daily/*.jsonl).
+	File string
+	Line int
 }
 
 // categoryWeights controls search ranking priority by memory type.
@@ -93,7 +106,7 @@ func (ms *MemoryStore) cleanExpired() {
 		}
 	}
 	if removed > 0 {
-		log.PrintSystem(fmt.Sprintf("[memory] Cleaned %d expired daily files (older than %d days)", removed, infra.MemoryTTLDays))
+		logging.PrintSystem(fmt.Sprintf("[memory] Cleaned %d expired daily files (older than %d days)", removed, infra.MemoryTTLDays))
 	}
 }
 
@@ -121,6 +134,20 @@ func (ms *MemoryStore) WriteMemory(content, category string) string {
 		"content":  content,
 	}
 	data, _ := json.Marshal(entry)
+
+	// The new entry's line index is the count of entries already
+	// cached for this exact file — i.e. it lands at the position
+	// right after the last one, matching what O_APPEND will do on
+	// disk. This only holds because every mutation in this file keeps
+	// the cache and the on-disk line layout in lockstep (see cachePut
+	// callers below and in tryReplaceDuplicate/DeleteMemory).
+	newLine := 0
+	for _, c := range ms.chunks {
+		if c.File == path {
+			newLine++
+		}
+	}
+
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Sprintf("Error writing memory: %v", err)
@@ -137,54 +164,47 @@ func (ms *MemoryStore) WriteMemory(content, category string) string {
 	if category != "" {
 		label += " [" + category + "]"
 	}
-	ms.chunks = append(ms.chunks, memoryChunk{Path: label, Text: content, Category: category})
+	ms.chunks = append(ms.chunks, memoryChunk{Path: label, Text: content, Category: category, File: path, Line: newLine})
 
 	return fmt.Sprintf("Memory saved to %s.jsonl (%s)", today, category)
 }
 
-// tryReplaceDuplicate scans daily files for a same-category entry similar to content.
+// tryReplaceDuplicate scans the in-memory chunk cache (no disk IO) for
+// a same-category daily entry similar to content. On a hit, it
+// rewrites only that entry's single line in its source file — not
+// every daily file, as the previous Glob+ReadFile-all-files version
+// did.
 func (ms *MemoryStore) tryReplaceDuplicate(content, category string, newTokens []string) string {
-	files, _ := filepath.Glob(filepath.Join(ms.memoryDir, "*.jsonl"))
-	for _, f := range files {
-		data, err := os.ReadFile(f)
+	for i, c := range ms.chunks {
+		if c.File == "" || c.Category != category {
+			continue // evergreen chunk (no File) or category mismatch
+		}
+		sim := jaccardSimilarity(newTokens, tokenize(c.Text))
+		if sim < infra.DeduplicateThreshold {
+			continue
+		}
+
+		data, err := os.ReadFile(c.File)
 		if err != nil {
 			continue
 		}
 		lines := strings.Split(string(data), "\n")
-		for i, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var entry map[string]string
-			if json.Unmarshal([]byte(line), &entry) != nil {
-				continue
-			}
-			if entry["category"] != category {
-				continue
-			}
-			oldTokens := tokenize(entry["content"])
-			sim := jaccardSimilarity(newTokens, oldTokens)
-			if sim >= infra.DeduplicateThreshold {
-				oldContent := entry["content"]
-				entry["content"] = content
-				entry["ts"] = time.Now().UTC().Format(time.RFC3339)
-				updated, _ := json.Marshal(entry)
-				lines[i] = string(updated)
-				os.WriteFile(f, []byte(strings.Join(lines, "\n")), 0o644)
-				base := strings.TrimSuffix(filepath.Base(f), ".jsonl")
-
-				// Sync cache: find and update the matching chunk.
-				for ci := range ms.chunks {
-					if ms.chunks[ci].Category == category && ms.chunks[ci].Text == oldContent {
-						ms.chunks[ci].Text = content
-						break
-					}
-				}
-
-				return fmt.Sprintf("Memory updated in %s.jsonl (%s) - replaced similar entry (similarity: %.0f%%)", base, category, sim*100)
-			}
+		if c.Line < 0 || c.Line >= len(lines) {
+			continue // cache out of sync with disk - fall through to a fresh append
 		}
+		var entry map[string]string
+		if json.Unmarshal([]byte(strings.TrimSpace(lines[c.Line])), &entry) != nil {
+			continue
+		}
+		entry["content"] = content
+		entry["ts"] = time.Now().UTC().Format(time.RFC3339)
+		updated, _ := json.Marshal(entry)
+		lines[c.Line] = string(updated)
+		os.WriteFile(c.File, []byte(strings.Join(lines, "\n")), 0o644)
+
+		base := strings.TrimSuffix(filepath.Base(c.File), ".jsonl")
+		ms.chunks[i].Text = content
+		return fmt.Sprintf("Memory updated in %s.jsonl (%s) - replaced similar entry (similarity: %.0f%%)", base, category, sim*100)
 	}
 	return ""
 }
@@ -239,7 +259,7 @@ func (ms *MemoryStore) loadAllChunksFromDisk() []memoryChunk {
 			continue
 		}
 		base := filepath.Base(f)
-		for _, line := range strings.Split(string(data), "\n") {
+		for idx, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue
@@ -257,13 +277,22 @@ func (ms *MemoryStore) loadAllChunksFromDisk() []memoryChunk {
 			if cat != "" {
 				label = base + " [" + cat + "]"
 			}
-			chunks = append(chunks, memoryChunk{Path: label, Text: text, Category: cat})
+			chunks = append(chunks, memoryChunk{Path: label, Text: text, Category: cat, File: f, Line: idx})
 		}
 	}
 	return chunks
 }
 
 // GetStats returns memory statistics.
+//
+// Unlike WriteMemory/tryReplaceDuplicate/DeleteMemory (which now search
+// the in-memory chunk cache instead of re-reading every daily file),
+// this intentionally stays disk-based: it is only called from the
+// startup banner and the `/memory` REPL command — not the per-turn hot
+// path — and daily jsonl files are occasionally created/edited outside
+// the WriteMemory API (tests do this; so could an operator), which the
+// write-through cache has no way to observe. Trading a rarely-called
+// O(N) disk scan for guaranteed freshness is the right call here.
 func (ms *MemoryStore) GetStats() (evergreenChars, dailyFiles, dailyEntries int) {
 	evergreenChars = len(ms.LoadEvergreen())
 	files, _ := filepath.Glob(filepath.Join(ms.memoryDir, "*.jsonl"))
@@ -282,7 +311,10 @@ func (ms *MemoryStore) GetStats() (evergreenChars, dailyFiles, dailyEntries int)
 	return
 }
 
-// DeleteMemory finds and removes the most similar daily memory entry matching query (and optionally category).
+// DeleteMemory finds and removes the most similar daily memory entry
+// matching query (and optionally category). Candidate search runs
+// entirely against the in-memory chunk cache; only the one file that
+// actually contains the winning entry is read/rewritten on disk.
 func (ms *MemoryStore) DeleteMemory(query, category string) string {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
@@ -292,70 +324,62 @@ func (ms *MemoryStore) DeleteMemory(query, category string) string {
 		return "Error: empty query - provide keywords to match the memory you want to delete."
 	}
 
-	// Scan daily files for the best-matching entry.
 	bestSim := 0.0
-	bestFile := ""
-	bestLine := -1
-	bestContent := ""
-
-	files, _ := filepath.Glob(filepath.Join(ms.memoryDir, "*.jsonl"))
-	for _, f := range files {
-		data, err := os.ReadFile(f)
-		if err != nil {
+	bestIdx := -1
+	for i, c := range ms.chunks {
+		if c.File == "" { // evergreen chunk - not eligible for delete
 			continue
 		}
-		for i, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var entry map[string]string
-			if json.Unmarshal([]byte(line), &entry) != nil {
-				continue
-			}
-			if category != "" && entry["category"] != category {
-				continue
-			}
-			sim := jaccardSimilarity(queryTokens, tokenize(entry["content"]))
-			if sim > bestSim {
-				bestSim = sim
-				bestFile = f
-				bestLine = i
-				bestContent = entry["content"]
-			}
+		if category != "" && c.Category != category {
+			continue
+		}
+		if sim := jaccardSimilarity(queryTokens, tokenize(c.Text)); sim > bestSim {
+			bestSim = sim
+			bestIdx = i
 		}
 	}
 
-	if bestSim < infra.DeduplicateThreshold {
+	if bestIdx < 0 || bestSim < infra.DeduplicateThreshold {
 		return fmt.Sprintf("No matching memory found (best similarity: %.0f%%, threshold: %.0f%%).",
 			bestSim*100, infra.DeduplicateThreshold*100)
 	}
 
-	// Remove the line from file.
-	data, err := os.ReadFile(bestFile)
+	target := ms.chunks[bestIdx]
+
+	data, err := os.ReadFile(target.File)
 	if err != nil {
 		return fmt.Sprintf("Error reading file: %v", err)
 	}
 	lines := strings.Split(string(data), "\n")
-	lines = append(lines[:bestLine], lines[bestLine+1:]...)
+	if target.Line < 0 || target.Line >= len(lines) {
+		// Cache drifted from disk (e.g. the file was edited outside
+		// this process). Self-heal by rebuilding from ground truth so
+		// the next call is consistent again, rather than leaving a
+		// permanently-broken index.
+		ms.chunks = ms.loadAllChunksFromDisk()
+		return "Error: memory index was out of sync with disk - rebuilt it, please retry the delete."
+	}
+	lines = append(lines[:target.Line], lines[target.Line+1:]...)
 	// Clean up: remove file if empty, otherwise rewrite.
 	remaining := strings.TrimSpace(strings.Join(lines, "\n"))
 	if remaining == "" {
-		os.Remove(bestFile)
+		os.Remove(target.File)
 	} else {
-		os.WriteFile(bestFile, []byte(strings.Join(lines, "\n")), 0o644)
+		os.WriteFile(target.File, []byte(strings.Join(lines, "\n")), 0o644)
 	}
 
-	// Sync cache: remove the matching chunk.
+	// Sync cache: drop the deleted chunk, then shift every other
+	// chunk from the *same file* that came after the removed line up
+	// by one, since the on-disk rewrite above shifted them too.
+	ms.chunks = append(ms.chunks[:bestIdx], ms.chunks[bestIdx+1:]...)
 	for i := range ms.chunks {
-		if ms.chunks[i].Text == bestContent {
-			ms.chunks = append(ms.chunks[:i], ms.chunks[i+1:]...)
-			break
+		if ms.chunks[i].File == target.File && ms.chunks[i].Line > target.Line {
+			ms.chunks[i].Line--
 		}
 	}
 
-	base := strings.TrimSuffix(filepath.Base(bestFile), ".jsonl")
-	snippet := bestContent
+	base := strings.TrimSuffix(filepath.Base(target.File), ".jsonl")
+	snippet := target.Text
 	if len(snippet) > 80 {
 		snippet = snippet[:80] + "..."
 	}
