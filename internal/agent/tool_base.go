@@ -14,8 +14,7 @@ type ToolResult = llm.ToolResult
 type ToolHandler = func(ctx context.Context, args json.RawMessage) ToolResult
 
 // ToolDefs / ToolHandlers are the process-wide tool registry, populated
-// once by InitTools() (see tool_registry.go) and consulted by the main
-// loop (Run) plus REPL commands that need the raw defs (e.g. /mcp).
+// once by InitTools() (see tool_registry.go).
 var (
 	ToolDefs     []llm.ToolDef
 	ToolHandlers map[string]ToolHandler
@@ -43,25 +42,8 @@ func intArrayProp() map[string]any {
 	return map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}
 }
 
-// ----------------------------------------------------------------------------
-// ToolSpec - single source of truth for a tool's schema + handler + security
-// ----------------------------------------------------------------------------
-//
-// Previously a tool's LLM-facing definition (ToolDefs), its execution
-// logic (ToolHandlers) and its approval level (ToolSecurityMap) were
-// three independently-maintained call sites. It was possible - and it
-// happened in practice - to register a tool's Def+Handler in
-// tool_registry.go and simply forget to add the matching entry to
-// security.go's ToolSecurityMap. checkToolApproval treats anything
-// missing from that map as "unknown tool", which is *always* denied
-// (see security.go) - so the tool would silently never be callable,
-// with no compile-time or obvious runtime signal that anything was
-// wrong.
-//
-// ToolSpec + registerToolSpec fix this by construction: a tool cannot
-// be added to ToolDefs/ToolHandlers without also supplying its Level
-// in the same call, and registerToolSpec is the only path that
-// populates ToolSecurityMap (see security.go - the map starts empty).
+// ToolSpec bundles a tool's Def, Handler, and approval Level so they
+// are registered atomically via registerToolSpec.
 type ToolSpec struct {
 	Def     llm.ToolDef
 	Handler ToolHandler

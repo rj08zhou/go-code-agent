@@ -167,21 +167,12 @@ func isRateLimitError(err error) bool {
 	return strings.Contains(msg, "429") || strings.Contains(msg, "too many requests") || strings.Contains(msg, "rate limit")
 }
 
-// Client wraps a Provider with the shared retry / timeout / usage
-// telemetry orchestration. The Provider interface itself only exposes
-// the atomic Call/Stream operations; the retry policy lives here, one
-// level up, so every backend shares it instead of reimplementing it.
-//
-// Use NewClient(nil) to target the active (main) provider selected at
-// startup; pass an explicit provider (e.g. llm.JudgeProvider(...)) to
-// route a single call to a different backend / endpoint.
+// Client wraps a Provider with shared retry / timeout / usage telemetry.
 type Client struct {
 	provider Provider
 }
 
-// NewClient wraps p. A nil p falls back to the active (main) provider
-// selected at startup, so NewClient(nil).CallWithRetry(...) behaves like
-// the old package-level CallLLMWithRetry.
+// NewClient wraps p; nil falls back to the active (main) provider.
 func NewClient(p Provider) *Client {
 	if p == nil {
 		p = activeProvider
@@ -197,18 +188,13 @@ func (c *Client) CallWithRetry(ctx context.Context, source string, params CallPa
 	lim := getLimiter()
 	var lastErr error
 	for attempt := 0; attempt <= infra.LlmMaxRetries; attempt++ {
-		// Process-wide throttle: bound QPS and parallelism BEFORE we
-		// hit the wire. release() runs even on error so a failing
-		// attempt still frees its concurrency slot.
+		// Process-wide throttle: bound QPS and parallelism before hitting the wire.
 		release, acqErr := lim.Acquire(ctx)
 		if acqErr != nil {
 			return nil, acqErr
 		}
 		started := time.Now()
-		// Per-attempt deadline. Without this a hung backend (e.g. an
-		// OpenAI-compatible gateway holding the SSE socket open without
-		// emitting bytes) freezes the whole agent loop with no
-		// subprocess and no audit trail.
+		// Per-attempt deadline to prevent hung backends from freezing the agent loop.
 		attemptCtx, cancel := context.WithTimeout(ctx, infra.LlmCallTimeout)
 		resp, err := c.provider.Call(attemptCtx, params)
 		cancel()
@@ -222,8 +208,7 @@ func (c *Client) CallWithRetry(ctx context.Context, source string, params CallPa
 			return resp, nil
 		}
 		lastErr = err
-		// If the parent ctx is already done, the per-attempt timeout
-		// is moot — propagate the parent error and stop retrying.
+		// Parent ctx already done — propagate and stop retrying.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
@@ -259,9 +244,7 @@ func (c *Client) StreamWithRetrySink(ctx context.Context, source string, params 
 			return nil, acqErr
 		}
 		started := time.Now()
-		// Per-attempt deadline. Streaming calls can hang mid-response
-		// when an upstream gateway stops emitting chunks; without this
-		// the for-range over Stream.Next() blocks forever.
+		// Per-attempt deadline to prevent hung streaming from blocking forever.
 		attemptCtx, cancel := context.WithTimeout(ctx, infra.LlmCallTimeout)
 		sr, err := c.provider.Stream(attemptCtx, params, sink)
 		cancel()
@@ -302,16 +285,7 @@ func (c *Client) StreamWithRetrySink(ctx context.Context, source string, params 
 	return nil, lastErr
 }
 
-// logRetryAttempt emits a structured retry diagnostic. Unlike the old
-// version which truncated the error and dropped the Retry-After value,
-// it now records:
-//   - attempt index / cap
-//   - the chosen wait duration
-//   - any server-supplied Retry-After hint (so 1302/1305 etc. become
-//     greppable in session.log)
-//   - a longer-but-still-bounded slice of the error message, instead
-//     of the previous 120-char head that often cut off the upstream
-//     JSON code.
+// logRetryAttempt emits a structured retry diagnostic.
 func logRetryAttempt(attempt int, err error, delay, hint time.Duration) {
 	body := errSnippet(err, 400)
 	if hint > 0 {
@@ -324,9 +298,7 @@ func logRetryAttempt(attempt int, err error, delay, hint time.Duration) {
 		attempt+1, infra.LlmMaxRetries, delay.Round(100*time.Millisecond), body))
 }
 
-// errSnippet returns a length-bounded view of err's message, preserving
-// enough tail for upstream JSON codes (e.g. {"code":"1302",...}) to
-// remain visible. Short errors are returned verbatim.
+// errSnippet returns a length-bounded view of err's message.
 func errSnippet(err error, max int) string {
 	if err == nil {
 		return ""
@@ -335,10 +307,7 @@ func errSnippet(err error, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	// Keep both head and tail so we still see "429 Too Many Requests"
-	// at the start AND the {"code":...} payload at the end.
+	// Keep head and tail so both the status code and JSON payload remain visible.
 	half := (max - 5) / 2
 	return s[:half] + " ... " + s[len(s)-half:]
 }
-
-

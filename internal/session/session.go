@@ -46,11 +46,12 @@ const (
 
 // sessionMeta is the on-disk shape of meta.json plus sessions.json entries.
 type sessionMeta struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Status    string `json:"status"`
-	CreatedAt int64  `json:"created_at"`
-	UpdatedAt int64  `json:"updated_at"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Status      string `json:"status"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+	MemorySaved bool   `json:"memory_saved"`
 }
 
 // Session bundles per-session subsystems. Workdir-global resources stay on AppContext.
@@ -69,7 +70,7 @@ type Session struct {
 	History   *history.HistoryStore
 
 	// Avoid calling SaveToMemory more than once per session lifetime.
-	memorySaved bool
+	// Persisted in meta.json so a restart won't re-summarize.
 }
 
 // Path helpers.

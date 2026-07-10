@@ -14,15 +14,40 @@ import (
 	"time"
 )
 
-// Compression - three layers:
-//   microCompact: in-place tool-result truncation
-//   AutoCompact: LLM-summarized compaction with checkpoint persistence
-//   manual: triggered by the `compress` tool
+// Compression layers: microCompact (in-place truncation), AutoCompact (LLM summary).
 
 // CompactedMarker prefixes AutoCompact's synthetic user-message.
 // Used by persistNewMessages (cmd/agent/main.go) to avoid duplicate
 // history entries.
 const CompactedMarker = "[Compressed. "
+
+// persistedBoundaryKey carries a caller-owned "not yet persisted"
+// index pointer through ctx. See WithPersistedBoundary.
+type persistedBoundaryKey struct{}
+
+// WithPersistedBoundary lets AutoCompact keep *boundary valid when it
+// replaces the message slice mid-turn. nil boundary is a no-op.
+func WithPersistedBoundary(ctx context.Context, boundary *int) context.Context {
+	if boundary == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, persistedBoundaryKey{}, boundary)
+}
+
+func persistedBoundaryFromCtx(ctx context.Context) *int {
+	if ctx == nil {
+		return nil
+	}
+	b, _ := ctx.Value(persistedBoundaryKey{}).(*int)
+	return b
+}
+
+// remapPersistedBoundary converts an old-slice index into AutoCompact's
+// new [system, summary, ack, tail...] slice. A boundary in the summarized
+// prefix clamps to 3 (start of tail).
+func remapPersistedBoundary(oldBoundary, split int) int {
+	return 3 + max(0, oldBoundary-split)
+}
 
 // estimateTokens is a thin alias over EstimateTokens (llm_types.go).
 // Keeping the lowercase name avoids touching every call site.
@@ -68,31 +93,9 @@ func microCompact(msgs []llm.Message) int {
 	return cleared
 }
 
-// AutoCompact performs PROGRESSIVE compaction: it summarizes only the
-// OLDER prefix of the conversation and keeps the most recent turns
-// VERBATIM, rather than replacing the entire history with a single
-// lossy summary. This is the key fix for the old behavior where, right
-// after compaction, the model had zero verbatim recent context (only a
-// summary) and would re-explore work it had just done.
-//
-// Result shape:
-//
-//	[ system(sys), user(summary-of-old-prefix), assistant(ack), <recent tail...> ]
-//
-// The split between "summarized prefix" and "verbatim tail" is snapped
-// to a safe turn boundary by findCompactionSplit so a tool_call is
-// never separated from its tool_result (both OpenAI and Anthropic
-// reject such orphans). If no safe boundary exists (pathological
-// input) it falls back to summarizing everything - never emitting a
-// corrupt message sequence.
-//
-// Restart note: the checkpoint written here still covers the whole
-// prior history (covered = WrittenCount), so a RESTART resumes from the
-// summary alone, without the verbatim tail. Preserving the tail across
-// restarts would require mapping history entries to messages 1:1 (they
-// are not - system/gate-injection messages have no entry); that is a
-// separate follow-up. The in-memory progressive keep already fixes the
-// common same-session case.
+// AutoCompact performs progressive compaction: summarizes the older prefix
+// and keeps recent turns verbatim. The split is snapped to a safe turn
+// boundary so tool_call/result pairs are never orphaned.
 func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Message {
 	origCount := len(msgs)
 	origTokens := estimateTokens(msgs)
@@ -112,9 +115,7 @@ func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 	// tail = msgs[split:] is kept verbatim.
 	split := findCompactionSplit(msgs, infra.KeepRecentMessages)
 
-	// Summarize the prefix, skipping any leading system message(s) - the
-	// fresh sys is re-injected below, so summarizing the old system text
-	// would be wasteful and redundant.
+	// Summarize the prefix, skipping leading system messages (re-injected below).
 	prefix := msgs[:split]
 	var toSummarize []llm.Message
 	for _, m := range prefix {
@@ -126,9 +127,7 @@ func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 
 	convData, _ := json.Marshal(toSummarize)
 	convText := string(convData)
-	// Keep the TAIL of the prefix when truncating: the most recent of
-	// the to-be-summarized messages matter most for continuity (the old
-	// code kept the first 80KB, i.e. the least relevant, oldest part).
+	// Keep the TAIL of the prefix (most recent matters most for continuity).
 	const maxSummaryInput = 80000
 	if len(convText) > maxSummaryInput {
 		convText = convText[len(convText)-maxSummaryInput:]
@@ -147,9 +146,7 @@ func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 		summary = resp.Content
 	}
 
-	// Persist the compaction as a checkpoint. The checkpoint supersedes
-	// all prior history entries for replay purposes; raw entries stay
-	// on disk for audit.
+	// Persist the compaction as a checkpoint (supersedes prior history for replay).
 	if App != nil && App.History() != nil {
 		covered := App.History().WrittenCount()
 		if err := App.History().AppendCheckpoint(summary, covered); err != nil {
@@ -163,6 +160,12 @@ func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 	logging.PrintDecision(DecisionContext, fmt.Sprintf(
 		"compacted %d/%d messages (~%d tokens) into a %d-char summary; kept %d recent messages verbatim; full transcript at %s",
 		len(prefix), origCount, origTokens, len(summary), len(tail), tPath))
+
+	// Remap any caller-tracked persisted-boundary in place (see
+	// WithPersistedBoundary) now that msgs has shrunk.
+	if boundary := persistedBoundaryFromCtx(ctx); boundary != nil {
+		*boundary = remapPersistedBoundary(*boundary, split)
+	}
 
 	out := make([]llm.Message, 0, len(tail)+3)
 	out = append(out,

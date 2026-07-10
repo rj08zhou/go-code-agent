@@ -76,9 +76,9 @@ type mcpServer struct {
 
 // MCPManager manages multiple MCP server connections.
 type MCPManager struct {
-	servers    map[string]*mcpServer
-	mu         sync.RWMutex
-	workdir    string
+	servers map[string]*mcpServer
+	mu      sync.RWMutex
+	workdir string
 
 	// Health checker control.
 	healthStop chan struct{}
@@ -411,10 +411,6 @@ func (s *mcpServer) callTool(name string, args map[string]any) (string, error) {
 	}
 	return utils.Truncate(output, infra.MaxOutputLen), nil
 }
-
-// ----------------------------------------------------------------------------
-// Circuit breaker + health check
-// ----------------------------------------------------------------------------
 
 // breakerAllow returns true if a call may proceed. Side effect: in
 // HALF-OPEN state it returns true exactly once per cooldown window

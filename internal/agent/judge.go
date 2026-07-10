@@ -11,21 +11,9 @@ import (
 	"sync"
 )
 
-// LLM-as-Judge verifier.
-//
-// A secondary LLM call evaluates whether the agent's actions match the
-// user's intent. Triggered after task completion. Uses a separate
-// (usually cheaper) model. Disabled by default; opt-in via JUDGE_ENABLED.
-//
-// The judge is configured entirely through JUDGE_* environment variables
-// (parsed once into infra.Cfg; see llm.JudgeProvider for the routing
-// vars), so its model, endpoint and credentials are set through one
-// consistent mechanism rather than a mix of CLI flags and env vars.
-//
-// Judge has no dependency on any process-wide global: the prompt
-// template loader is injected via NewJudge, and the main model's
-// fallback id is passed explicitly to Verify. This keeps the type
-// fully self-contained and testable in isolation.
+// LLM-as-Judge verifier: a secondary LLM call evaluates whether the
+// agent's actions match the user's intent. Triggered after task
+// completion. Disabled by default; opt-in via JUDGE_ENABLED.
 
 // JudgeVerdict is the structured output produced by the Judge LLM.
 type JudgeVerdict struct {

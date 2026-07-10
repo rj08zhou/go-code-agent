@@ -54,5 +54,3 @@ func Render(tmpl string, vars map[string]string) string {
 	}
 	return out
 }
-
-

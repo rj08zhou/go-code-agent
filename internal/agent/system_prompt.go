@@ -11,12 +11,6 @@ import (
 
 // BuildSystemPrompt assembles the system prompt with dynamic sections:
 // evergreen memory and DAG resume context.
-//
-// Note: per-turn semantic recall was intentionally removed. Evergreen
-// MEMORY.md is loaded once at session start (resident), and relevant
-// daily memories are surfaced on-demand by the model via the
-// `memory_search` tool — mirroring how Claude Code / Cursor / CodeBuddy
-// avoid blindly re-recalling on every user turn.
 func BuildSystemPrompt() string {
 	raw := App.PromptLoader.Load("system")
 	if raw == "" {

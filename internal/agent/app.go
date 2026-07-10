@@ -18,30 +18,18 @@ import (
 	"os"
 )
 
-// AppContext is the agent's root object - the single source of truth
-// for every piece of process-/session-scoped state the engine needs.
-//
-// Fields are grouped into:
-//   - Process-wide config: Model, Workdir, System
-//   - Workdir-global subsystems (shared across sessions): Skills,
-//     MemStore, MCPMgr, PromptLoader
-//   - Per-session subsystems (rebound on session switch): reached via
-//     the SessionManager.Active() accessors below (DagSched/TaskMgr/...)
-//   - Cmd-layer subsystems: TeamMgr
-//
-// Tool handlers and the REPL reach every subsystem through the
-// package-level `App` variable.
-//
-// Note: the tool registry (defs/handlers/security levels) is NOT a
-// field on AppContext - it lives in the package-level ToolDefs /
-// ToolHandlers / ToolSecurityMap vars, populated once by InitTools()
-// (see tool_registry.go, tool_base.go).
-
+// AppContext is the agent's root object: process-wide config, workdir-global
+// subsystems, and session management. Reached via the package-level `App`.
 type AppContext struct {
 	// Process-wide config
 	Model   string
 	Workdir string
 	System  string // assembled system prompt, rebuilt per-session
+
+	// Embedded holds documentation baked into the binary (e.g. the
+	// README) so commands like /readme can serve it without needing the
+	// source file on disk. Set by main() at startup if available.
+	Embedded []byte
 
 	// Workdir-global subsystems (shared across sessions)
 	Skills       *skill.SkillLoader
@@ -128,22 +116,28 @@ func NewApp(model, workdir string, bashValidate session.BashValidator) *AppConte
 // sessionSwitchTo (previously duplicated verbatim in both places).
 func (a *AppContext) ActivateSession(sess *session.Session) {
 	a.SessionManager.Activate(sess)
-	a.SetTeamMgr(NewTeamMgr(
+	wm := NewWorktreeManager(sess.Dir(), a.Workdir)
+	tm := NewTeamMgr(
 		sess.TeamDir(), sess.Bus, sess.TaskMgr, sess.DagSched,
-		sess.TasksDir(), sess.Protocols,
-	))
+		sess.TasksDir(), sess.Protocols, wm,
+	)
+	wm.CleanupOrphans(tm.MemberNames())
+	a.SetTeamMgr(tm)
 	a.System = BuildSystemPrompt()
 }
 
 // DeactivateActiveSession is ActivateSession's mirror: it shuts down
-// any running teammates and deactivates the currently active session
-// (flushing it to memory - see SessionManager.Deactivate). No-op if
-// no session is active. Called from every session-teardown path -
-// SIGINT, normal REPL exit, and /session switch's old-session
-// teardown - which previously duplicated this same two-step sequence
-// in all three places.
+// any running teammates and removes worktrees. It does NOT call
+// SaveToMemory — that was a synchronous LLM call that blocked the exit
+// path. Unsaved sessions are picked up by BackfillMemory on next
+// startup. No-op if no session is active.
 func (a *AppContext) DeactivateActiveSession() {
 	ShutdownTeammates()
+	if tm := a.TeamMgr(); tm != nil {
+		if wm := tm.worktrees; wm != nil {
+			wm.RemoveAll()
+		}
+	}
 	if s := a.SessionManager.Active(); s != nil {
 		a.SessionManager.Deactivate(s)
 	}
