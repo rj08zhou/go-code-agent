@@ -4,33 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go-code-agent/frontend/server"
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/session"
 	"go-code-agent/internal/usage"
+	"os"
 	"slices"
 	"strings"
 )
 
-// REPL slash-commands.
-//
-// Commands are self-registered (see the init() at the bottom of this
-// file) into replCommands, mirroring the same registry pattern already
-// used for LLM providers (internal/llm/provider.go, via init()) and
-// the tool registry (agent.ToolSpec, see internal/agent/tool_base.go).
-//
-// Before this, handleReplCommand was a single ~270-line switch
-// statement: every new command required editing this one function in
-// the middle of an unrelated block, and there was no way to express
-// "this command's logic lives elsewhere" — everything had to be
-// inlined into the switch body. Registration makes each command an
-// independent, self-contained entry (a match predicate + a handler),
-// so adding one is an isolated append instead of a squeeze into a
-// growing switch.
-//
-// handleReplCommand returns (handled, newHistory). Session-aware
-// commands may replace the conversation slice entirely.
+// readmeViewer holds a viewer started by /readme so re-running the
+// command can recycle the previous server instead of leaking ports.
+var readmeViewer *server.Viewer
+
+// REPL slash-commands. Commands self-register via init() (same pattern
+// as LLM providers and tool registry). handleReplCommand returns
+// (handled, newHistory); session-aware commands may replace the conv slice.
 
 // replHandler runs a matched command and returns (handled, newHistory).
 type replHandler func(ctx context.Context, query string, history []llm.Message) (bool, []llm.Message)
@@ -41,16 +32,11 @@ type replCommand struct {
 	handler replHandler
 }
 
-// replCommands holds every registered command, in registration order.
-// handleReplCommand tries them in order and runs the first match —
-// same first-match-wins semantics as the switch statement this
-// replaced, so registration order still matters when two predicates
-// could both match (e.g. an exact "/session" vs a prefix "/session ").
+// replCommands holds every registered command in registration order.
+// First-match-wins; registration order matters when two predicates match.
 var replCommands []replCommand
 
-// registerReplCommand appends a command to the registry. Called from
-// this file's init() below; see the doc comment on replCommands for
-// why commands self-register instead of living in one big function.
+// registerReplCommand appends a command to the registry. Called from init().
 func registerReplCommand(match func(string) bool, handler replHandler) {
 	replCommands = append(replCommands, replCommand{match: match, handler: handler})
 }
@@ -104,6 +90,55 @@ func init() {
 
 	registerReplCommand(exact("/team"), func(ctx context.Context, query string, history []llm.Message) (bool, []llm.Message) {
 		fmt.Println(agent.App.TeamMgr().ListAll())
+		return true, history
+	})
+
+	registerReplCommand(prefix("/team spawn "), func(ctx context.Context, query string, history []llm.Message) (bool, []llm.Message) {
+		rest := strings.TrimSpace(strings.TrimPrefix(query, "/team spawn "))
+		parts := splitN(rest, 3)
+		if len(parts) < 3 {
+			fmt.Println("Usage: /team spawn <name> <role> <prompt>")
+			return true, history
+		}
+		fmt.Println(agent.App.TeamMgr().Spawn(ctx, parts[0], parts[1], parts[2]))
+		return true, history
+	})
+
+	registerReplCommand(prefix("/team shutdown "), func(ctx context.Context, query string, history []llm.Message) (bool, []llm.Message) {
+		name := strings.TrimSpace(strings.TrimPrefix(query, "/team shutdown "))
+		if name == "" {
+			fmt.Println("Usage: /team shutdown <name>")
+			return true, history
+		}
+		fmt.Println(agent.App.TeamMgr().ShutdownByName(name))
+		return true, history
+	})
+
+	registerReplCommand(prefix("/team message "), func(ctx context.Context, query string, history []llm.Message) (bool, []llm.Message) {
+		rest := strings.TrimSpace(strings.TrimPrefix(query, "/team message "))
+		parts := splitN(rest, 2)
+		if len(parts) < 2 {
+			fmt.Println("Usage: /team message <name> <content>")
+			return true, history
+		}
+		agent.App.Bus().Send("lead", parts[0], parts[1], "user_message", nil)
+		fmt.Printf("Sent to '%s'\n", parts[0])
+		return true, history
+	})
+
+	registerReplCommand(exact("/team inbox"), func(ctx context.Context, query string, history []llm.Message) (bool, []llm.Message) {
+		data, _ := json.MarshalIndent(agent.App.Bus().ReadInbox("lead"), "", "  ")
+		fmt.Println(string(data))
+		return true, history
+	})
+
+	registerReplCommand(exact("/team help", "/team ?"), func(ctx context.Context, query string, history []llm.Message) (bool, []llm.Message) {
+		fmt.Println("Team commands:")
+		fmt.Println("  /team                            list teammates")
+		fmt.Println("  /team spawn <name> <role> <prompt>  create a teammate")
+		fmt.Println("  /team shutdown <name>            send shutdown request to a teammate")
+		fmt.Println("  /team message <name> <content>   send a message to a teammate")
+		fmt.Println("  /team inbox                      read lead's inbox")
 		return true, history
 	})
 
@@ -368,6 +403,55 @@ func init() {
 		fmt.Printf("Reloaded %d rule(s) from %s\n", security.GlobalPermissions.Count(), path)
 		return true, history
 	})
+
+	registerReplCommand(exact("/readme"), func(ctx context.Context, query string, history []llm.Message) (bool, []llm.Message) {
+		// Prefer the README baked into the binary (embedded at build
+		// time) so this works from any directory with no disk read.
+		// Fall back to locating README_zh.md on disk if embedding was
+		// not compiled in.
+		var embedded []byte
+		if agent.App != nil {
+			embedded = agent.App.Embedded
+		}
+
+		workdir := ""
+		if wd, err := os.Getwd(); err == nil {
+			workdir = wd
+		}
+
+		// Recycle a previously started viewer so repeated /readme calls
+		// don't leak ports.
+		if readmeViewer != nil {
+			_ = readmeViewer.Stop()
+			readmeViewer = nil
+		}
+
+		opts := server.Options{
+			Host:        "127.0.0.1",
+			Port:        0, // ephemeral
+			OpenBrowser: true,
+		}
+		if len(embedded) > 0 {
+			opts.Embedded = embedded
+		} else {
+			opts.File = server.DefaultFile
+		}
+
+		v, err := server.New(workdir, opts)
+		if err != nil {
+			fmt.Printf("[readme] %v\n", err)
+			fmt.Println("[readme] (is README_zh.md present in the repo?)")
+			return true, history
+		}
+		if err := v.Start(); err != nil {
+			fmt.Printf("[readme] %v\n", err)
+			return true, history
+		}
+		readmeViewer = v
+		fmt.Printf("[readme] serving %s in your browser\n", v.Addr())
+		fmt.Println("[readme] the server keeps running; run /readme again or quit the agent to stop it.")
+		return true, history
+	})
 }
 
 // hasSessionID is a helper for /session rename arg disambiguation.
@@ -378,6 +462,13 @@ func hasSessionID(sm *session.SessionManager, id string) bool {
 		}
 	}
 	return false
+}
+
+// splitN splits s by whitespace into at most n parts; the last part
+// retains all remaining text (useful for /team spawn where the prompt
+// itself may contain spaces).
+func splitN(s string, n int) []string {
+	return strings.SplitN(s, " ", n)
 }
 
 // sessionSwitchTo performs a full session swap and returns a fresh conversation.
@@ -408,6 +499,10 @@ func sessionSwitchTo(oldHistory []llm.Message, id, newTitle string) []llm.Messag
 	}
 
 	agent.App.ActivateSession(next)
+
+	// Backfill any sessions left unsaved (including the one we just
+	// left), excluding the now-active one.
+	agent.App.SessionManager.BackfillMemory(next.ID())
 
 	// An explicit /session switch is a deliberate user action, so we do
 	// not arm the startup resume-boundary note here (that guards only

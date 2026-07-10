@@ -14,10 +14,6 @@ import (
 	"time"
 )
 
-// ----------------------------------------------------------------------------
-// Tool outcome model
-// ----------------------------------------------------------------------------
-
 // ToolOutcome classifies a tool-call dispatch result.
 type ToolOutcome int
 
@@ -49,10 +45,6 @@ func lastUserMessage(msgs []llm.Message) string {
 	return ""
 }
 
-// ----------------------------------------------------------------------------
-// Loop state
-// ----------------------------------------------------------------------------
-
 // loopState owns mutable counters driving reflection, planning, and judge.
 type loopState struct {
 	toolRounds              int
@@ -74,25 +66,13 @@ type loopState struct {
 	cachedTokensAt int // toolRounds value when cachedTokens was computed
 
 	// reflectLastTriggered records the toolRounds value at which each
-	// reflection trigger kind last fired. Used by reflect() to
-	// suppress duplicate prompts within a kind-specific cool-down
-	// window. nil-safe: allocated lazily on first use.
+	// reflection trigger kind last fired, for cool-down suppression.
 	reflectLastTriggered map[string]int
 
-	// touchedTasks is true once this turn has run any task-mutating
-	// tool (see taskMutationTools). It gates the end-of-turn progress
-	// summary: DAG tasks persist across turns, so without this a turn
-	// that never touched tasks would still re-print the stale count of
-	// whatever the session finished long ago (e.g. a perpetual
-	// "<progress>4/4 tasks completed. All tasks done!</progress>" on
-	// every unrelated turn). We only surface progress on turns that
-	// actually changed task state.
+	// touchedTasks gates end-of-turn progress summary: only surface
+	// progress on turns that actually changed task state.
 	touchedTasks bool
 }
-
-// ----------------------------------------------------------------------------
-// Static tool classification
-// ----------------------------------------------------------------------------
 
 // planningTools are tools that count as "planning activity".
 var planningTools = map[string]bool{
@@ -102,9 +82,7 @@ var planningTools = map[string]bool{
 	"TodoWrite": true,
 }
 
-// exploreTools are read-only / discovery tools that count as
-// "thinking activity" — gathering information before planning is
-// encouraged. `think` is the most explicit form of thinking.
+// exploreTools are read-only / discovery tools that count as "thinking activity".
 var exploreTools = map[string]bool{
 	"think":         true,
 	"memory_search": true, "memory_stats": true,
@@ -112,13 +90,8 @@ var exploreTools = map[string]bool{
 	"list_dir": true, "search_file": true,
 }
 
-// taskMutationTools are the tools that actually change the DAG-task set
-// or a task's status - i.e. the state ProgressSummary reports. Used to
-// decide whether a turn "touched tasks" and therefore whether its
-// end-of-turn progress line is meaningful (vs. a stale re-print of a
-// long-finished session's task count). Deliberately excludes read-only
-// task queries (task_list/task_get/task_dag/task_ready) and TodoWrite
-// (a separate TodoManager not counted by ProgressSummary).
+// taskMutationTools change the DAG-task set or a task's status.
+// Excludes read-only task queries and TodoWrite.
 var taskMutationTools = map[string]bool{
 	"task_create":     true,
 	"task_update":     true,
@@ -126,10 +99,6 @@ var taskMutationTools = map[string]bool{
 	"task_remove_dep": true,
 	"claim_task":      true,
 }
-
-// ----------------------------------------------------------------------------
-// Run (the agent loop)
-// ----------------------------------------------------------------------------
 
 // Run drives the think -> plan -> act -> reflect cycle for one user turn.
 func Run(ctx context.Context, messages *[]llm.Message) error {
@@ -163,9 +132,7 @@ func Run(ctx context.Context, messages *[]llm.Message) error {
 		}
 		*messages = append(*messages, sr.ToAssistantMessage())
 
-		// 3.5) Truncation detection: if the model hit its output token
-		//      limit, the response is incomplete. Inject a continuation
-		//      prompt so the model can finish its thought / tool calls.
+		// 3.5) Truncation detection: inject continuation if output hit max_tokens.
 		if sr.FinishReason == "length" {
 			logging.PrintSystem("[truncated] LLM output hit max_tokens, requesting continuation")
 			*messages = append(*messages, llm.UserMessage(
@@ -205,10 +172,7 @@ func Run(ctx context.Context, messages *[]llm.Message) error {
 			*messages = append(*messages, llm.UserMessage(prompt))
 		}
 
-		// 7) Judge first, then progress injection. Putting judge
-		//    before the success-flavored progress summary avoids
-		//    feeding the model contradictory signals when the judge
-		//    rejects the verdict.
+		// 7) Judge first, then progress injection (avoids contradictory signals).
 		if execResult.taskCompletedThisRound {
 			if runJudgeIfApplicable(ctx, st, messages, execResult.roundToolResults) {
 				if ps := App.DagSched().ProgressSummary(); ps != "" {
@@ -253,9 +217,7 @@ func Run(ctx context.Context, messages *[]llm.Message) error {
 			infra.StuckThreshold, infra.ReflectInterval, App.Todo().HasOpenItems(),
 			st.reflectLastTriggered,
 		)
-		// Record the round at which each kind fired so the next
-		// invocation can honor its cool-down. Only stamp kinds that
-		// actually emitted a prompt this round.
+		// Record which kinds fired this round for cool-down tracking.
 		for _, kind := range triggered {
 			st.reflectLastTriggered[kind] = st.toolRounds
 		}
@@ -289,8 +251,7 @@ func Run(ctx context.Context, messages *[]llm.Message) error {
 			*messages = AutoCompact(ctx, *messages, App.System)
 		}
 
-		// 12) Lesson stage budget enforcement: once lessonsWritten,
-		//     allow only lessonRoundsLimit additional rounds.
+		// 12) Lesson stage budget enforcement.
 		if st.lessonsWritten {
 			st.lessonRoundsRemaining--
 			if st.lessonRoundsRemaining <= 0 {
@@ -300,22 +261,15 @@ func Run(ctx context.Context, messages *[]llm.Message) error {
 	}
 }
 
-// finalizeTurn emits a concise end-of-turn summary so the user can see
-// the loop completed a full request cycle instead of silently dropping
-// back to the prompt. It is the single normal-completion exit: every
-// non-error `return nil` from Run should flow through here so the
-// closing signal stays consistent across exit paths.
+// finalizeTurn emits an end-of-turn summary. Every non-error return
+// from Run should flow through here.
 func finalizeTurn(st *loopState) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "turn complete — %d tool round(s)", st.toolRounds)
 	if st.totalFailures > 0 {
 		fmt.Fprintf(&b, ", %d tool failure(s)", st.totalFailures)
 	}
-	// Only surface the DAG progress summary when this turn actually
-	// changed task state. Tasks persist across turns, so on a turn that
-	// never touched them this would otherwise re-print a stale count
-	// from a long-finished session (the perpetual "4/4 tasks completed.
-	// All tasks done!" that had nothing to do with the current turn).
+	// Only surface DAG progress when this turn actually changed task state.
 	if st.touchedTasks && App != nil && App.DagSched() != nil {
 		if ps := App.DagSched().ProgressSummary(); ps != "" {
 			b.WriteString(" — ")
@@ -326,15 +280,9 @@ func finalizeTurn(st *loopState) error {
 	return nil
 }
 
-// ----------------------------------------------------------------------------
-// Pre-round helpers
-// ----------------------------------------------------------------------------
-
 // preRound: token compression, drain background notifications, pull inbox.
 func preRound(ctx context.Context, messages *[]llm.Message, st *loopState) {
-	// micro-compact: only run every N rounds to avoid excessive context loss.
-	// Surface a decision event when it actually folds something.
-	const microCompactInterval = 6 // run microCompact every 6 rounds (raised from 3: was compacting ~1x/min, too noisy)
+	const microCompactInterval = 6
 	if st.toolRounds%microCompactInterval == 0 {
 		if cleared := microCompact(*messages); cleared > 0 {
 			logging.PrintDecision(DecisionContext, fmt.Sprintf(
@@ -353,8 +301,7 @@ func preRound(ctx context.Context, messages *[]llm.Message, st *loopState) {
 			"context ~%d tokens exceeded threshold %d (model %q) — auto-compacting: summarizing older history, keeping recent messages verbatim",
 			st.cachedTokens, compactAt, App.Model))
 		*messages = AutoCompact(ctx, *messages, App.System)
-		// After compaction the slice shrinks dramatically; force a
-		// fresh estimate next round.
+		// Force a fresh token estimate next round after compaction.
 		st.cachedTokens = 0
 	}
 
@@ -380,10 +327,6 @@ func preRound(ctx context.Context, messages *[]llm.Message, st *loopState) {
 	}
 }
 
-// ----------------------------------------------------------------------------
-// Tool execution
-// ----------------------------------------------------------------------------
-
 // roundExecResult collects per-round tool execution outcomes.
 type roundExecResult struct {
 	usedTodo               bool
@@ -408,9 +351,7 @@ func executeToolCalls(ctx context.Context, sr *llm.StreamResult, messages *[]llm
 	var hitlNotes []string
 
 	for _, tc := range sr.ToolCalls {
-		// Guard: skip tool calls with truncated/invalid JSON arguments.
-		// This happens when the LLM output is cut off by max_tokens mid-
-		// way through a tool_call's arguments field.
+		// Skip tool calls with truncated/invalid JSON arguments (max_tokens cutoff).
 		if tc.Arguments != "" && !json.Valid([]byte(tc.Arguments)) {
 			out := fmt.Sprintf("[SKIPPED] tool call '%s' has truncated arguments (incomplete JSON)", tc.Name)
 			logging.PrintTool(tc.Name, out)
@@ -474,20 +415,8 @@ func executeToolCalls(ctx context.Context, sr *llm.StreamResult, messages *[]llm
 
 // dispatchTool runs security gate, HITL gate, then the handler under timeout.
 func dispatchTool(ctx context.Context, tc llm.ToolCall, messages *[]llm.Message, hitlNotes *[]string) (ToolOutcome, string) {
-	// checkToolApproval already encodes the tool's ApprovalLevel together
-	// with the current /approve setting (auto/safe/danger/off), so its
-	// returned bool is authoritative — nothing extra to layer on top.
-	//
-	// NOTE: an earlier version re-checked `ToolSecurityMap[tc.Name]` here
-	// (as a proxy for "is this tool safe-level") before honoring
-	// IsAutoApproveSafe(). Because that lookup's second return value is
-	// just "found in the map" (not the tool's actual level), it made
-	// `/approve safe` accidentally auto-approve every *known* tool
-	// including ApproveDanger ones (bash, delete_file, ...). Trusting
-	// checkToolApproval's own bool fixes that and also means unknown /
-	// ApproveBlocked tools stay blocked even under `/approve danger`
-	// (fail-safe default), instead of slipping through via the old
-	// `!globalApproval.IsAutoApproveAll()` short-circuit.
+	// checkToolApproval is authoritative — it encodes the tool's
+	// ApprovalLevel together with the current /approve setting.
 	if approved, reason := checkToolApproval(tc.Name, tc.Arguments); !approved {
 		out := fmt.Sprintf("[SECURITY] %s", reason)
 		logging.PrintTool(tc.Name, out)
@@ -516,9 +445,7 @@ func dispatchTool(ctx context.Context, tc llm.ToolCall, messages *[]llm.Message,
 	*messages = append(*messages, llm.ToolMessage(result.Output, tc.ID))
 
 	if !result.OK {
-		// Determine if it's a timeout or a plain failure by sniffing
-		// the output (runToolWithTimeout decorates timeout/ancel
-		// messages with "timed out" / "cancelled" keywords).
+		// Determine timeout vs failure by sniffing output keywords.
 		lower := strings.ToLower(result.Output)
 		if strings.Contains(lower, "timed out") || strings.Contains(lower, "cancelled") {
 			return OutcomeTimeout, result.Output
@@ -528,45 +455,16 @@ func dispatchTool(ctx context.Context, tc llm.ToolCall, messages *[]llm.Message,
 	return OutcomeSuccess, result.Output
 }
 
-// interactiveConfirmTools are handlers that may block on synchronous,
-// unbounded-duration terminal input - write_file/edit_file's diff-
-// preview confirm (security.PreviewAndConfirm) - rather than on real
-// work. They are run directly in the calling goroutine by
-// runToolWithTimeout below instead of the timeout-wrapped goroutine,
-// for two independent reasons:
-//
-//  1. A human's decision time has nothing to do with how long a tool
-//     should be allowed to run. Wrapping the confirm prompt in
-//     PerToolTimeout means the operator can be mid-read of a diff
-//     when the tool is force-timed-out out from under them - their
-//     eventual answer is simply discarded once resultCh's writer loses
-//     the race in the select below.
-//  2. security.ReadLine (see main.go) is wired to the same
-//     chzyer/readline Instance driving the main REPL loop. That
-//     Instance is designed to be read sequentially - one Readline()
-//     call at a time - and is normally only ever driven from this one
-//     goroutine; running the confirm prompt in a second, timeout-
-//     wrapped goroutine adds a needless (if likely benign) doubt about
-//     cross-goroutine reentrancy for zero benefit, since these tools'
-//     actual file I/O is local and fast regardless.
-//
-// bash is deliberately NOT in this set: most bash calls need no
-// confirmation and DO need the timeout ceiling to stop a hung command
-// from freezing the REPL forever (that protection matters far more
-// than the rarer bash-danger-confirm path colliding with it).
+// interactiveConfirmTools bypass the timeout wrapper: human confirm time
+// should not be bounded by PerToolTimeout, and readline is not goroutine-safe.
+// bash is excluded: it needs the timeout ceiling.
 var interactiveConfirmTools = map[string]bool{
 	"write_file": true,
 	"edit_file":  true,
 }
 
-// toolTimeoutOverrides lets specific tools use a longer hard ceiling
-// than the general-purpose PerToolTimeout, without weakening the
-// default protection for every other tool. task is the only entry
-// today: a read-only subagent exploring a real codebase routinely
-// needs more than 5 minutes of read_file/bash rounds. runSubagent
-// paired with this uses infra.SubagentSoftDeadlineBuffer to return a
-// progress summary before this hard ceiling would otherwise fire and
-// discard its entire investigation (see runSubagent's doc comment).
+// toolTimeoutOverrides gives specific tools a longer timeout ceiling.
+// task (subagent) needs more time for real codebase exploration.
 var toolTimeoutOverrides = map[string]time.Duration{
 	"task": infra.SubagentTimeout,
 }
@@ -624,10 +522,6 @@ func invokeToolHandler(ctx context.Context, tc llm.ToolCall) ToolResult {
 	}
 	return llm.MkErr(fmt.Sprintf("Unknown tool: %s", tc.Name))
 }
-
-// ----------------------------------------------------------------------------
-// Auto-lesson + judge helpers
-// ----------------------------------------------------------------------------
 
 // shouldRequestLesson returns true when the LLM should write a lesson entry.
 func shouldRequestLesson(st *loopState) bool {

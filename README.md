@@ -13,6 +13,7 @@ An autonomous coding agent built in Go featuring multi-round planning, self-refl
 - [Built-in Tools](#built-in-tools)
 - [LLM Providers](#llm-providers)
 - [Security Model](#security-model)
+- [Web Access & SSRF Protection](#web-access--ssrf-protection)
 - [Agentic Features](#agentic-features)
 - [Memory System](#memory-system)
 - [Session Management](#session-management)
@@ -133,7 +134,7 @@ All persistent state is stored under `{workdir}/.go-code-agent/`. Sessions survi
 │  LLM PROVIDERS           │   │  TOOL DISPATCH                    │
 │  (provider_*.go)         │   │  (tool_registry + MCP)            │
 │                          │   │                                   │
-│  openai / anthropic /    │   │  32 built-in + mcp__* tools        │
+│  openai / anthropic /    │   │  34 built-in + mcp__* tools        │
 │  gemini (stub)           │   │  security gate → HITL gate →      │
 │  + retry (exp backoff)   │   │  timeout → snapshot/rollback      │
 └──────────────────────────┘   └────────────────┬──────────────────┘
@@ -255,6 +256,11 @@ Session End:
 | `OPENAI_API_KEY` | — | Required for gpt-*/o*/compatible models |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Proxy/local model endpoint |
 | `SNAPSHOT_ENABLED` | `0` | Set `1` to enable git-stash-based rollback |
+| `WEB_ALLOW_PRIVATE_IPS` | `0` | Set `1` to let `web_fetch`/`web_search` reach private/internal network addresses (default: blocked) |
+| `WEB_SEARCH_PROVIDER` | auto | Force a search backend: `tavily` \| `brave` (requires `WEB_SEARCH_API_KEY`); unset = auto downgrade chain |
+| `WEB_SEARCH_API_KEY` | — | API key for the forced `WEB_SEARCH_PROVIDER` |
+| `SEARXNG_URL` | — | A specific/trusted SearXNG instance, tried alone instead of the public instance list |
+| `SEARXNG_INSTANCES` | built-in list | Comma-separated override of the public SearXNG instances tried in the downgrade chain |
 
 ### CLI Flags
 
@@ -335,6 +341,9 @@ All thresholds are centralized in one file for easy tuning:
 | | JudgeMaxRetryInjects | 2 | Max verification-failed retries |
 | **Planning** | PlanningGateMinTaskChars | 80 | Skip gate for trivial queries |
 | | LessonRoundsLimit | 3 | Max extra rounds after lesson |
+| **Web** | WebFetchTimeout | 20s | `web_fetch` request+redirects timeout |
+| | WebFetchMaxBytes | 2 MB | `web_fetch` response body cap |
+| | WebSearchTimeout | 8s | Per-backend timeout in the `web_search` downgrade chain |
 
 ---
 
@@ -359,6 +368,7 @@ go-code-agent/
 │   │   ├── team.go               #   TeammateManager: WORK/IDLE autonomous loop
 │   │   ├── tool_registry.go      #   Tool definitions (30+ tools registered here)
 │   │   ├── tool_base.go          #   Base tool handlers (bash, files, think, etc.)
+│   │   ├── web_tools.go          #   web_fetch/web_search tools (formatting + secrets redaction)
 │   │   ├── system_prompt.go      #   System prompt assembly + memory recall
 │   │   ├── security.go           #   Tool security registry, checkToolApproval, HITL gate glue
 │   │   ├── snapshot.go           #   Saga-pattern snapshot/rollback via git-stash
@@ -379,6 +389,18 @@ go-code-agent/
 │   ├── hitlaudit/                # Human-in-the-loop + audit
 │   │   ├── hitlaudit.go          #   Audit log (JSONL) + approval gate
 │   │   └── human_approval.go     #   4-mode approval logic + risk classification
+│   ├── security/                 # Security primitives (no internal/agent dependency)
+│   │   ├── approval.go           #   ApprovalLevel + ApprovalState (auto/safe/danger gating)
+│   │   ├── bash_policy.go        #   Command allowlist + danger-pattern detection
+│   │   ├── path_sandbox.go       #   SecurePath: traversal/symlink-escape prevention
+│   │   ├── secrets.go            #   SecretsSanitizer: redact API keys/tokens/private keys
+│   │   ├── permissions.go        #   User-editable permissions.json (tool+pattern allow/deny/ask)
+│   │   └── ssrf.go               #   SSRF policy: private/internal IP blocklist (see Web Access section)
+│   ├── web/                      # Outbound web access for web_fetch/web_search
+│   │   ├── client.go             #   SSRF-hardened http.Client (dial-time IP check, redirect guard)
+│   │   ├── fetch.go               #   web_fetch: GET + content-type dispatch
+│   │   ├── html.go               #   HTML → readable text extraction (golang.org/x/net/html)
+│   │   └── search.go             #   Searcher interface + DDG/SearXNG/Tavily/Brave + downgrade chain
 │   ├── task/                     # Task management
 │   │   ├── task.go               #   TaskManager: CRUD, file persistence
 │   │   ├── task_scheduler.go     #   DAGScheduler: topological sort, stage execution
@@ -514,6 +536,15 @@ go-code-agent/
 | `background_run` | Run a long command in background (non-blocking) |
 | `check_background` | Check status/output of background tasks |
 
+### Web Access
+
+| Tool | Description |
+|------|-------------|
+| `web_fetch` | Fetch a public URL and return its readable text (HTML → plain text; blocked for private/internal addresses by default) |
+| `web_search` | Search the web via a zero-config downgrade chain (SearXNG → DuckDuckGo), or a paid backend (Tavily/Brave) if configured |
+
+See [Web Access & SSRF Protection](#web-access--ssrf-protection) for the security model behind these two tools.
+
 ### Multi-Agent Collaboration
 
 | Tool | Description |
@@ -619,6 +650,43 @@ Detected secrets are replaced with `[REDACTED]` before being added to conversati
 - **HITL Approval**: 4 modes (interactive/auto-approve/auto-reject/notify-only)
 - **Snapshot/Rollback**: Git-stash-based Saga pattern for write tools (opt-in via `SNAPSHOT_ENABLED=1`)
 - **Per-tool Timeout**: 5-minute hard ceiling prevents hung handlers from freezing the REPL
+- **User Permission Rules**: `{workdir}/.go-code-agent/permissions.json` lets you allow/deny/ask per tool+pattern (e.g. allow `git commit -m *` but deny `git push --force*`) — layered *after* the hard bash danger-pattern blacklist, so a user `allow` rule can never resurrect a command the blacklist forbids. See `/permissions` and `/permissions reload`.
+
+---
+
+## Web Access & SSRF Protection
+
+The `web_fetch` and `web_search` tools (see [Built-in Tools](#built-in-tools)) are the agent's only way to reach the public internet. Both are funneled through a single SSRF-hardened HTTP client (`internal/web/client.go`) so the security guarantee below holds regardless of what either tool does with the result.
+
+### Default-deny private networks
+
+Every outbound connection is checked **at dial time, against the actually-resolved IP** (not the hostname string) — this is what defeats DNS rebinding, where a domain's DNS answer can differ between "looks safe" and "connects somewhere private" between the first check and the actual connection.
+
+| Address space | Default | Override |
+|----------------|---------|----------|
+| Loopback (`127.0.0.0/8`, `::1`), RFC1918 private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and `9.*`/`11.*`/`21.*`/`30.*` (explicitly listed in project security rules) | Blocked | `WEB_ALLOW_PRIVATE_IPS=1` |
+| Link-local / cloud metadata (`169.254.0.0/16`, `fe80::/10`) — the address space real-world SSRF exploits target (e.g. stealing cloud IAM credentials via `169.254.169.254`) | **Always blocked** | No override — never opt-outable |
+
+Additional guards: redirects are capped at 5 hops and non-`http(s)` redirect targets are rejected outright; response bodies are read through `io.LimitReader` (never fully buffered) and capped at `WebFetchMaxBytes` (2 MB default).
+
+### web_search downgrade chain
+
+`web_search` never requires configuration to be usable:
+
+```
+WEB_SEARCH_PROVIDER=tavily|brave + WEB_SEARCH_API_KEY set?
+  → yes: use ONLY that backend (an explicitly configured paid backend
+         is never silently downgraded)
+  → no:  1. SEARXNG_URL if set (a trusted/self-hosted instance), tried alone
+         2. else the built-in public SearXNG instance list
+            (or SEARXNG_INSTANCES override), tried in order
+         3. DuckDuckGo Lite (zero-key, always available) as the final fallback
+         4. all backends failed → explicit error, never a silent empty result
+```
+
+### Untrusted content handling
+
+`web_fetch`'s extracted page text is wrapped in an explicit `BEGIN/END UNTRUSTED PAGE CONTENT` marker before being added to the conversation — the model is instructed to treat it as data to read, never as instructions to follow (defense against prompt injection from a fetched page). Both tools also run their output through the same `SecretsSanitizer` used for bash/file output, since a fetched page could echo back something that looks like a credential.
 
 ---
 
@@ -891,6 +959,7 @@ View aggregated stats with the `/usage` REPL command.
 | `github.com/tidwall/gjson` | Fast JSON path queries |
 | `github.com/tidwall/sjson` | JSON mutation |
 | `github.com/invopop/jsonschema` | JSON Schema generation for tool defs |
+| `golang.org/x/net` | HTML parsing for `web_fetch`/`web_search` (`golang.org/x/net/html`) |
 | `golang.org/x/sync` | Concurrency primitives (errgroup) |
 
 ---

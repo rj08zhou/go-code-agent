@@ -1,21 +1,6 @@
-// Reflection module: self-evaluation triggers.
-//
-// Triggers (each maintains an independent cool-down so the same kind
-// of reflection prompt isn't injected into the conversation every
-// round; without cool-downs the message list quickly fills with
-// near-identical "<reflect>...</reflect>" blocks, drowning out the
-// actual signal):
-//
-//  1. consecutiveFailures == 1 -> mini-reflect      (no cooldown — one-shot per first failure)
-//  2. consecutiveFailures >= max -> strategy-change (cooldown: strategyChangeCooldown)
-//  3. roundsSinceLastComplete >= stuckThreshold -> stuck   (cooldown: stuckCooldown)
-//  4. toolRounds % reflectInterval == 0 -> periodic        (cooldown: periodicCooldown)
-//  5. roundsWithoutTodo >= 3 && hasOpenItems -> todo-nag   (cooldown: todoNagCooldown)
-//
-// Pure function: returns prompts + reset flags + the set of trigger
-// kinds that fired this round, without side effects. The caller
-// records "kind -> toolRounds" in its loopState so the next invocation
-// can honor the cool-down.
+// Reflection module: self-evaluation triggers with independent cool-downs.
+// Triggers: mini-reflect (1 failure), strategy-change (N failures),
+// stuck (no completion), periodic (every N rounds), todo-nag.
 package agent
 
 import (
@@ -32,9 +17,7 @@ const (
 	reflectKindTodoNag  = "todo_nag"
 )
 
-// Cool-down windows (in tool-round units). Tuned conservatively: long
-// enough to break out of a tight loop, short enough that real new
-// problems still surface within a few rounds.
+// Cool-down windows (in tool-round units).
 const (
 	strategyChangeCooldown = 5
 	stuckCooldown          = 5
@@ -42,11 +25,9 @@ const (
 	todoNagCooldown        = 3
 )
 
-// reflect evaluates agent state and returns reflection prompts to
-// inject. `lastTriggered` maps trigger-kind -> the toolRounds value at
-// which that kind last fired; pass an empty map on the very first
-// call. `triggered` is the set of kinds that fired *this* round, so
-// the caller can update its own `lastTriggered` snapshot.
+// reflect evaluates agent state and returns reflection prompts to inject.
+// `lastTriggered` maps trigger-kind → toolRounds; `triggered` is the set
+// of kinds that fired this round.
 func reflect(
 	consecutiveFailures int, lastFailedTool string, maxConsecutiveFailures int,
 	toolRounds int, totalFailures int,

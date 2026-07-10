@@ -58,6 +58,7 @@ func (bg *BackgroundManager) Run(command string, timeout int) string {
 	bg.mu.Unlock()
 
 	go func() {
+		// Detached on purpose: background tasks outlive the issuing turn.
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "sh", "-c", command)
@@ -68,8 +69,11 @@ func (bg *BackgroundManager) Run(command string, timeout int) string {
 		status, result := "completed", strings.TrimSpace(string(output))
 		if ctx.Err() == context.DeadlineExceeded {
 			status, result = "timeout", "Timeout"
-		} else if err != nil && result == "" {
-			status, result = "error", err.Error()
+		} else if err != nil {
+			status = "error"
+			if result == "" {
+				result = err.Error()
+			}
 		}
 		if result == "" {
 			result = "(no output)"

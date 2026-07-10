@@ -172,3 +172,78 @@ func TestIsSafeSplit(t *testing.T) {
 		t.Errorf("out-of-range indices must be unsafe")
 	}
 }
+
+// Regression tests for a real panic: main.go's `before := len(conv)`
+// went stale when AutoCompact replaced conv mid-turn.
+
+func TestRemapPersistedBoundary_TailUntouchedMessage(t *testing.T) {
+	split := 500
+	oldBoundary := 550
+	got := remapPersistedBoundary(oldBoundary, split)
+	want := 3 + (550 - 500)
+	if got != want {
+		t.Errorf("remapPersistedBoundary(%d, %d) = %d, want %d", oldBoundary, split, got, want)
+	}
+}
+
+func TestRemapPersistedBoundary_BoundaryInsideSummarizedPrefix(t *testing.T) {
+	// Shape of the reported panic: oldBoundary falls inside the
+	// summarized prefix, must clamp to the tail start (3).
+	split := 565
+	oldBoundary := 40
+	got := remapPersistedBoundary(oldBoundary, split)
+	if got != 3 {
+		t.Errorf("remapPersistedBoundary(%d, %d) = %d, want 3", oldBoundary, split, got)
+	}
+}
+
+func TestRemapPersistedBoundary_NeverExceedsNewSliceLength(t *testing.T) {
+	for n := 1; n <= 40; n++ {
+		msgs := make([]llm.Message, 0, n)
+		msgs = append(msgs, sysMsg())
+		for i := 1; i < n; i++ {
+			if i%4 == 0 {
+				msgs = append(msgs, userMsg())
+			} else {
+				msgs = append(msgs, asstText())
+			}
+		}
+		for keepRecent := 1; keepRecent <= n+2; keepRecent++ {
+			split := findCompactionSplit(msgs, keepRecent)
+			newLen := 3 + (len(msgs) - split)
+			for oldBoundary := 0; oldBoundary <= len(msgs); oldBoundary++ {
+				got := remapPersistedBoundary(oldBoundary, split)
+				if got < 0 || got > newLen {
+					t.Fatalf("n=%d keepRecent=%d split=%d oldBoundary=%d: remapped=%d out of [0,%d]",
+						n, keepRecent, split, oldBoundary, got, newLen)
+				}
+			}
+		}
+	}
+}
+
+func TestWithPersistedBoundary_RoundTrip(t *testing.T) {
+	boundary := 42
+	ctx := WithPersistedBoundary(t.Context(), &boundary)
+	got := persistedBoundaryFromCtx(ctx)
+	if got == nil {
+		t.Fatal("expected a non-nil boundary pointer from ctx")
+	}
+	*got = 99
+	if boundary != 99 {
+		t.Errorf("expected mutation through the ctx pointer to affect boundary, got %d", boundary)
+	}
+}
+
+func TestWithPersistedBoundary_NilIsNoOp(t *testing.T) {
+	ctx := WithPersistedBoundary(t.Context(), nil)
+	if got := persistedBoundaryFromCtx(ctx); got != nil {
+		t.Error("expected nil boundary to be a no-op")
+	}
+}
+
+func TestPersistedBoundaryFromCtx_AbsentReturnsNil(t *testing.T) {
+	if got := persistedBoundaryFromCtx(t.Context()); got != nil {
+		t.Error("expected nil when no boundary was attached to ctx")
+	}
+}

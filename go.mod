@@ -6,6 +6,8 @@ require (
 	github.com/anthropics/anthropic-sdk-go v1.41.0
 	github.com/chzyer/readline v1.5.1
 	github.com/openai/openai-go v1.12.0
+	github.com/russross/blackfriday/v2 v2.1.0
+	golang.org/x/net v0.57.0
 	golang.org/x/time v0.15.0
 )
 
@@ -22,6 +24,6 @@ require (
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	golang.org/x/sync v0.16.0 // indirect
-	golang.org/x/sys v0.35.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

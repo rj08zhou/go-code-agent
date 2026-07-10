@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go-code-agent/infra"
 	"go-code-agent/internal/llm"
@@ -43,24 +44,18 @@ type TeammateManager struct {
 	dagSched   *task.DAGScheduler
 	tasksDir   string
 	protocols  *team.ProtocolStore
+	worktrees  *WorktreeManager
 
-	// spawnMu serializes Spawn calls and lastSpawn enforces a minimum
-	// gap between consecutive spawns. A reflect step that decides to
-	// fan out 3 subagents would otherwise launch their goroutines (and
-	// their first LLM hits) within microseconds of each other,
-	// defeating the LLM token-bucket and inviting 429s. Staggering by
-	// SpawnMinInterval lets the upstream gateway's bucket refill
-	// between hits.
 	spawnMu   sync.Mutex
 	lastSpawn time.Time
 }
 
-func NewTeamMgr(dir string, bus *team.MessageBus, taskMgr *task.TaskManager, dagSched *task.DAGScheduler, tasksDir string, protocols *team.ProtocolStore) *TeammateManager {
+func NewTeamMgr(dir string, bus *team.MessageBus, taskMgr *task.TaskManager, dagSched *task.DAGScheduler, tasksDir string, protocols *team.ProtocolStore, worktrees *WorktreeManager) *TeammateManager {
 	os.MkdirAll(dir, 0o755)
 	tm := &TeammateManager{
 		dir: dir, configPath: filepath.Join(dir, "config.json"),
 		bus: bus, taskMgr: taskMgr, dagSched: dagSched, tasksDir: tasksDir,
-		protocols: protocols,
+		protocols: protocols, worktrees: worktrees,
 	}
 	if data, err := os.ReadFile(tm.configPath); err == nil {
 		json.Unmarshal(data, &tm.config)
@@ -129,19 +124,44 @@ func (tm *TeammateManager) Spawn(ctx context.Context, name, role, prompt string)
 	tm.save()
 	tm.mu.Unlock()
 
+	// Resolve the worktree after the busy-check above, so a capacity
+	// rejection (ErrTooManyWorktrees) surfaces as a clean error to the
+	// caller without ever having claimed the "working" slot for a
+	// teammate we're about to fail to start.
+	workdir := ""
+	if tm.worktrees != nil {
+		wt, err := tm.worktrees.Create(name)
+		switch {
+		case err == nil:
+			workdir = wt
+		case errors.Is(err, ErrTooManyWorktrees):
+			tm.setStatus(name, "shutdown")
+			return fmt.Sprintf("Error: too many active teammate worktrees (max %d) - shut one down first", infra.MaxActiveWorktrees)
+		default:
+			logging.PrintSystem(fmt.Sprintf("[team] worktree creation failed for %s: %v, falling back to shared workdir", name, err))
+		}
+	}
+
 	// Use a background context so the teammate's lifetime is independent
 	// of the spawning tool call's timeout (PerToolTimeout = 5min).
-	go tm.autonomousLoop(context.Background(), name, role, prompt)
+	go tm.autonomousLoop(context.Background(), name, role, prompt, workdir)
 	return fmt.Sprintf("Spawned '%s' (role: %s)", name, role)
 }
 
 // autonomousLoop runs a WORK -> IDLE -> WORK cycle until timeout or shutdown.
-func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, prompt string) {
+func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, prompt, workdir string) {
+	if workdir != "" {
+		ctx = WithWorkdir(ctx, workdir)
+	}
 	teamName := tm.config.TeamName
 	tmpl := App.PromptLoader.Load("teammate")
+	wd := workdir
+	if wd == "" {
+		wd = App.Workdir
+	}
 	sys := strings.NewReplacer(
 		"{{name}}", name, "{{role}}", role,
-		"{{team}}", teamName, "{{workdir}}", App.Workdir,
+		"{{team}}", teamName, "{{workdir}}", wd,
 	).Replace(tmpl)
 	msgs := []llm.Message{llm.SystemMessage(sys), llm.UserMessage(prompt)}
 
@@ -218,13 +238,26 @@ func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, promp
 		}
 	}
 
-	for { // Outer: alternates WORK and IDLE phases.
+	for {
 		if tm.workPhase(ctx, name, &msgs, tools, execTool) == "shutdown" {
+			tm.cleanupWorktree(name)
 			return
 		}
 		if !tm.idlePhase(name, role, teamName, &msgs) {
+			tm.cleanupWorktree(name)
 			return
 		}
+	}
+}
+
+func (tm *TeammateManager) cleanupWorktree(name string) {
+	if tm.worktrees == nil {
+		return
+	}
+	// Remove already logs why it kept a dirty/unmerged worktree (see
+	// worktree.go); ErrWorktreeDirty here is expected, not a failure.
+	if err := tm.worktrees.Remove(name); err != nil && err != ErrWorktreeDirty {
+		logging.PrintSystem(fmt.Sprintf("[team] worktree cleanup failed for %s: %v", name, err))
 	}
 }
 
@@ -368,6 +401,15 @@ func (tm *TeammateManager) MemberNames() []string {
 		names = append(names, m.Name)
 	}
 	return names
+}
+
+// ShutdownByName sends a shutdown request to a single teammate.
+func (tm *TeammateManager) ShutdownByName(name string) string {
+	if tm.findIndex(name) < 0 {
+		return fmt.Sprintf("Error: no teammate named '%s'", name)
+	}
+	team.PostShutdownRequest(tm.protocols, tm.bus, name)
+	return fmt.Sprintf("Shutdown request sent to '%s'", name)
 }
 
 // ShutdownTeammates sends shutdown requests to all active teammates (best-effort).

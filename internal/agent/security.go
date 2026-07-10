@@ -19,22 +19,8 @@ import (
 	"time"
 )
 
-// Security layer glue for go-code-agent.
-//
-// The reusable, agent-agnostic security primitives (approval
-// state machine, bash policy, path sandbox, secrets sanitizer, diff
-// preview) live in internal/security - see that package for their
-// implementation and doc comments. This file only keeps what's
-// genuinely tied to this package's concerns:
-//
-//   - ToolSecurityMeta / ToolSecurityMap: the concrete tool registry
-//     (populated by registerToolSpec, see tool_base.go/tool_registry.go).
-//   - checkToolApproval: resolves a tool name to a security.ApprovalLevel
-//     via that registry (with an MCP-prefix fallback), then delegates
-//     the actual allow/deny decision to security.GlobalApproval.Decide.
-//   - secure*: workdir-aware wrappers around internal/security's pure
-//     functions (they need this package's App.Workdir, logging.Print*,
-//     and checkToolApproval).
+// Security layer glue: tool security registry, checkToolApproval, and
+// workdir-aware wrappers around internal/security primitives.
 
 type ToolSecurityMeta struct {
 	Name        string
@@ -46,13 +32,8 @@ type ToolSecurityMeta struct {
 // directory override is carried. See WithWorkdir / workdirFromCtx.
 type workdirKey struct{}
 
-// WithWorkdir returns a context that pins tool file/bash operations to
-// dir instead of the process-wide App.Workdir. It is the mechanism that
-// lets an isolated agent (e.g. a teammate running in its own git
-// worktree) confine its reads/writes/commands to a private directory
-// while the main agent keeps using App.Workdir untouched. An empty dir
-// is a no-op (returns ctx unchanged) so callers can pass through
-// unconditionally.
+// WithWorkdir pins tool file/bash operations to dir instead of App.Workdir.
+// No-op if dir is empty.
 func WithWorkdir(ctx context.Context, dir string) context.Context {
 	if dir == "" {
 		return ctx
@@ -60,11 +41,7 @@ func WithWorkdir(ctx context.Context, dir string) context.Context {
 	return context.WithValue(ctx, workdirKey{}, dir)
 }
 
-// workdirFromCtx resolves the working directory for a tool call: the
-// ctx override if one was set via WithWorkdir, else the process-wide
-// App.Workdir. This fallback is what keeps the main agent's behavior
-// identical to before this indirection existed - it never sets the
-// override, so it always lands on App.Workdir.
+// workdirFromCtx returns the ctx override if set, else App.Workdir.
 func workdirFromCtx(ctx context.Context) string {
 	if ctx != nil {
 		if d, ok := ctx.Value(workdirKey{}).(string); ok && d != "" {
@@ -75,48 +52,13 @@ func workdirFromCtx(ctx context.Context) string {
 }
 
 // ToolSecurityMap holds the approval Level for every registered tool.
-//
-// It starts empty and is populated exclusively by registerToolSpec
-// (see tool_base.go / tool_registry.go's InitTools) — never by a
-// static literal here. That used to be a hand-maintained map living in
-// this file, disconnected from the Def+Handler registration in
-// tool_registry.go; it drifted in both directions in practice: some
-// registered tools had no entry here (silently unusable — see
-// checkToolApproval's "unknown tool" branch below) and some entries
-// here referred to tool names this agent never actually registers.
-// Routing every tool through registerToolSpec makes that class of
-// drift impossible: a tool cannot exist in ToolDefs without also
-// landing here with an explicit Level.
+// Populated by registerToolSpec (see tool_base.go / tool_registry.go).
 var ToolSecurityMap = map[string]ToolSecurityMeta{}
 
 // checkToolApproval determines if a tool call should be allowed.
-// Returns (allowed, reason).
-//
-// Resolution order:
-//  1. Exact match in ToolSecurityMap (the tool registry).
-//  2. MCP-prefixed tools ("mcp__<server>__<tool>") with no explicit
-//     entry fall back to security.MCPDefaultLevel (see that constant's
-//     doc comment for why).
-//  3. Anything else is an unknown tool: permanently denied, regardless
-//     of /approve settings (fail-safe default).
-//
-// User permission rules (permissions.json) are then consulted with the
-// call's arguments, EXCEPT for bash: bash command-pattern rules are
-// enforced inside BashPolicy.Validate instead (which also guarantees
-// the DangerPatterns blacklist is checked first and can't be bypassed),
-// so matching them here too would double-prompt. For every other tool a
-// matching rule overrides the Level decision:
-//
-//	deny  -> blocked
-//	allow -> approved (skips the Level gate, but note it can never
-//	         bypass hard checks like the path sandbox / bash blacklist,
-//	         which run independently in the secure* wrappers)
-//	ask   -> forced through danger-level approval so it is never
-//	         silently auto-approved
-//
-// With no matching rule (the default when there is no permissions.json)
-// the resolved Level is delegated to security.GlobalApproval.Decide, so
-// behavior is identical to before.
+// Resolution: ToolSecurityMap exact match → MCP default → deny (unknown).
+// Then permissions.json rules (deny/allow/ask) override the Level decision,
+// except for bash (enforced in BashPolicy.Validate to avoid double-prompting).
 func checkToolApproval(toolName, argsJSON string) (bool, string) {
 	meta, ok := ToolSecurityMap[toolName]
 	if !ok {
