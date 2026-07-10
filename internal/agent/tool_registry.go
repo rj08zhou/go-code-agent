@@ -401,6 +401,9 @@ func InitTools() {
 			}),
 	)
 
+	// Web access (web_fetch/web_search) - see web_tools.go.
+	registerWebTools()
+
 	// Append MCP tools from connected servers. Their approval Level is
 	// resolved dynamically in security.go's checkToolApproval (they
 	// don't have a static ToolSpec since the set is only known at

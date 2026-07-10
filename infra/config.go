@@ -7,27 +7,8 @@ import (
 	"strings"
 )
 
-// Centralized runtime configuration.
-//
-// Config is the single, typed snapshot of every environment variable
-// the process honours. Previously each subsystem read os.Getenv on its
-// own (main.go, judge.go, limiter.go, provider*.go), so "what knobs
-// exist" was scattered across the tree and impossible to see at a
-// glance. Load() is now the ONE place that parses env; Cfg is the
-// process-wide snapshot taken once, at package-init time.
-//
-// Init-order note: this file lives in infra, the lowest-level package
-// that everything else imports. Go initializes imported packages
-// before their importers, so `var Cfg = Load()` runs before the init()
-// of internal/llm (where the provider constructors read credentials)
-// and before main(). That is why credentials read at provider-init
-// time can safely read Cfg. Environment is fixed for the process's
-// lifetime, so reading it once here loses nothing.
-//
-// Dependency note: Load()/Validate() deliberately import only the
-// standard library. infra must stay free of any internal/* import to
-// remain the dependency-free base layer; callers (main.go) do the
-// logging of Validate()'s findings.
+// Centralized runtime configuration. Load() parses env once at init; Cfg
+// is the process-wide snapshot.
 
 const defaultModelID = "claude-opus-4.7"
 
@@ -61,10 +42,7 @@ type Config struct {
 	ContextWindowOverride int // CONTEXT_WINDOW_TOKENS (0 => infer from model id)
 }
 
-// Cfg is the process-wide configuration snapshot, populated once at
-// package-init time. Tests that need to exercise parsing against a
-// mutated environment should call Load() directly rather than mutating
-// this value.
+// Cfg is the process-wide config snapshot, populated once at init.
 var Cfg = Load()
 
 // Load reads and parses the full environment into a Config. It never
@@ -96,12 +74,8 @@ func Load() *Config {
 	return c
 }
 
-// ContextWindowTokens returns the assumed context-window size (in
-// tokens) for a model id. An explicit CONTEXT_WINDOW_TOKENS env
-// override wins; otherwise it is inferred from the model-id prefix,
-// falling back to ContextWindowDefault for unrecognized ids. The
-// figure only needs to be in the right ballpark - CompactionThresholdFrac
-// leaves headroom on top of it.
+// ContextWindowTokens returns the assumed context-window size for a model id.
+// Explicit override wins; otherwise inferred from model-id prefix.
 func ContextWindowTokens(model string) int {
 	if Cfg != nil && Cfg.ContextWindowOverride > 0 {
 		return Cfg.ContextWindowOverride
@@ -119,13 +93,8 @@ func ContextWindowTokens(model string) int {
 	}
 }
 
-// CompactionThreshold returns the estimated-token count at which
-// AutoCompact should fire for a given model: the smaller of the
-// model-window-derived budget (window * CompactionThresholdFrac) and
-// the absolute TokenThreshold cap. Making it model-aware prevents a
-// small-window model from silently blowing past its real limit, while
-// the TokenThreshold cap preserves existing behavior for large-window
-// models.
+// CompactionThreshold returns the token count at which AutoCompact fires:
+// the smaller of window*CompactionThresholdFrac and the absolute TokenThreshold.
 func CompactionThreshold(model string) int {
 	windowBudget := int(float64(ContextWindowTokens(model)) * CompactionThresholdFrac)
 	if windowBudget < TokenThreshold {
@@ -134,16 +103,11 @@ func CompactionThreshold(model string) int {
 	return TokenThreshold
 }
 
-// Validate returns human-readable warnings about a suspicious (but not
-// necessarily fatal) configuration. main() prints these at startup.
-// They are intentionally non-fatal: e.g. a dedicated OpenAI-compatible
-// gateway may authenticate purely via LLM_PROVIDER + OPENAI_BASE_URL,
-// so a missing standard key is a warning, not an error.
+// Validate returns non-fatal warnings about suspicious config.
 func (c *Config) Validate() []string {
 	var warns []string
 
-	// No credentials at all is the single most common misconfig - the
-	// first LLM call would otherwise fail with an opaque 401.
+	// No credentials is the most common misconfig.
 	if c.OpenAIAPIKey == "" && c.AnthropicAPIKey == "" {
 		warns = append(warns, "no LLM API key found (set OPENAI_API_KEY or ANTHROPIC_API_KEY; ignore if your gateway needs none)")
 	}
@@ -172,9 +136,7 @@ func envBool(key string) bool {
 	return false
 }
 
-// envFloat parses a float env var, falling back to dflt on missing or
-// malformed input. A parsed value <= 0 is preserved (the limiter reads
-// LLM_MAX_QPS=0 as "disable throttling").
+// envFloat parses a float env var, falling back to dflt on missing/malformed.
 func envFloat(key string, dflt float64) float64 {
 	s := strings.TrimSpace(os.Getenv(key))
 	if s == "" {

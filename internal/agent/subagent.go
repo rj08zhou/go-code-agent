@@ -13,16 +13,9 @@ import (
 )
 
 // Subagent - isolated read-only agent loop, returns summary only.
-//
-// Subagents never get write tools. They pass through the same security
-// and HITL gates as the main agent. If a write is needed, the subagent
-// returns a summary and the parent performs the write.
 
 func runSubagent(ctx context.Context, prompt, agentType string) string {
-	// Subagents NEVER receive write tools. Passing false to both keeps
-	// the advertised Defs and the executable Handlers in lockstep -
-	// there is no write_file/edit_file/delete_file handler sitting in
-	// subHandlers for a stray tool_call to reach.
+	// Subagents never receive write tools.
 	subTools := coreToolDefs(false)
 	subHandlers := coreToolHandlers(false)
 

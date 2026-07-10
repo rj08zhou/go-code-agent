@@ -7,8 +7,8 @@ const AppRootDirName = ".go-code-agent"
 // Project-wide configuration constants. All tunable thresholds and timeouts.
 
 const (
-	StuckThreshold         = 20    // rounds without completing a task = "stuck" (raised from 10: 10 fired too often on long multi-step tasks)
-	ReflectInterval        = 20    // periodic reflection every N tool rounds (raised from 10: periodic+stuck were firing ~every 1-2 min)
+	StuckThreshold         = 20    // rounds without completing a task = "stuck"
+	ReflectInterval        = 20    // periodic reflection every N tool rounds
 	MaxConsecutiveFailures = 3     // same tool failing → force strategy change
 	MaxRounds              = 100   // hard safety cap for agent loop
 	LessonThreshold        = 3     // min tool rounds before auto-lesson prompt
@@ -18,31 +18,20 @@ const (
 )
 
 const (
-	TokenThreshold = 300000 // autoCompact trigger (estimated total tokens) - raised from 200000 to reduce compaction frequency
-	KeepRecent     = 15     // microCompact keeps N most recent tool messages - raised from 10 to retain more context
+	TokenThreshold = 300000 // autoCompact trigger (estimated total tokens)
+	KeepRecent     = 15     // microCompact keeps N most recent tool messages
 	MaxOutputLen   = 500000 // max bytes per tool output (truncation limit, 500KB)
 
-	// KeepRecentMessages is how many of the most recent conversation
-	// messages AutoCompact keeps VERBATIM (progressive compaction): only
-	// the older prefix is summarized. The actual split is snapped to a
-	// safe turn boundary (never orphaning a tool_call/tool_result pair),
-	// so this is a target, not an exact count. Distinct from KeepRecent
-	// above, which governs microCompact's tool-result folding.
+	// KeepRecentMessages: AutoCompact keeps this many recent messages verbatim;
+	// older prefix is summarized. Snapped to a safe turn boundary.
 	KeepRecentMessages = 20
 
-	// CompactionThresholdFrac: AutoCompact fires when estimated tokens
-	// exceed this fraction of the model's context window (see
-	// ContextWindowTokens). Kept below 1.0 to leave headroom for the
-	// next turn's output + the summarization call itself. The absolute
-	// TokenThreshold above is still honored as an upper cap.
+	// CompactionThresholdFrac: AutoCompact fires when tokens exceed this
+	// fraction of the context window.
 	CompactionThresholdFrac = 0.75
 )
 
-// Model context-window sizes (in tokens), used to make the compaction
-// threshold model-aware instead of a single hard-coded number. These
-// are deliberately conservative round numbers matched by model-id
-// prefix in ContextWindowTokens; an exact figure is unnecessary since
-// CompactionThresholdFrac already leaves headroom.
+// Model context-window sizes (tokens), matched by model-id prefix.
 const (
 	ContextWindowClaude  = 200000
 	ContextWindowGPT     = 128000
@@ -56,54 +45,34 @@ const (
 )
 
 const (
-	// LlmMaxRetries: most public LLM gateways throttle on a ~60s window;
-	// 3 retries (cumulative ~43s of backoff) cannot reliably outlast that
-	// window. Bumping to 5 pushes the cumulative wait to ~120s, which
-	// covers the typical rate-limit window.
+	// LlmMaxRetries: 5 retries to outlast typical ~60s gateway rate-limit windows.
 	LlmMaxRetries = 5
 	LlmBaseDelay  = 1 * time.Second
-	// LlmRateLimitDelay: 429-specific base backoff. Raised from 5s to 10s
-	// so we do not keep retrying inside the same throttle window (which
-	// only earns us another 429).
+	// LlmRateLimitDelay: 429-specific base backoff, above typical throttle window.
 	LlmRateLimitDelay = 10 * time.Second
-	// LlmMaxDelay: per-attempt backoff cap. Raised from 30s to 60s to
-	// match the rate-limit window length of typical LLM gateways.
+	// LlmMaxDelay: per-attempt backoff cap matching typical gateway rate-limit window.
 	LlmMaxDelay = 60 * time.Second
 
-	// LlmCallTimeout caps the wall-clock time of one provider Call/Stream
-	// attempt. Without it a hung backend (e.g. an OpenAI-compatible
-	// gateway that holds the SSE socket open without sending chunks) can
-	// freeze the agent loop indefinitely, with no subprocess and no
-	// audit trail of where it stopped. Generous enough for a long
-	// reasoning + large-output completion; the retry wrapper still gets
-	// up to LlmMaxRetries chances after a timeout.
+	// LlmCallTimeout caps one provider Call/Stream attempt, preventing a hung
+	// backend from freezing the agent loop.
 	LlmCallTimeout = 5 * time.Minute
 
-	// LlmHTTPTimeout is the HTTP-client level timeout we install on the
-	// underlying transport. It is intentionally larger than
-	// LlmCallTimeout so the per-call ctx deadline is what fires first
-	// in the normal case; the HTTP timeout is a hard backstop for
-	// whatever ignores ctx (older SDKs, custom transports).
+	// LlmHTTPTimeout: HTTP-client level timeout, intentionally larger than
+	// LlmCallTimeout so the per-call ctx deadline fires first; hard backstop.
 	LlmHTTPTimeout = 6 * time.Minute
 
-	// Process-wide LLM throttle. Both the main agent and every spawned
-	// subagent / teammate share one token-bucket + concurrency cap so
-	// that fan-out (a reflect that spawns 3 verifiers) cannot overwhelm
-	// the upstream gateway and trigger a 429 storm.
-	//
-	// Defaults are conservative; override via env vars at startup:
-	//   LLM_MAX_QPS         float, requests-per-second  (default 2.0)
-	//   LLM_MAX_BURST       int,   bucket capacity      (default 4)
-	//   LLM_MAX_CONCURRENCY int,   in-flight calls cap  (default 2)
+	// Process-wide LLM throttle (shared by main agent + subagents). Override via
+	// LLM_MAX_QPS / LLM_MAX_BURST / LLM_MAX_CONCURRENCY.
 	LlmDefaultMaxQPS         = 2.0
 	LlmDefaultMaxBurst       = 4
 	LlmDefaultMaxConcurrency = 2
 
-	// SpawnMinInterval throttles teammate Spawn calls so that a single
-	// reflect step that fires off N subagents staggers their first LLM
-	// hit instead of all hitting the gateway at the same instant.
+	// SpawnMinInterval staggers teammate Spawn calls so their first LLM hits don't coincide.
 	SpawnMinInterval = 750 * time.Millisecond
 )
+
+// MaxActiveWorktrees caps concurrent teammate git worktrees to prevent disk exhaustion.
+const MaxActiveWorktrees = 10
 
 const (
 	MemoryTTLDays        = 90   // daily files older than this are auto-deleted
@@ -118,10 +87,7 @@ const (
 )
 
 const (
-	// Weights for merging keyword (BM25) + vector (hash-based) scores.
-	// Both inputs are normalized to [0, 1] before weighting, so weights sum should be 1.
-	// Keyword weight is higher: BM25 is a much stronger signal than hash-vector
-	// (which is essentially a random projection of bag-of-words).
+	// Weights for merging BM25 + vector scores. Both normalized to [0,1]; weights sum to 1.
 	HybridKeywordWeight = 0.65
 	HybridVectorWeight  = 0.35
 )
@@ -135,45 +101,24 @@ const (
 	BashTimeout = 120 * time.Second // bash / background_run default timeout
 )
 
-// Per-tool execution safety
-//
-// Even though individual tools (bash, network, ...) own their own
-// timeouts, we wrap each handler invocation in agentLoop with a
-// hard ceiling so that a buggy / hung handler can never freeze the
-// REPL. The ceiling is intentionally generous; well-behaved tools
-// finish far below it.
+// Per-tool execution safety: a hard ceiling on each handler invocation.
 const (
 	PerToolTimeout = 5 * time.Minute // hard ceiling per tool handler call
 
-	// SubagentTimeout is the task tool's own (more generous) hard
-	// ceiling, overriding PerToolTimeout for that one tool. A read-only
-	// subagent exploring a real codebase (many read_file/bash rounds)
-	// routinely needs longer than the general-purpose 5-minute ceiling;
-	// see SubagentSoftDeadlineBuffer below for how it avoids actually
-	// hitting this hard limit in the common case.
+	// SubagentTimeout: a more generous ceiling for the task tool, overriding PerToolTimeout.
 	SubagentTimeout = 10 * time.Minute
 
-	// SubagentSoftDeadlineBuffer: runSubagent checks its own elapsed
-	// time against (deadline - this buffer) before starting each new
-	// round, so it can stop itself and return a summary of progress
-	// so far instead of being hard-killed by SubagentTimeout with its
-	// entire investigation discarded (the failure mode we're fixing:
-	// a task call that ran out of PerToolTimeout used to throw away
-	// every file it had already read).
+	// SubagentSoftDeadlineBuffer: runSubagent self-terminates with a progress summary
+	// before the hard deadline fires, instead of being hard-killed.
 	SubagentSoftDeadlineBuffer = 30 * time.Second
 
-	// estimateTokens is O(N); recomputing every round on long sessions
-	// is wasteful. We re-check at most every TokenCheckInterval rounds.
+	// TokenCheckInterval: re-check tokens at most every N rounds (estimateTokens is O(N)).
 	TokenCheckInterval = 3
 
-	// After lessonsWritten=true, we allow at most this many extra rounds
-	// for the model to actually persist the lesson via memory_write,
-	// preventing an unbounded "post-lesson" tail.
+	// LessonRoundsLimit: max extra rounds after lessonsWritten to persist the lesson.
 	LessonRoundsLimit = 3
 
-	// Skip the planning-gate prompt for trivial single-line user
-	// queries (e.g., "read README", "what does X do?"). Length-based
-	// heuristic; longer / multi-line tasks still get the gate.
+	// PlanningGateMinTaskChars: skip planning-gate for trivial short queries.
 	PlanningGateMinTaskChars = 80
 )
 
@@ -181,15 +126,7 @@ const (
 	MaxTeamMessageSize = 64 * 1024 // 64KB max team message size (prevents inbox flooding)
 )
 
-// LLM-as-Judge verification
-//
-// The judge runs a SECOND LLM call after task completion to evaluate whether
-// the agent actually achieved the user's goal (vs. just claiming it did).
-// See judge.go.
-//
-// The judge is configured entirely through JUDGE_* environment variables
-// (model, endpoint, credentials and behaviour), so it is set up through one
-// consistent mechanism rather than a mix of CLI flags and env vars:
+// LLM-as-Judge verification (see judge.go). Configured via JUDGE_* env vars:
 //
 //	JUDGE_ENABLED   turn the judge on        (1 | true | yes | on)
 //	JUDGE_MODEL     judge model id           (empty = reuse main model)
@@ -197,19 +134,12 @@ const (
 //	JUDGE_PROVIDER  explicit backend SDK     (openai | anthropic | gemini)
 //	JUDGE_API_KEY   judge-only key           (else the backend's standard key)
 //	JUDGE_BASE_URL  judge-only endpoint      (else the backend's standard url)
-//
-// Backend routing (JUDGE_PROVIDER/API_KEY/BASE_URL) is resolved in
-// llm.JudgeProvider; the rest is read by judgeConfigFromEnv.
 const (
 	JudgeMinScore        = 7 // verdicts below this force a retry (scale 1-10)
 	JudgeMaxRetryInjects = 2 // at most N verification-failed injections per agentLoop run
 )
 
-// Human-in-the-loop approval
-//
-// When enabled, high-risk tool invocations (delete, bash, critical paths)
-// pause the agent and ask an operator to approve / reject / modify.
-// See human_approval.go.
+// Human-in-the-loop approval (see human_approval.go).
 const (
 	HitlDefaultMode = "interactive" // interactive | auto-approve | auto-reject | notify-only
 )
@@ -219,4 +149,17 @@ const (
 	KindAssistant  = "assistant"
 	KindTool       = "tool"
 	KindCheckpoint = "checkpoint"
+)
+
+// Outbound web access env vars (read by internal/web and internal/security, not via infra.Config).
+//
+//	WEB_ALLOW_PRIVATE_IPS  opt into private/internal network access, default deny
+//	WEB_SEARCH_PROVIDER    force a backend: tavily|brave; unset = auto
+//	WEB_SEARCH_API_KEY     API key for the forced provider
+//	SEARXNG_URL            a specific SearXNG instance
+//	SEARXNG_INSTANCES      comma-separated override of the built-in public list
+const (
+	WebFetchTimeout  = 20 * time.Second // web_fetch: whole request+redirects
+	WebFetchMaxBytes = 2 * 1024 * 1024  // web_fetch: response body cap (2MB)
+	WebSearchTimeout = 8 * time.Second  // web_search: per-backend timeout in the downgrade chain
 )

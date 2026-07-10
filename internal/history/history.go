@@ -312,41 +312,51 @@ func (hs *HistoryStore) WrittenCount() int {
 	return hs.written
 }
 
-// trimDanglingToolCalls drops orphan assistant-with-tool_calls from the tail
-// (prevents 400 errors after crash-mid-turn).
+// trimDanglingToolCalls drops any assistant tool_calls turn not fully
+// answered by the tool messages immediately following it (prevents
+// 400 errors after crash-mid-turn). Scans the whole slice, not just
+// the tail: history.jsonl is append-only, so a mid-turn orphan from a
+// crashed session can end up buried under later sessions' valid turns
+// rather than staying at the end.
 func trimDanglingToolCalls(msgs []llm.Message) []llm.Message {
-	if len(msgs) == 0 {
-		return msgs
-	}
-
-	// Walk from the tail collecting tool result IDs.
-	seenToolIDs := map[string]bool{}
-	i := len(msgs) - 1
-	for ; i >= 0; i-- {
+	// out/flushed stay nil/0 until an orphan is actually found - the
+	// overwhelmingly common case is a cleanly-ended session with
+	// nothing to drop, which then costs no allocation or copy.
+	var out []llm.Message
+	flushed := 0 // msgs[:flushed] already copied into out
+	i := 0
+	for i < len(msgs) {
 		m := msgs[i]
-		if m.Role == llm.RoleTool {
-			seenToolIDs[m.ToolCallID] = true
+		if m.Role != llm.RoleAssistant || len(m.ToolCalls) == 0 {
+			i++
 			continue
 		}
-		if m.Role == llm.RoleAssistant && len(m.ToolCalls) > 0 {
-			allAnswered := true
+		// Does an immediately-following run of tool messages answer
+		// every one of this call's ids?
+		j := i + 1
+		unanswered := len(m.ToolCalls)
+		for j < len(msgs) && msgs[j].Role == llm.RoleTool && unanswered > 0 {
 			for _, tc := range m.ToolCalls {
-				if !seenToolIDs[tc.ID] {
-					allAnswered = false
+				if tc.ID == msgs[j].ToolCallID {
+					unanswered--
 					break
 				}
 			}
-			if allAnswered {
-				// This assistant turn is fine; nothing to trim.
-				return msgs
-			}
-			// Orphan assistant. Cut it and everything after.
-			return msgs[:i]
+			j++
 		}
-		// Anything else in the tail means the conversation ended cleanly
-		// (e.g. last message is a user turn, a plain assistant reply, a
-		// system message).
-		return msgs
+		if unanswered == 0 {
+			i = j
+			continue
+		}
+		// Orphan found: copy everything kept so far (since the last
+		// flush point), then drop msgs[i:j] (the orphan assistant +
+		// its partial tool results).
+		out = append(out, msgs[flushed:i]...)
+		i = j
+		flushed = j
 	}
-	return msgs
+	if out == nil {
+		return msgs // nothing dropped, no copy needed
+	}
+	return append(out, msgs[flushed:]...)
 }

@@ -189,5 +189,3 @@ func (b *MessageBus) Broadcast(sender, content string, names []string) string {
 	}
 	return fmt.Sprintf("Broadcast to %d teammates", count)
 }
-
-

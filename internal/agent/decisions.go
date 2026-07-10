@@ -1,14 +1,7 @@
 package agent
 
-// Autonomous-decision audit trail.
-//
-// logging.PrintDecision surfaces every autonomous action (planning, context
-// compaction, memory writes, judge self-evaluation, reflection) to the
-// terminal. That solves "can I see it while it runs", but terminal output is
-// ephemeral. This file wires a sink so each decision is ALSO appended to the
-// active session's decisions.jsonl, giving a single replayable timeline of
-// "what did the agent decide on its own this session" — viewable any time via
-// the /decisions REPL command, even after the terminal scrollback is gone.
+// Autonomous-decision audit trail: appends each decision to decisions.jsonl
+// for replay via /decisions.
 
 import (
 	"bufio"
@@ -29,21 +22,7 @@ type decisionRecord struct {
 	Summary string `json:"summary"`
 }
 
-// Decision kinds - the single source of truth for every string passed
-// as logging.PrintDecision's first argument across this package
-// (agent_loop.go, compression.go). Every call site should use one of
-// these constants instead of a literal string.
-//
-// decisionKindOrder controls the preferred left-to-right ordering in
-// RenderDecisions' "by kind" summary line; it existed as an inline
-// literal before this and had already drifted out of sync with the
-// actual kinds in use - DecisionTurn (emitted by finalizeTurn) had no
-// entry, so it silently fell through to the unordered tail loop below
-// instead of appearing in its intended position. Because every kind
-// constant now feeds decisionKindOrder directly, that class of drift
-// is no longer possible: forgetting to add a new kind here means it's
-// not a usable constant, so a new call site would have to either
-// reuse an existing one or add itself here first.
+// Decision kinds. decisionKindOrder controls rendering order in RenderDecisions.
 const (
 	DecisionPlan    = "plan"
 	DecisionContext = "context"
