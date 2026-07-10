@@ -12,16 +12,8 @@ import (
 	"sync"
 )
 
-// isStdinTTY reports whether stdin is connected to a terminal. We use it
-// to fail fast in interactive HITL mode when no human is reachable
-// (background tasks, scheduled runs, container entrypoints, piped CI
-// jobs). Without this check, promptInteractive would print a prompt to
-// nowhere and then block forever — or worse, ReadString would race with
-// other stdin consumers.
-//
-// We deliberately do NOT pull in golang.org/x/term just for this; the
-// os.ModeCharDevice bit on stdin's FileInfo is the same signal POSIX
-// isatty(3) reads, and works on macOS / Linux / Windows.
+// isStdinTTY reports whether stdin is a terminal, to fail fast in
+// interactive HITL mode when no human is reachable.
 func isStdinTTY() bool {
 	fi, err := os.Stdin.Stat()
 	if err != nil {
@@ -30,28 +22,9 @@ func isStdinTTY() bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-// Human-in-the-Loop Approval
-//
-// This layer gates CRITICAL tool invocations behind explicit human sign-off.
-// It is a second line of defense on top of the existing security.go
-// ApprovalLevel system:
-//
-//   security.go / checkToolApproval   -> static per-tool policy (auto/safe/danger/blocked)
-//   human_approval.go / HITLManager   -> per-invocation interactive review
-//                                         (arguments, diff-style preview, veto/modify/approve)
-//
-// Typical flow (agent_loop.go):
-//
-//   for each tool call:
-//     checkToolApproval(name)          // existing static policy
-//     if hitlManager.NeedsReview(name, args):
-//        decision = hitlManager.RequestApproval(...)
-//        switch decision:
-//          APPROVE -> execute normally
-//          REJECT  -> inject <human-reject> into messages, skip this tool
-//          MODIFY  -> inject <human-feedback> into messages, skip this tool
-//
-// HITL is opt-in; when disabled NeedsReview always returns false.
+// Human-in-the-Loop Approval: gates critical tool invocations behind
+// explicit human sign-off. Second line of defense on top of security.go's
+// static ApprovalLevel. Opt-in; when disabled NeedsReview returns false.
 
 // HITLDecision captures the three possible outcomes of a human review.
 type HITLDecision int

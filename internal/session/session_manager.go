@@ -120,16 +120,14 @@ func (sm *SessionManager) LoadSession(id string) (*Session, error) {
 
 // Lifecycle: Deactivate / SaveToMemory.
 
-// Deactivate saves memory and prepares the session for switch.
+// Deactivate flushes lightweight state (history is already append-only,
+// so nothing to flush here) and marks the session inactive. The heavy
+// memory-distillation LLM call is deliberately NOT done here — it would
+// block the exit path for seconds to minutes. Instead, unsaved sessions
+// are picked up by BackfillMemory on the next startup.
 func (sm *SessionManager) Deactivate(s *Session) {
 	if s == nil {
 		return
-	}
-	// Best-effort: save session insights to long-term memory.
-	if msg, err := sm.SaveToMemory(context.Background(), s); err != nil {
-		logging.PrintSystem(fmt.Sprintf("[session] SaveToMemory error: %v", err))
-	} else if msg != "" {
-		logging.PrintSystem(fmt.Sprintf("[session] %s", msg))
 	}
 }
 
@@ -138,8 +136,15 @@ func (sm *SessionManager) SaveToMemory(ctx context.Context, s *Session) (string,
 	if sm.memStore == nil {
 		return "", fmt.Errorf("no MemStore available (deps not configured)")
 	}
-	if s.memorySaved {
+	if s.meta.MemorySaved {
 		return "Memory already saved for this session.", nil
+	}
+
+	// Bail if this session became active while we were waiting (e.g.
+	// user /session-switched into it). Reading its history now would
+	// race with concurrent appends from the REPL loop.
+	if sm.ActiveID() == s.ID() {
+		return "session is now active, skipping backfill.", nil
 	}
 
 	// 1. Read history.
@@ -148,8 +153,14 @@ func (sm *SessionManager) SaveToMemory(ctx context.Context, s *Session) (string,
 		return "", fmt.Errorf("read history: %w", err)
 	}
 	if len(entries) == 0 {
-		s.memorySaved = true
+		s.markMemorySaved()
 		return "No history to save.", nil
+	}
+	// Re-check after the (slow) read: if the session became active in
+	// the meantime, its history is now being mutated and the snapshot
+	// we just read may be stale.
+	if sm.ActiveID() == s.ID() {
+		return "session became active during read, skipping backfill.", nil
 	}
 
 	// 2. Format history (last 100 entries; truncate long content).
@@ -211,7 +222,7 @@ func (sm *SessionManager) SaveToMemory(ctx context.Context, s *Session) (string,
 	}
 
 	if len(items) == 0 {
-		s.memorySaved = true
+		s.markMemorySaved()
 		return "No valuable insights found to save.", nil
 	}
 
@@ -237,8 +248,15 @@ func (sm *SessionManager) SaveToMemory(ctx context.Context, s *Session) (string,
 		}
 	}
 
-	s.memorySaved = true
+	s.markMemorySaved()
 	return fmt.Sprintf("Saved %d insights to memory:\n- %s", saved, strings.Join(summaries, "\n- ")), nil
+}
+
+// markMemorySaved persists the memorySaved flag to meta.json so a
+// restart won't re-summarize the same session.
+func (s *Session) markMemorySaved() {
+	s.meta.MemorySaved = true
+	_ = s.saveMeta()
 }
 
 // Index management.
@@ -515,4 +533,36 @@ func (sm *SessionManager) BootstrapSession(explicitID string) (*Session, error) 
 		return nil, err
 	}
 	return s, nil
+}
+
+// BackfillMemory summarizes unsaved non-archived sessions (excluding
+// the active one) in a background goroutine. Replaces the old
+// synchronous exit-time SaveToMemory.
+func (sm *SessionManager) BackfillMemory(activeID string) {
+	var pending []string
+	for _, m := range sm.List() {
+		if m.Status == StatusArchived || m.MemorySaved || m.ID == activeID {
+			continue
+		}
+		pending = append(pending, m.ID)
+	}
+	if len(pending) == 0 {
+		return
+	}
+	logging.PrintSystem(fmt.Sprintf("[session] background memory backfill: %d unsaved session(s)", len(pending)))
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		for _, id := range pending {
+			s, err := sm.LoadSession(id)
+			if err != nil {
+				continue
+			}
+			if msg, err := sm.SaveToMemory(ctx, s); err != nil {
+				logging.PrintSystem(fmt.Sprintf("[session] backfill %s error: %v", id, err))
+			} else if msg != "" {
+				logging.PrintSystem(fmt.Sprintf("[session] backfill %s: %s", id, msg))
+			}
+		}
+	}()
 }

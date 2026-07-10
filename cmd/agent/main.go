@@ -66,6 +66,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"go-code-agent/embedded"
 	"go-code-agent/infra"
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/history"
@@ -107,6 +108,11 @@ func main() {
 	// (Skills/MemStore/MCPMgr/PromptLoader/SessionManager) internally.
 	agent.App = agent.NewApp(model, workdir, security.DefaultBashPolicy.Validate)
 
+	// Capture documentation baked into the binary (if the frontend/
+	// embedded package was compiled in) so /readme can serve it from
+	// any directory without a disk read.
+	agent.App.Embedded = embedded.Content
+
 	hitlaudit.InitHITLAudit(workdir)
 	hitlaudit.SetPromptLoader(agent.App.PromptLoader)
 	usage.InitUsageRecorder(workdir)
@@ -140,6 +146,11 @@ func main() {
 	}
 
 	agent.App.ActivateSession(sess)
+
+	// Kick off background memory backfill for sessions that were never
+	// summarized (e.g. the previous run was killed before SaveToMemory
+	// ran). Does not block the REPL — runs in a detached goroutine.
+	agent.App.SessionManager.BackfillMemory(sess.ID())
 
 	agent.InitTools()
 
@@ -179,12 +190,16 @@ func main() {
 		logging.PrintSystem(fmt.Sprintf("[hitl] enabled (mode=%s)", hitlaudit.HitlManager.Mode()))
 	}
 
-	// Signal handling.
+	// Signal handling: first Ctrl+C does lightweight cleanup (no LLM
+	// calls); second Ctrl+C exits immediately. The old handler called
+	// DeactivateActiveSession which synchronously invoked SaveToMemory
+	// (an LLM call with up to 5×5min retries), blocking the exit path
+	// for potentially tens of minutes.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\n[cleaning up...]")
+		fmt.Println("\n[exiting... (Ctrl+C again to force quit)]")
 		agent.ShutdownFileLog()
 		if agent.App != nil {
 			agent.App.DeactivateActiveSession()
@@ -205,7 +220,7 @@ func main() {
 	if sess.History != nil {
 		fmt.Printf("  History: %s (%d entries)\n", sess.History.Path(), sess.History.WrittenCount())
 	}
-	fmt.Println("  Commands: /session /compact /tasks /dag /decisions /team /inbox /memory /search <q> /mcp /approve /security /permissions /usage")
+	fmt.Println("  Commands: /readme /session /compact /tasks /dag /decisions /team /inbox /memory /search <q> /mcp /approve /security /permissions /usage")
 	fmt.Println("  Type 'q' or 'exit' to quit.")
 	fmt.Printf("  Security: bash allowlist ON, path sandbox ON, secrets sanitizer ON\n")
 	fmt.Printf("  Judge: %s  |  HITL: %s  |  Preview: %s\n",
@@ -275,6 +290,14 @@ func main() {
 	// competing for bytes while we read here.
 	security.ReadLine = func() (string, error) {
 		_ = rl.Terminal.ExitRawMode()
+		// Drain any leftover bytes from stdin. The readline raw→cooked
+		// transition can leave stray \r or \n in the kernel buffer that
+		// would cause ReadString to return immediately with garbage.
+		syscall.SetNonblock(int(os.Stdin.Fd()), true)
+		var discard [256]byte
+		for n, _ := syscall.Read(int(os.Stdin.Fd()), discard[:]); n > 0; n, _ = syscall.Read(int(os.Stdin.Fd()), discard[:]) {
+		}
+		syscall.SetNonblock(int(os.Stdin.Fd()), false)
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		return strings.TrimSpace(line), err
 	}
@@ -317,9 +340,16 @@ func main() {
 		}
 
 		before := len(conv)
-		if err := agent.Run(ctx, &conv); err != nil {
+		// Mid-turn AutoCompact replaces conv with a shorter slice, so
+		// `before` needs updating in place - see WithPersistedBoundary.
+		runCtx := agent.WithPersistedBoundary(ctx, &before)
+		if err := agent.Run(runCtx, &conv); err != nil {
 			logging.PrintError(err.Error())
 			continue
+		}
+		// Defensive clamp in case any path missed the remap above.
+		if before > len(conv) {
+			before = len(conv)
 		}
 		if hs != nil {
 			persistNewMessages(hs, conv[before:])
