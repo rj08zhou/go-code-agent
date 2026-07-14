@@ -80,6 +80,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/chzyer/readline"
 )
@@ -271,16 +272,31 @@ func main() {
 	// clear stray \r/\n left by the raw→cooked transition.
 	security.ReadLine = func() (string, error) {
 		_ = rl.Terminal.ExitRawMode()
-		// Drain any leftover bytes from stdin. The readline raw→cooked
-		// transition can leave stray \r or \n in the kernel buffer that
-		// would cause ReadString to return immediately with garbage.
-		syscall.SetNonblock(int(os.Stdin.Fd()), true)
-		var discard [256]byte
-		for n, _ := syscall.Read(int(os.Stdin.Fd()), discard[:]); n > 0; n, _ = syscall.Read(int(os.Stdin.Fd()), discard[:]) {
+
+		// 1. 启动一个 goroutine 来读取一行
+		lineChan := make(chan string, 1)
+		errChan := make(chan error, 1)
+		go func() {
+			reader := bufio.NewReader(os.Stdin)
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				errChan <- err
+				return
+			}
+			lineChan <- strings.TrimSpace(line)
+		}()
+
+		// 2. 使用 select 等待结果，并设置超时防止永久阻塞
+		select {
+		case line := <-lineChan:
+			return line, nil
+		case err := <-errChan:
+			return "", err
+		case <-time.After(100 * time.Millisecond): // 等待100ms，可根据需要调整
+			// 超时了，没有输入。这里返回空字符串和 nil 错误
+			// 你的逻辑可能需要在这里处理“无输入”的情况
+			return "", nil
 		}
-		syscall.SetNonblock(int(os.Stdin.Fd()), false)
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		return strings.TrimSpace(line), err
 	}
 
 	for {
