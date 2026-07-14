@@ -427,7 +427,13 @@ func applyAcceptedHunks(oldContent, filename string, hunks []diffHunk, accepted 
 }
 
 // ShouldPreviewDiff determines if we should show diff preview.
-// Always returns true: user should always see and confirm changes.
+//
+// By default it returns true so the user always sees and confirms
+// changes. When the session has auto-approved all tools (i.e. the
+// operator ran /approve danger, which gates every tool including
+// destructive ones), the diff preview is skipped too - /approve danger
+// is an explicit "trust everything, don't interrupt me" signal, so
+// showing a per-chunk preview would just be noise.
 func ShouldPreviewDiff() bool {
-	return true
+	return !GlobalApproval.IsAutoApproveAll()
 }

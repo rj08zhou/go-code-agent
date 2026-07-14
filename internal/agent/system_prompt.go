@@ -38,5 +38,12 @@ func BuildSystemPrompt() string {
 		prompt += "\n\n" + rc
 	}
 
+	// Inject MCP server instructions so the model knows what each server does.
+	if App.MCPMgr != nil {
+		if instructions := App.MCPMgr.ServerInstructions(); instructions != "" {
+			prompt += "\n\n## MCP Server Instructions\n\n" + instructions
+		}
+	}
+
 	return prompt
 }

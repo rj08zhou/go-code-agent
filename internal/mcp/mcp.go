@@ -57,12 +57,13 @@ type mcpTool struct {
 
 // mcpServer represents a single connected MCP server.
 type mcpServer struct {
-	Name    string
-	Command string
-	Args    []string
-	Env     map[string]string
-	conn    *jsonRPCConn
-	Tools   []mcpTool
+	Name         string
+	Command      string
+	Args         []string
+	Env          map[string]string
+	Instructions string // server-provided usage guidance (from initialize response)
+	conn         *jsonRPCConn
+	Tools        []mcpTool
 
 	// Breaker state. Guarded by bMu — kept separate from the
 	// manager's mu so a long ping doesn't block Tool dispatch.
@@ -323,6 +324,21 @@ func (m *MCPManager) IsMCPTool(name string) bool {
 	return strings.HasPrefix(name, "mcp__")
 }
 
+// ServerInstructions returns a formatted string of all connected servers'
+// instructions for injection into the system prompt.
+func (m *MCPManager) ServerInstructions() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var parts []string
+	for name, srv := range m.servers {
+		if srv.Instructions == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("### %s\n%s", name, srv.Instructions))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 // ServerCount returns the number of connected servers.
 func (m *MCPManager) ServerCount() int {
 	m.mu.RLock()
@@ -352,9 +368,19 @@ func (s *mcpServer) initialize() error {
 			"version": "1.0.0",
 		},
 	}
-	_, err := s.conn.sendRequest("initialize", params)
+	result, err := s.conn.sendRequest("initialize", params)
 	if err != nil {
 		return err
+	}
+	var initResult struct {
+		Instructions string `json:"instructions"`
+		ServerInfo   struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		} `json:"serverInfo"`
+	}
+	if err := json.Unmarshal(result, &initResult); err == nil {
+		s.Instructions = strings.TrimSpace(initResult.Instructions)
 	}
 	s.conn.sendNotification("notifications/initialized")
 	return nil
@@ -387,8 +413,11 @@ func (s *mcpServer) callTool(name string, args map[string]any) (string, error) {
 
 	var callResult struct {
 		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type     string          `json:"type"`
+			Text     string          `json:"text"`
+			Data     string          `json:"data"`     // image base64
+			MimeType string          `json:"mimeType"` // image mime
+			Resource json.RawMessage `json:"resource"` // resource object
 		} `json:"content"`
 		IsError bool `json:"isError"`
 	}
@@ -396,13 +425,33 @@ func (s *mcpServer) callTool(name string, args map[string]any) (string, error) {
 		return string(result), nil
 	}
 
-	var texts []string
+	var parts []string
 	for _, c := range callResult.Content {
-		if c.Text != "" {
-			texts = append(texts, c.Text)
+		switch c.Type {
+		case "text":
+			if c.Text != "" {
+				parts = append(parts, c.Text)
+			}
+		case "image":
+			label := "[image"
+			if c.MimeType != "" {
+				label += " " + c.MimeType
+			}
+			label += fmt.Sprintf(", %d bytes]", len(c.Data))
+			parts = append(parts, label)
+		case "resource":
+			if len(c.Resource) > 0 {
+				parts = append(parts, "[resource: "+string(c.Resource)+"]")
+			} else {
+				parts = append(parts, "[resource]")
+			}
+		default:
+			if c.Text != "" {
+				parts = append(parts, c.Text)
+			}
 		}
 	}
-	output := strings.Join(texts, "\n")
+	output := strings.Join(parts, "\n")
 	if callResult.IsError {
 		output = "Error: " + output
 	}

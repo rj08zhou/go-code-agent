@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "fs": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "@modelcontextprotocol/server-filesystem",
+        "/ABSOLUTE/PATH/TO/A/DIRECTORY"
+      ],
+      "env": {}
+    }
+  }
+}

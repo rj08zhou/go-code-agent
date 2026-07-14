@@ -84,10 +84,12 @@ var planningTools = map[string]bool{
 
 // exploreTools are read-only / discovery tools that count as "thinking activity".
 var exploreTools = map[string]bool{
-	"think":         true,
-	"memory_search": true, "memory_stats": true,
-	"read_file": true, "search_content": true,
-	"list_dir": true, "search_file": true,
+	"think":          true,
+	"memory_search":  true,
+	"read_file":      true,
+	"search_content": true,
+	"list_dir":       true,
+	"search_file":    true,
 }
 
 // taskMutationTools change the DAG-task set or a task's status.

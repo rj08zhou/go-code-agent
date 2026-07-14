@@ -106,7 +106,17 @@ SNAPSHOT_ENABLED=1 ./agent
 
 **💡 Judge Configuration**: For detailed judge setup (custom model, separate endpoint, etc.), refer to the [Running](#running) section which shows full `export` command examples.
 
-All persistent state is stored under `{workdir}/.go-code-agent/`. Sessions survive across restarts and crashes.
+All persistent state (sessions, memory, usage, HITL audit, permissions, command history) is stored under a **state directory** (`DataDir`), by default under the user-level config location keyed by the project path:
+
+```
+{UserConfigDir}/go-code-agent/projects/<sha256(workdir)[:16]>/
+```
+
+where `UserConfigDir` is `~/Library/Application Support` (macOS), `~/.config` (Linux), or `%APPDATA%` (Windows). This keeps the project directory clean and maps the same project to the same state across launches, regardless of where the binary runs from. Override with `--data-dir <path>` or the `GO_CODE_AGENT_DATA_DIR` env var.
+
+The **working directory** (`Workdir`, where the agent edits files and runs commands) is separate — pass it with `--workdir <path>` (defaults to the current directory).
+
+Sessions survive across restarts and crashes.
 
 ---
 
@@ -162,11 +172,11 @@ All persistent state is stored under `{workdir}/.go-code-agent/`. Sessions survi
 
 `AppContext` (`internal/agent/app.go`) is the single root object holding
 every piece of process-/session-scoped state; `main.go` only ever
-constructs one (`agent.NewApp(model, workdir, bashValidate)`) and reaches
+constructs one (`agent.NewApp(model, workdir, dataDir, bashValidate)`) and reaches
 everything else through it — no subsystem lives as a bare package
 variable outside the tool registry.
 
-- **Process-wide config** (fields on `AppContext`, built once by `NewApp`): `Model`, `Workdir`, `System` (rebuilt per-session)
+- **Process-wide config** (fields on `AppContext`, built once by `NewApp`): `Model`, `Workdir`, `DataDir`, `System` (rebuilt per-session)
 - **Workdir-global subsystems** (fields on `AppContext`, persist for process lifetime): `Skills`, `MemStore`, `MCPMgr`, `PromptLoader`, `SessionManager`, `Snapshot`, `Judge`
 - **Per-session** (rebound on session switch, reached via `SessionManager.Active()`): `TaskManager`, `DAGScheduler`, `MessageBus`, `ProtocolStore`, `HistoryStore`, `TeammateManager`
 - **Compile-time capability table** (package-level, not per-instance): `ToolDefs` / `ToolHandlers` / `ToolSecurityMap`, populated once by `InitTools()`
@@ -174,7 +184,7 @@ variable outside the tool registry.
 Lifecycle is driven by three `AppContext` methods, each collapsing a
 sequence that used to be duplicated across `main.go` and
 `repl_commands.go`:
-- `NewApp(model, workdir, bashValidate)` — constructs every workdir-global subsystem in one call
+- `NewApp(model, workdir, dataDir, bashValidate)` — constructs every workdir-global subsystem in one call
 - `ActivateSession(sess)` — binds `sess` into `SessionManager`, rebuilds `TeamMgr`, regenerates `System`
 - `DeactivateActiveSession()` — shuts down teammates, flushes the active session to memory
 
@@ -270,6 +280,8 @@ Session End:
 | `--new-session` | false | Force creation of a new session |
 | `--human` | false | Enable Human-in-the-loop approval |
 | `--human-mode` | interactive | `interactive` / `auto-approve` / `auto-reject` / `notify-only` |
+| `--workdir <path>` | current dir | Project directory the agent edits and runs commands in (the `Workdir`) |
+| `--data-dir <path>` | `{UserConfigDir}/go-code-agent/projects/<hash>` | Override the persistent state directory (`DataDir`) |
 
 ### LLM-as-Judge Env Vars
 
@@ -427,6 +439,14 @@ go-code-agent/
 ├── infra/                        # Cross-cutting constants
 │   └── consts.go                 # All tunable thresholds in one place
 │
+├── embedded/                     # Build-time embedded assets (package embedded)
+│   ├── embedded.go               #   //go:embed README_zh.md → Content []byte
+│   └── README_zh.md              #   Real copy of the root README (refreshed via `go generate ./embedded`)
+│
+├── frontend/                     # Standalone README viewer (also powers the /readme command)
+│   ├── main.go                   #   Entry point: `go run ./frontend` serves + opens the browser
+│   └── server/                   #   server package: markdown → styled HTML, ephemeral localhost server
+│
 ├── utils/                        # Shared utilities
 │   └── utils.go                  # Path helpers (JoinWorkdir, Truncate, etc.)
 │
@@ -451,8 +471,9 @@ go-code-agent/
 │   └── pdf/SKILL.md              # PDF processing skill
 │
 ├── go.mod / go.sum               # Go module definition
-└── .go-code-agent/               # Runtime state directory (gitignored)
-    └── sessions/                 # Per-session data (tasks, team, history, etc.)
+└── (no runtime state here — by default state lives under the user-level
+     config dir, see `--data-dir`; a legacy `.go-code-agent/` may still
+     appear if you opt into project-local state)
 ```
 
 ---
@@ -468,7 +489,7 @@ go-code-agent/
 | `/session archive [id]` | Archive a session (removes from active list) |
 | `/compact` | Manually trigger conversation compaction (LLM summarization) |
 | `/tasks` | List all tasks in current session with status |
-| `/dag` | Show DAG execution plan (topological stages) |
+| `/dag` | Show DAG execution plan (topological stages). Unrelated task batches (disconnected components) are split into separate labeled `Workflow`s, each shown with a deterministic execution order |
 | `/decisions` | Show the active session's autonomous-decision audit trail (decisions.jsonl) |
 | `/team` | List active teammates with state (WORK/IDLE) |
 | `/inbox` | Read the lead agent's inbox messages |
@@ -481,6 +502,19 @@ go-code-agent/
 | `/approve [safe\|danger\|off]` | Toggle auto-approval level for tool calls |
 | `/security` | Show current security configuration status |
 | `/security test-bash <cmd>` | Dry-run a command through the bash allowlist/danger-pattern policy |
+| `/readme` | Launch the README viewer and open `README_zh.md` in your browser (the doc is embedded into the binary at build time, so no on-disk file is needed) |
+
+### `/readme` — view the README in your browser
+
+`/readme` starts a local viewer that renders `README_zh.md` into a styled web page (the title is taken from the document's first `#`; code blocks, tables, and blockquotes are supported) and opens it in your default browser. The server binds to an ephemeral `127.0.0.1` port and is only reachable locally; each request re-renders, so refreshing reflects any edits.
+
+**The doc is embedded in the binary**: `README_zh.md` is baked into the `agent` executable at build time via `//go:embed` (see the `embedded/` package), so `/readme` does not depend on the file existing on disk — it works even when launched from any directory, or after `README_zh.md` has been deleted.
+
+- Re-running `/readme` recycles the previous viewer (no port leak); the server shuts down when the agent exits.
+- On headless/remote machines the browser may fail to auto-open, but the terminal prints the URL so you can open it manually.
+- The same viewer also ships as a standalone frontend project: `go run ./frontend` (under `frontend/`, with the core logic in the `frontend/server` package, rendered via `blackfriday/v2`).
+
+> Note: the embedded asset is a **real copy** of `embedded/README_zh.md` (Go's `//go:embed` cannot use `..` and rejects symlinks). After editing the root `README_zh.md`, run `go generate ./embedded` to refresh the copy.
 
 ---
 
@@ -627,10 +661,10 @@ User query → agent calls bash("rm -rf /") →
 
 | Level | Behavior |
 |-------|----------|
-| `auto` | All tools execute without confirmation |
-| `safe` | Only "safe" tools auto-execute; others prompt |
-| `danger` | All tools prompt for confirmation |
-| `off` | Approval system disabled |
+| `auto` (default) | Read-only / auto-approved tools execute without confirmation; safe & danger tools still prompt |
+| `safe` | Only "safe" tools auto-execute; danger tools still prompt |
+| `danger` (alias `all`) | **ALL** tools auto-execute without confirmation, including destructive ones — most permissive (use with caution) |
+| `off` (alias `reset`) | Manual confirmation required for everything (auto-approval disabled) |
 
 Toggle at runtime with `/approve [level]`.
 
@@ -646,11 +680,11 @@ Detected secrets are replaced with `[REDACTED]` before being added to conversati
 
 ### Additional Security Features
 
-- **Diff Preview**: Unified diff shown in terminal before any file modification
+- **Diff Preview**: Unified diff shown in terminal before any file modification. When auto-approval is fully on (`/approve danger`/`all`), the per-chunk diff preview is skipped too — that mode signals full trust and is meant for non-interactive runs, so the verbose diff would just be noise.
 - **HITL Approval**: 4 modes (interactive/auto-approve/auto-reject/notify-only)
 - **Snapshot/Rollback**: Git-stash-based Saga pattern for write tools (opt-in via `SNAPSHOT_ENABLED=1`)
 - **Per-tool Timeout**: 5-minute hard ceiling prevents hung handlers from freezing the REPL
-- **User Permission Rules**: `{workdir}/.go-code-agent/permissions.json` lets you allow/deny/ask per tool+pattern (e.g. allow `git commit -m *` but deny `git push --force*`) — layered *after* the hard bash danger-pattern blacklist, so a user `allow` rule can never resurrect a command the blacklist forbids. See `/permissions` and `/permissions reload`.
+- **User Permission Rules**: `{dataDir}/permissions.json` lets you allow/deny/ask per tool+pattern (e.g. allow `git commit -m *` but deny `git push --force*`) — layered *after* the hard bash danger-pattern blacklist, so a user `allow` rule can never resurrect a command the blacklist forbids. By default `dataDir` is the user-level state directory (see `--data-dir`); it is **not** inside the project. See `/permissions` and `/permissions reload`.
 
 ---
 
@@ -787,7 +821,7 @@ user message → extract keywords → hybrid search → top-3 results
 SessionManager.BootstrapOrCreate(forceNew, explicitID)
   → forceNew (no explicit id): NewSession("New session")
   → otherwise: BootstrapSession resolves explicit id > most recent > fresh
-  → NewSession creates directory: .go-code-agent/sessions/<uuid>/
+  → NewSession creates directory: {dataDir}/sessions/<uuid>/
     subdirs: tasks/, team/, history/, transcripts/
   │
 AppContext.ActivateSession(session)

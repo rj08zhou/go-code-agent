@@ -236,7 +236,7 @@ func secureRunBash(ctx context.Context, command string, interactive bool) string
 
 // secureReadFile reads a file after validating its path through the securePath sandbox.
 // Optimized version: uses buffered scanner for memory efficiency and supports line limit.
-func secureReadFile(ctx context.Context, path string, limit int) string {
+func secureReadFile(ctx context.Context, path string, offset, limit int) string {
 	fp, err := security.SecurePath(workdirFromCtx(ctx), path, false) // read-only, no sensitive-file check needed
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
@@ -256,14 +256,18 @@ func secureReadFile(ctx context.Context, path string, limit int) string {
 
 	lineCount := 0
 	for scanner.Scan() {
-		// Check line limit
-		if limit > 0 && lineCount >= limit {
+		// Skip offset lines before counting/collecting.
+		if offset > 0 && lineCount < offset {
+			lineCount++
+			continue
+		}
+		if limit > 0 && lineCount-offset >= limit {
 			buf.WriteString(fmt.Sprintf("... (%d more lines)\n", countRemainingLines(f)))
 			break
 		}
 
 		// Write line to buffer
-		if lineCount > 0 {
+		if buf.Len() > 0 {
 			buf.WriteString("\n")
 		}
 		buf.WriteString(scanner.Text())
@@ -360,10 +364,8 @@ func secureWriteFile(ctx context.Context, path, content string) string {
 }
 
 // secureEditFile replaces exact text in a file after path validation.
-// Loads the entire file into memory for accurate matching (supports both single-line and multi-line).
-// This follows Claude Code's approach: simple and reliable.
-// Includes TOCTOU protection to prevent race conditions.
-func secureEditFile(ctx context.Context, path, oldText, newText string) string {
+// Includes TOCTOU protection and whitespace-tolerant matching.
+func secureEditFile(ctx context.Context, path, oldText, newText string, replaceAll bool) string {
 	// Check edit approval
 	if approved, msg := checkToolApproval("edit_file", path); !approved && !security.GlobalApproval.IsAutoApproveSafe() && !security.GlobalApproval.IsAutoApproveAll() {
 		return fmt.Sprintf("\u274c %s", msg)
@@ -415,15 +417,42 @@ func secureEditFile(ctx context.Context, path, oldText, newText string) string {
 			matchedOld = m
 			whitespaceTolerant = true
 		} else if count > 1 {
-			return fmt.Sprintf("Error: Text not found in %s (exact match), and %d locations match when ignoring whitespace - too ambiguous to pick one automatically. Add more surrounding context to old_text to make it unique.%s",
-				path, count, closestMatchHint(content, oldText))
+			if replaceAll {
+				// replace_all: apply every whitespace-tolerant match in
+				// order, each at its exact (real-whitespace) location.
+				newContent := content
+				offset := 0
+				for {
+					m, found := findWhitespaceTolerantMatchAt(newContent[offset:], oldText)
+					if !found {
+						break
+					}
+					idx := offset + strings.Index(newContent[offset:], m)
+					newContent = newContent[:idx] + newText + newContent[idx+len(m):]
+					offset = idx + len(newText)
+				}
+				content = newContent
+				matchedOld = oldText
+				whitespaceTolerant = false
+			} else {
+				return fmt.Sprintf("Error: Text not found in %s (exact match), and %d locations match when ignoring whitespace - too ambiguous to pick one automatically. Add more surrounding context to old_text to make it unique, or set replace_all=true to replace all of them.%s",
+					path, count, closestMatchHint(content, oldText))
+			}
 		} else {
 			return fmt.Sprintf("Error: Text not found in %s.%s", path, closestMatchHint(content, oldText))
 		}
 	}
 
-	// Perform replacement (only first occurrence in the entire file)
-	newContent := strings.Replace(content, matchedOld, newText, 1)
+	// Perform replacement. With replace_all, every occurrence is
+	// replaced; otherwise only the first occurrence in the file is
+	// changed (deliberately, so a non-unique old_text does not
+	// silently mutate unrelated locations unless the caller opts in).
+	var newContent string
+	if replaceAll {
+		newContent = strings.ReplaceAll(content, matchedOld, newText)
+	} else {
+		newContent = strings.Replace(content, matchedOld, newText, 1)
+	}
 
 	// Generate diff if needed
 	var oldForDiff string
@@ -471,6 +500,115 @@ func secureEditFile(ctx context.Context, path, oldText, newText string) string {
 		return fmt.Sprintf("Edited %s (matched ignoring leading/trailing whitespace differences per line - the file's original indentation was preserved for surrounding text)", path)
 	}
 	return fmt.Sprintf("Edited %s", path)
+}
+
+// secureInsertFile inserts newText into a file after a 1-based line
+// number. afterLine==0 prepends before the first line; afterLine>=N
+// (where N is the line count) appends to the end. Newlines are added
+// around the inserted block automatically so the result is always
+// valid line-oriented text. Shares edit_file's safety posture:
+// approval gate, workdir-anchored SecurePath, mtime TOCTOU checks,
+// diff preview, and atomic temp-file write.
+func secureInsertFile(ctx context.Context, path string, afterLine int, newText string) string {
+	if approved, msg := checkToolApproval("insert_file", path); !approved && !security.GlobalApproval.IsAutoApproveSafe() && !security.GlobalApproval.IsAutoApproveAll() {
+		return fmt.Sprintf("\u274c %s", msg)
+	}
+
+	fp, err := security.SecurePath(workdirFromCtx(ctx), path, true) // allowWrite=true
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+
+	// Read existing content (file may not exist yet -> empty content).
+	var originalMtime time.Time
+	var content string
+	if data, rerr := os.ReadFile(fp); rerr == nil {
+		content = string(data)
+		if fi, serr := os.Stat(fp); serr == nil {
+			originalMtime = fi.ModTime()
+		}
+	} else if !os.IsNotExist(rerr) {
+		return fmt.Sprintf("Error reading file: %v", rerr)
+	}
+
+	// Re-stat to detect concurrent modification before we compute the
+	// new content (mirrors secureEditFile's TOCTOU guard).
+	if fi, serr := os.Stat(fp); serr == nil {
+		if !originalMtime.IsZero() && !fi.ModTime().Equal(originalMtime) {
+			return fmt.Sprintf("Error: File '%s' was modified during editing (mtime changed)", path)
+		}
+	}
+
+	hadTrailingNewline := strings.HasSuffix(content, "\n")
+	lines := strings.Split(content, "\n")
+	if hadTrailingNewline {
+		// Drop the empty artifact produced by the trailing '\n' so
+		// line math stays intuitive (logical lines, not raw split).
+		lines = lines[:len(lines)-1]
+	}
+	if content == "" {
+		// Brand-new file: no logical lines yet.
+		lines = nil
+	}
+
+	// Clamp afterLine into [0, len(lines)].
+	if afterLine < 0 {
+		afterLine = 0
+	}
+	if afterLine > len(lines) {
+		afterLine = len(lines)
+	}
+
+	insertLines := strings.Split(newText, "\n")
+	head := lines[:afterLine]
+	tail := lines[afterLine:]
+	newLines := make([]string, 0, len(lines)+len(insertLines))
+	newLines = append(newLines, head...)
+	newLines = append(newLines, insertLines...)
+	newLines = append(newLines, tail...)
+	newContent := strings.Join(newLines, "\n")
+	// Preserve the original trailing newline (or add one for a new file).
+	if hadTrailingNewline || content == "" {
+		newContent += "\n"
+	}
+
+	// Diff preview (insertion of a brand-new file shows the full new
+	// content as an addition).
+	if security.ShouldPreviewDiff() && len(content) < 500000 {
+		diff, derr := security.GenerateUnifiedDiff(content, newContent, path)
+		if derr != nil {
+			return fmt.Sprintf("Error generating diff: %v", derr)
+		}
+		if diff != "" {
+			applied, ok := security.PreviewAndConfirm(path, content, newContent, diff)
+			if !ok {
+				return "\u274c File insert rejected by user"
+			}
+			newContent = applied
+		}
+	}
+
+	// Final mtime check, atomic write (mirrors secureEditFile).
+	if fi, serr := os.Stat(fp); serr == nil {
+		if !originalMtime.IsZero() && !fi.ModTime().Equal(originalMtime) {
+			return fmt.Sprintf("Error: File '%s' was modified during editing (concurrent modification detected)", path)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
+		return fmt.Sprintf("Error creating directory: %v", err)
+	}
+	tmpPath := fmt.Sprintf("%s.tmp.%d.%d", fp, os.Getpid(), time.Now().UnixNano())
+	if err := os.WriteFile(tmpPath, []byte(newContent), 0o644); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Sprintf("Error writing temp file: %v", err)
+	}
+	if err := os.Rename(tmpPath, fp); err != nil {
+		os.Remove(tmpPath)
+		if err2 := os.WriteFile(fp, []byte(newContent), 0o644); err2 != nil {
+			return fmt.Sprintf("Error writing file (atomic+direct both failed): %v / %v", err, err2)
+		}
+	}
+	return fmt.Sprintf("Inserted %d line(s) into %s after line %d", len(insertLines), path, afterLine)
 }
 
 // findWhitespaceTolerantMatch looks for a substring of content whose
@@ -532,6 +670,48 @@ func findWhitespaceTolerantMatch(content, oldText string) (match string, count i
 		return lastMatch, 1
 	}
 	return "", count
+}
+
+// findWhitespaceTolerantMatchAt returns the first substring of content
+// whose lines equal oldText's lines after per-line TrimSpace (same
+// matching rule as findWhitespaceTolerantMatch), or "" if none. Used by
+// the replace_all path to iterate matches left-to-right.
+func findWhitespaceTolerantMatchAt(content, oldText string) (match string, found bool) {
+	oldLines := strings.Split(oldText, "\n")
+	if len(oldLines) == 0 {
+		return "", false
+	}
+	trimmedOld := make([]string, len(oldLines))
+	for i, l := range oldLines {
+		trimmedOld[i] = strings.TrimSpace(l)
+	}
+
+	type lineSpan struct{ start, end int }
+	var spans []lineSpan
+	lineStart := 0
+	for i := 0; i < len(content); i++ {
+		if content[i] == '\n' {
+			spans = append(spans, lineSpan{lineStart, i})
+			lineStart = i + 1
+		}
+	}
+	spans = append(spans, lineSpan{lineStart, len(content)})
+
+	n := len(trimmedOld)
+	for start := 0; start+n <= len(spans); start++ {
+		ok := true
+		for j := range n {
+			line := content[spans[start+j].start:spans[start+j].end]
+			if strings.TrimSpace(line) != trimmedOld[j] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return content[spans[start].start:spans[start+n-1].end], true
+		}
+	}
+	return "", false
 }
 
 // closestMatchHint returns a short, actionable diagnostic appended to
