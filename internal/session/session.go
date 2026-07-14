@@ -19,12 +19,13 @@ type BashValidator = background.BashValidator
 // Session represents a unit of continuous work with its own task board,
 // DAG, teammates, inbox, conversation history, and transcripts.
 //
-// Stored at: {workdir}/.go-code-agent/sessions/<id>/
+// Stored at: {dataDir}/sessions/<id>/  (dataDir is the resolved
+// per-project state directory, normally under the user-level config
+// dir rather than inside the project workdir).
 // Workdir-global resources (skills, prompts, memory, MCP) are shared across sessions.
 // Lifecycle managed by SessionManager.
 
 const (
-	appRootDirName     = ".go-code-agent"
 	sessionsSubDirName = "sessions"
 	sessionMetaFile    = "meta.json"
 
@@ -57,8 +58,9 @@ type sessionMeta struct {
 // Session bundles per-session subsystems. Workdir-global resources stay on AppContext.
 type Session struct {
 	meta    sessionMeta
-	dir     string // {workdir}/.go-code-agent/sessions/<id>
-	workdir string // the workspace root
+	dir     string // {dataDir}/sessions/<id>
+	workdir string // the workspace root (project; used by bash/file tools)
+	dataDir string // per-project state root (sessions, etc.)
 
 	// Per-session subsystems.
 	Todo      *task.TodoManager
@@ -75,14 +77,15 @@ type Session struct {
 
 // Path helpers.
 
-// sessionsRoot returns the parent dir holding all sessions for a workdir.
-func sessionsRoot(workdir string) string {
-	return filepath.Join(workdir, appRootDirName, sessionsSubDirName)
+// sessionsRoot returns the parent dir holding all sessions for a
+// dataDir (the resolved per-project state directory).
+func sessionsRoot(dataDir string) string {
+	return filepath.Join(dataDir, sessionsSubDirName)
 }
 
 // sessionDir returns the on-disk path for a given session id.
-func sessionDir(workdir, id string) string {
-	return filepath.Join(sessionsRoot(workdir), id)
+func sessionDir(dataDir, id string) string {
+	return filepath.Join(sessionsRoot(dataDir), id)
 }
 
 // newSessionID generates a lexicographically sortable id with millisecond

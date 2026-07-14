@@ -56,11 +56,11 @@ func TestSecureReadFile_HonorsCtxWorkdir(t *testing.T) {
 	// App.Workdir points at dirA; a ctx override points at dirB.
 	App = &AppContext{Workdir: dirA}
 
-	if got := secureReadFile(context.Background(), "f.txt", 0); got != "from-A" {
+	if got := secureReadFile(context.Background(), "f.txt", 0, 0); got != "from-A" {
 		t.Errorf("fallback workdir: got %q, want from-A", got)
 	}
 	ctx := WithWorkdir(context.Background(), dirB)
-	if got := secureReadFile(ctx, "f.txt", 0); got != "from-B" {
+	if got := secureReadFile(ctx, "f.txt", 0, 0); got != "from-B" {
 		t.Errorf("ctx workdir: got %q, want from-B", got)
 	}
 }

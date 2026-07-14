@@ -3,7 +3,6 @@ package hitlaudit
 import (
 	"encoding/json"
 	"fmt"
-	"go-code-agent/infra"
 	"go-code-agent/utils"
 	"os"
 	"path/filepath"
@@ -13,7 +12,7 @@ import (
 
 // HITL Audit Log.
 //
-// Every HITL decision is appended to {workdir}/memory/hitl_audit.jsonl.
+// Every HITL decision is appended to {dataDir}/memory/hitl_audit.jsonl.
 // Exempt from the 7-day TTL sweep (security audit trail).
 // Best-effort writes: never blocks the main flow on failure.
 
@@ -46,13 +45,14 @@ var hitlAuditor = &HITLAuditor{}
 
 // InitHITLAudit configures the audit log location. Safe to call more than
 // once (e.g. on workdir change), though in practice we call it once at
-// startup. workdir is the workspace root, NOT the memory subdir.
-func InitHITLAudit(workdir string) {
-	if workdir == "" {
+// startup. dataDir is the resolved per-project state directory; the log
+// lives under {dataDir}/memory/hitl_audit.jsonl.
+func InitHITLAudit(dataDir string) {
+	if dataDir == "" {
 		hitlAuditor.disabled = true
 		return
 	}
-	dir := filepath.Join(workdir, infra.AppRootDirName, "memory")
+	dir := filepath.Join(dataDir, "memory")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		// We can't create the audit dir. Don't kill the agent over it,
 		// just stop trying to write so we don't spam stderr per call.

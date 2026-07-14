@@ -106,7 +106,17 @@ SNAPSHOT_ENABLED=1 ./agent
 
 **💡 Judge 配置说明**：如需详细配置（自定义模型、独立端点等），请参考[运行](#运行)章节中的完整 `export` 命令示例。
 
-所有持久化状态存储在 `{workdir}/.go-code-agent/` 目录下。会话在重启和崩溃后均可恢复。
+所有持久化状态（会话、记忆、用量、HITL 审计、权限、命令历史）都存储在独立的**状态目录**（`DataDir`）中，默认位于用户级配置目录下，并按项目路径定位：
+
+```
+{UserConfigDir}/go-code-agent/projects/<sha256(workdir)[:16]>/
+```
+
+其中 `UserConfigDir` 在 macOS 为 `~/Library/Application Support`、Linux 为 `~/.config`、Windows 为 `%APPDATA%`。这样项目目录保持干净，且同一项目无论二进制从何处启动，都映射到同一份状态。可用 `--data-dir <path>` 或环境变量 `GO_CODE_AGENT_DATA_DIR` 覆盖。
+
+**工作目录**（`Workdir`，即 agent 编辑文件、执行命令的目录）与状态目录是分离的——通过 `--workdir <path>` 指定（默认当前目录）。
+
+会话在重启和崩溃后均可恢复。
 
 ---
 
@@ -161,17 +171,17 @@ SNAPSHOT_ENABLED=1 ./agent
 ### 组件所有权
 
 `AppContext`（`internal/agent/app.go`）是持有全部进程级/会话级状态的唯一
-根对象；`main.go` 只构造一次（`agent.NewApp(model, workdir, bashValidate)`），
+根对象；`main.go` 只构造一次（`agent.NewApp(model, workdir, dataDir, bashValidate)`），
 其余全部通过它访问——除工具注册表外，没有任何子系统以裸包变量形式存在。
 
-- **进程级配置**（`AppContext` 字段，由 `NewApp` 一次性构造）：`Model`、`Workdir`、`System`（每会话重建）
+- **进程级配置**（`AppContext` 字段，由 `NewApp` 一次性构造）：`Model`、`Workdir`、`DataDir`、`System`（每会话重建）
 - **工作目录全局子系统**（`AppContext` 字段，进程生命周期内持久）：`Skills`、`MemStore`、`MCPMgr`、`PromptLoader`、`SessionManager`、`Snapshot`、`Judge`
 - **每会话**（会话切换时重新绑定，经 `SessionManager.Active()` 访问）：`TaskManager`、`DAGScheduler`、`MessageBus`、`ProtocolStore`、`HistoryStore`、`TeammateManager`
 - **编译期能力表**（包级、非实例级）：`ToolDefs` / `ToolHandlers` / `ToolSecurityMap`，由 `InitTools()` 一次性填充
 
 生命周期由 `AppContext` 的三个方法驱动，每个都收敛了此前在 `main.go` 与
 `repl_commands.go` 之间重复的一段流程：
-- `NewApp(model, workdir, bashValidate)` —— 一次调用构造全部工作目录全局子系统
+- `NewApp(model, workdir, dataDir, bashValidate)` —— 一次调用构造全部工作目录全局子系统
 - `ActivateSession(sess)` —— 把 `sess` 绑定进 `SessionManager`，重建 `TeamMgr`，重新生成 `System`
 - `DeactivateActiveSession()` —— 关闭全部 teammate，把当前活跃会话落盘到记忆
 
@@ -273,6 +283,8 @@ agentLoop(ctx, &conv)
 | `--new-session` | false | 强制创建新会话 |
 | `--human` | false | 启用人工确认（Human-in-the-loop） |
 | `--human-mode` | interactive | `interactive` / `auto-approve` / `auto-reject` / `notify-only` |
+| `--workdir <path>` | 当前目录 | 指定 agent 编辑文件、执行命令的项目目录（`Workdir`） |
+| `--data-dir <path>` | `{UserConfigDir}/go-code-agent/projects/<hash>` | 覆盖持久化状态目录（`DataDir`） |
 
 ### Judge 提供商解析逻辑
 
@@ -417,6 +429,14 @@ go-code-agent/
 ├── infra/                        # 横切常量
 │   └── consts.go                 # 所有可调阈值集中在此
 │
+├── embedded/                     # 编译期内置资源（package embedded）
+│   ├── embedded.go               #   //go:embed README_zh.md → Content []byte
+│   └── README_zh.md              #   根 README 的真实副本（通过 `go generate ./embedded` 刷新）
+│
+├── frontend/                     # 独立的 README 查看器（也是 /readme 命令的底层实现）
+│   ├── main.go                   #   入口：`go run ./frontend` 启动服务并打开浏览器
+│   └── server/                   #   server 包：Markdown → 带样式 HTML，临时 localhost 服务
+│
 ├── utils/                        # 共享工具函数
 │   └── utils.go                  # 路径辅助函数（JoinWorkdir、Truncate 等）
 │
@@ -441,8 +461,8 @@ go-code-agent/
 │   └── pdf/SKILL.md              # PDF 处理技能
 │
 ├── go.mod / go.sum               # Go 模块定义
-└── .go-code-agent/               # 运行时状态目录（被 .gitignore 忽略）
-    └── sessions/                 # 每会话数据（tasks、team、history 等）
+└── （运行时状态默认不在本目录——见 `--data-dir`；若选择项目内状态，
+     原有的 `.go-code-agent/` 仍可能出现在项目根）
 ```
 
 ---
@@ -653,7 +673,7 @@ LLM_PROVIDER 环境变量已设置？
 - **HITL 审批**：4 种模式（interactive/auto-approve/auto-reject/notify-only）
 - **快照/回滚**：基于 git-stash 的 Saga 模式，用于写工具（通过 `SNAPSHOT_ENABLED=1` 选择启用）
 - **每工具超时**：5 分钟硬性上限，防止挂起的处理器冻结 REPL
-- **用户权限规则**：`{workdir}/.go-code-agent/permissions.json` 支持按"工具+模式"配置 allow/deny/ask（例如允许 `git commit -m *` 但拒绝 `git push --force*`）——该规则层位于 bash 硬性危险模式黑名单**之后**，因此用户的 `allow` 规则永远无法复活被黑名单禁止的命令。可用 `/permissions`、`/permissions reload` 查看/热重载。
+- **用户权限规则**：`{dataDir}/permissions.json` 支持按"工具+模式"配置 allow/deny/ask（例如允许 `git commit -m *` 但拒绝 `git push --force*`）——该规则层位于 bash 硬性危险模式黑名单**之后**，因此用户的 `allow` 规则永远无法复活被黑名单禁止的命令。默认 `dataDir` 为用户级状态目录（见 `--data-dir`），**不在**项目目录内。可用 `/permissions`、`/permissions reload` 查看/热重载。
 
 ---
 
@@ -789,7 +809,7 @@ task_dag() 输出：
 SessionManager.BootstrapOrCreate(forceNew, explicitID)
   → forceNew（且无显式 id）：NewSession("New session")
   → 否则：BootstrapSession 解析 显式 id > 最近活跃 > 全新会话
-  → NewSession 创建目录：.go-code-agent/sessions/<uuid>/
+  → NewSession 创建目录：{dataDir}/sessions/<uuid>/
     子目录：tasks/、team/、history/、transcripts/
   │
 AppContext.ActivateSession(session)

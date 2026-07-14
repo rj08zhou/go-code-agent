@@ -387,6 +387,12 @@ func InitTools() {
 				}
 				return llm.MkOk(App.MemStore.DeleteMemory(a.Query, a.Category))
 			}),
+		spec("memory_stats", "Show memory store statistics (evergreen chars, daily files, entry count).",
+			map[string]any{}, nil, security.ApproveAuto,
+			func(ctx context.Context, r json.RawMessage) ToolResult {
+				ec, df, de := App.MemStore.GetStats()
+				return llm.MkOk(fmt.Sprintf("evergreen: %d chars, daily files: %d, entries: %d", ec, df, de))
+			}),
 		spec("session_save_memory", "Extract insights from the current session's conversation history and save them to long-term memory. Called automatically when the session ends; use this to trigger it manually.",
 			map[string]any{}, nil, security.ApproveSafe,
 			func(ctx context.Context, r json.RawMessage) ToolResult {

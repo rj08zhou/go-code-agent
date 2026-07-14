@@ -3,7 +3,6 @@ package usage
 import (
 	"encoding/json"
 	"fmt"
-	"go-code-agent/infra"
 	"go-code-agent/internal/llm"
 	"os"
 	"path/filepath"
@@ -118,14 +117,14 @@ func Render() string {
 
 // InitUsageRecorder configures the usage log location. Safe to call
 // more than once (e.g. on workdir change), though in practice we call
-// it once at startup. workdir is the workspace root, NOT the memory
-// subdir.
-func InitUsageRecorder(workdir string) {
-	if workdir == "" {
+// it once at startup. dataDir is the resolved per-project state
+// directory; the log lives under {dataDir}/memory/usage.jsonl.
+func InitUsageRecorder(dataDir string) {
+	if dataDir == "" {
 		usageRecorder.disabled = true
 		return
 	}
-	dir := filepath.Join(workdir, infra.AppRootDirName, "memory")
+	dir := filepath.Join(dataDir, "memory")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "[usage] cannot create %s: %v (telemetry disabled)\n", dir, err)
 		usageRecorder.disabled = true
