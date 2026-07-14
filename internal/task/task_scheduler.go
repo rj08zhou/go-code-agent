@@ -293,15 +293,61 @@ func (ds *DAGScheduler) TopoView() string {
 		return "No tasks."
 	}
 
-	inDeg := make(map[int]int)
-	adj := make(map[int][]int)
 	taskInfo := make(map[int]map[string]any)
-
 	for _, t := range tasks {
 		id := int(t["id"].(float64))
-		inDeg[id] = 0
 		taskInfo[id] = t
 	}
+
+	markers := map[string]string{"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+
+	// Group tasks into weakly-connected components (treating dependency
+	// edges as undirected). Unrelated batches — e.g. two independent
+	// chains with no shared node — must be rendered as SEPARATE
+	// workflows, never collapsed into one shared Stage. (Before this
+	// fix a single Kahn pass merged every inDeg==0 root across all
+	// components into Stage 1, falsely implying they were parallel
+	// parts of one plan.)
+	components := ds.connectedComponents(taskInfo, edges)
+
+	var workflows []string
+	for idx, comp := range components {
+		sections, _, cycle := ds.topoViewComponent(comp.ids, comp.edges, taskInfo, markers)
+		header := fmt.Sprintf("Workflow %d (%d tasks):", idx+1, len(comp.ids))
+		if cycle {
+			header += " ⚠ cycle detected - some tasks unreachable!"
+		}
+		workflows = append(workflows, header+"\n"+strings.Join(sections, "\n"))
+	}
+
+	body := strings.Join(workflows, "\n\n")
+
+	var edgeLines []string
+	for _, e := range edges {
+		edgeLines = append(edgeLines, fmt.Sprintf("  #%d → #%d", e.From, e.To))
+	}
+	edgeSection := ""
+	if len(edgeLines) > 0 {
+		edgeSection = "\n\nDependency edges:\n" + strings.Join(edgeLines, "\n")
+	}
+
+	return "DAG execution plan (tasks in the same Stage can run in parallel within a workflow):\n\n" + body + edgeSection
+}
+
+// component is a weakly-connected sub-graph: the task ids that belong to
+// it and the dependency edges entirely internal to it.
+type component struct {
+	ids   []int
+	edges []dagEdge
+}
+
+// connectedComponents partitions all tasks into weakly-connected
+// components using an undirected view of the dependency edges. A BFS
+// from each unvisited node collects every node reachable via any edge
+// direction, so two chains that merely share a transitive shape but no
+// node are still split when they are truly disjoint.
+func (ds *DAGScheduler) connectedComponents(taskInfo map[int]map[string]any, edges []dagEdge) []component {
+	undirected := make(map[int][]int)
 	for _, e := range edges {
 		if _, ok := taskInfo[e.From]; !ok {
 			continue
@@ -309,20 +355,92 @@ func (ds *DAGScheduler) TopoView() string {
 		if _, ok := taskInfo[e.To]; !ok {
 			continue
 		}
+		undirected[e.From] = append(undirected[e.From], e.To)
+		undirected[e.To] = append(undirected[e.To], e.From)
+	}
+	// Sort each adjacency list so BFS visits neighbors in ascending id
+	// order, making the component's internal `ids` order deterministic.
+	for k := range undirected {
+		sort.Ints(undirected[k])
+	}
+
+	seen := make(map[int]bool)
+	var comps []component
+
+	// Collect all task ids sorted so component ordering is deterministic.
+	allIDs := make([]int, 0, len(taskInfo))
+	for id := range taskInfo {
+		allIDs = append(allIDs, id)
+	}
+	sort.Ints(allIDs)
+
+	for _, id := range allIDs {
+		if seen[id] {
+			continue
+		}
+		// BFS over the undirected adjacency.
+		var ids []int
+		queue := []int{id}
+		seen[id] = true
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			ids = append(ids, cur)
+			for _, nb := range undirected[cur] {
+				if !seen[nb] {
+					seen[nb] = true
+					queue = append(queue, nb)
+				}
+			}
+		}
+		// Collect edges internal to this component.
+		var compEdges []dagEdge
+		for _, e := range edges {
+			if containsInt(ids, e.From) && containsInt(ids, e.To) {
+				compEdges = append(compEdges, e)
+			}
+		}
+		comps = append(comps, component{ids: ids, edges: compEdges})
+	}
+	// Deterministic order: by smallest id in the component.
+	sort.Slice(comps, func(i, j int) bool {
+		return comps[i].ids[0] < comps[j].ids[0]
+	})
+	return comps
+}
+
+func containsInt(s []int, v int) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// topoViewComponent runs Kahn's algorithm over a single connected
+// component (the tasks in `ids` and edges in `compEdges`) and returns
+// the rendered stages, the topological order, and whether a cycle left
+// some tasks unreachable.
+func (ds *DAGScheduler) topoViewComponent(ids []int, compEdges []dagEdge, taskInfo map[int]map[string]any, markers map[string]string) ([]string, []int, bool) {
+	inDeg := make(map[int]int)
+	adj := make(map[int][]int)
+	for _, id := range ids {
+		inDeg[id] = 0
+	}
+	for _, e := range compEdges {
 		adj[e.From] = append(adj[e.From], e.To)
 		inDeg[e.To]++
 	}
 
-	// Kahn's algorithm.
 	var queue []int
-	for id, deg := range inDeg {
-		if deg == 0 {
+	for _, id := range ids {
+		if inDeg[id] == 0 {
 			queue = append(queue, id)
 		}
 	}
 	sort.Ints(queue)
 
-	markers := map[string]string{"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
 	var sections []string
 	var order []int
 	stage := 0
@@ -332,7 +450,6 @@ func (ds *DAGScheduler) TopoView() string {
 		stage++
 		var nextQueue []int
 
-		// Classify tasks in this stage by status.
 		var runnable, done int
 		taskLines := make([]string, 0, len(queue))
 		for _, id := range queue {
@@ -340,7 +457,6 @@ func (ds *DAGScheduler) TopoView() string {
 			t := taskInfo[id]
 			st, _ := t["status"].(string)
 			sub, _ := t["subject"].(string)
-			// 修复：处理空 subject 的情况
 			if strings.TrimSpace(sub) == "" {
 				sub = "(no subject)"
 			}
@@ -356,7 +472,7 @@ func (ds *DAGScheduler) TopoView() string {
 			}
 
 			var preds []string
-			for _, e := range edges {
+			for _, e := range compEdges {
 				if e.To == id {
 					preds = append(preds, fmt.Sprintf("#%d", e.From))
 				}
@@ -376,7 +492,6 @@ func (ds *DAGScheduler) TopoView() string {
 			}
 		}
 
-		// Stage header: show parallelism hint and blocking status.
 		var header string
 		switch {
 		case runnable == 0:
@@ -396,21 +511,8 @@ func (ds *DAGScheduler) TopoView() string {
 		queue = nextQueue
 	}
 
-	body := strings.Join(sections, "\n\n")
-	if len(order) < len(taskInfo) {
-		body += "\n\n  ⚠ WARNING: cycle detected - some tasks unreachable!"
-	}
-
-	var edgeLines []string
-	for _, e := range edges {
-		edgeLines = append(edgeLines, fmt.Sprintf("  #%d → #%d", e.From, e.To))
-	}
-	edgeSection := ""
-	if len(edgeLines) > 0 {
-		edgeSection = "\n\nDependency edges:\n" + strings.Join(edgeLines, "\n")
-	}
-
-	return "DAG execution plan (tasks in the same Stage can run in parallel):\n\n" + body + edgeSection
+	cycle := len(order) < len(ids)
+	return sections, order, cycle
 }
 
 // ProgressSummary returns a brief progress report.

@@ -4,80 +4,83 @@ description: |
   LLM-as-Judge verification for agent outputs.
   Use when you need to verify agent work quality, validate task completion,
   or implement quality gates. Keywords: verify, validate, judge, score, evaluate.
-type: code
 ---
 
-# Judge Skill
+# Judge
 
-LLM-based verification layer that evaluates whether the agent's actions and results truly match the user's intent.
+LLM-based verification layer that evaluates whether the agent's actions and
+results truly match the user's intent.
 
-## What This Skill Does
+> **Note on scope**: `judge` is a **code-internal capability** of
+> `go-code-agent` (implemented in `internal/agent/judge.go`, wired into the
+> agent loop at `loop.go`). This skill file is **documentation only** — it is
+> loaded on demand via the `load_skill` tool to give the agent methodological
+> guidance. It does **not** participate in the automatic verification flow and
+> there is no separate `skills/judge` Go package or `WithSkills(...)` API. The
+> judge runs automatically whenever it is enabled (see below); you never call
+> it from this skill.
 
-After significant events (task completion, post-reflection), the Judge:
+## What the Judge Does
 
-1. Collects recent conversation and tool results
-2. Sends them to a SEPARATE (usually cheaper) LLM
-3. Gets a structured verdict with:
-   - `approved`: bool - overall pass/fail
-   - `score`: int (1-10) - quality score
-   - `issues`: []string - concrete problems
-   - `suggestions`: []string - how to fix
-   - `should_retry`: bool - whether to force another round
+After the agent finishes a task (a turn where it declared the task complete
+and used at least one tool), the loop calls `Judge.Verify(...)`:
+
+1. Collects the recent conversation tail and the round's tool results.
+2. Sends them to a **separate (usually cheaper) LLM** via the judge provider.
+3. Parses a structured verdict:
+   - `approved`: bool — overall pass/fail
+   - `score`: int (1–10) — quality score
+   - `issues`: []string — concrete problems
+   - `suggestions`: []string — how to fix
+   - `should_retry`: bool — whether to force another round
+
+If `score < JUDGE_MIN_SCORE`, the verdict is forced to `should_retry = true`
+(and `approved = false`), and the loop injects a `<verification-failed>`
+feedback block back into the conversation so the agent can self-correct. On any
+internal error (bad model, empty response, parse failure) the judge falls back
+to a **permissive verdict** (`approved = true`) so it never blocks progress.
 
 ## Configuration
 
-In this repo the judge is configured entirely through `JUDGE_*` environment
-variables (no CLI flags), so its model, endpoint, credentials and behaviour
-all live in one consistent place:
+The judge is configured **entirely through `JUDGE_*` environment variables**
+(no CLI flags, no YAML, no per-skill config). Parsed centrally in
+`infra/config.go`:
 
 ```bash
-JUDGE_ENABLED=1                       # turn the judge on (1 | true | yes | on)
-JUDGE_MODEL=claude-haiku-4.5          # empty = reuse main model
-JUDGE_MIN_SCORE=7                     # below this, should_retry is forced
-JUDGE_PROVIDER=openai                 # optional: explicit backend SDK
-JUDGE_API_KEY=<key>                   # optional: judge-only key
-JUDGE_BASE_URL=https://api.deepseek.com  # optional: judge-only endpoint
+JUDGE_ENABLED=1                              # turn the judge on (1 | true | yes | on)
+JUDGE_MODEL=claude-haiku-4.5                 # empty = reuse the main agent model
+JUDGE_MIN_SCORE=7                            # below this, should_retry is forced
+JUDGE_PROVIDER=openai                        # optional: explicit backend SDK
+JUDGE_API_KEY=<key>                          # optional: judge-only API key
+JUDGE_BASE_URL=https://api.deepseek.com      # optional: judge-only endpoint
 ```
 
-The conceptual config below maps onto those vars (`min_score` →
-`JUDGE_MIN_SCORE`, `model` → `JUDGE_MODEL`, …):
-
-```yaml
-skills:
-  - name: judge
-    enabled: true
-    config:
-      min_score: 7          # below this, should_retry is forced
-      model: ""             # empty = reuse main model; use "claude-haiku-4.5" for cost savings
-      max_history: 12       # max messages included in judge prompt
-      max_retry_injects: 2  # cap verification-failed injections per loop
-```
+Notes:
+- `JUDGE_MODEL` empty → the judge reuses the **main model** as a fallback.
+  Generally a *cheaper* model is used to save cost, but that is a deployment
+  choice, not a code requirement.
+- `JUDGE_PROVIDER` / `JUDGE_API_KEY` / `JUDGE_BASE_URL` let the judge live
+  behind a **separate endpoint** from the main agent; if unset, it uses the
+  main model's provider.
+- `JUDGE_MIN_SCORE` invalid/empty → falls back to the infra default (7).
 
 ## Prompt Templates
 
-This skill uses templates in `prompts/judge_system.md`. Customize them for your domain:
+The judge renders prompt templates loaded from the project's `prompts/`
+directory (same dir as the agent's other prompts). Customize them for your
+domain:
 
-- `judge_system.md` - Main verification prompt (with scoring rubric)
-- `judge_critical.md` - Injected when score <= 3 (forces strategy change)
-
-## Usage Example
-
-```go
-import "github.com/yourname/go-code-agent/skills/judge"
-
-// In your agent setup:
-judgeSkill := judge.New(judge.Config{
-    MinScore: 7,
-    Model:    "claude-haiku-4.5",
-})
-
-agent := NewAgent().
-    WithSkills(judgeSkill)
-```
+- `prompts/judge_system.md` — main verification prompt (with scoring rubric)
+- `prompts/judge_critical.md` — injected when the score is critically low,
+  forcing a strategy change
 
 ## Design Notes
 
-- **Cost control**: Uses a separate (cheaper) LLM call with compact context
-- **Non-blocking**: On internal errors, returns permissive default (approved=true)
-- **Configurable strictness**: Adjust `min_score` to your quality bar
-- **Domain adaptable**: Override prompt templates for different domains (code, writing, analysis)
+- **Cost control**: uses a separate (cheaper) LLM call with compact context
+  (last ~12 messages by default).
+- **Non-blocking**: on internal errors, returns a permissive default
+  (`approved = true`), never stalls the agent.
+- **Configurable strictness**: raise/lower `JUDGE_MIN_SCORE` to set your
+  quality bar.
+- **Domain adaptable**: override the prompt templates above for different
+  domains (code, writing, analysis).

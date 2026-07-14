@@ -3,8 +3,16 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"go-code-agent/infra"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/security"
+	"go-code-agent/utils"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
 )
 
 // ToolResult is an alias for llm.ToolResult.
@@ -96,16 +104,24 @@ func runBash(ctx context.Context, command string) string {
 	return secureRunBash(ctx, command, true)
 }
 
-func runRead(ctx context.Context, path string, limit int) string {
-	return secureReadFile(ctx, path, limit)
+func runRead(ctx context.Context, path string, offset, limit int) string {
+	return secureReadFile(ctx, path, offset, limit)
 }
 
 func runWrite(ctx context.Context, path, content string) string {
 	return secureWriteFile(ctx, path, content)
 }
 
-func runEdit(ctx context.Context, path, oldText, newText string) string {
-	return secureEditFile(ctx, path, oldText, newText)
+func runEdit(ctx context.Context, path, oldText, newText string, replaceAll bool) string {
+	return secureEditFile(ctx, path, oldText, newText, replaceAll)
+}
+
+// runInsert inserts newText into a file after a 1-based line number
+// (afterLine==0 prepends, afterLine>=line count appends). Delegates to
+// the security layer for approval, path safety, diff preview, and the
+// atomic write.
+func runInsert(ctx context.Context, path string, afterLine int, newText string) string {
+	return secureInsertFile(ctx, path, afterLine, newText)
 }
 
 // runDelete provides safe file deletion through the security layer.
@@ -137,17 +153,137 @@ func coreToolSpecs(writeTools bool) []ToolSpec {
 				}
 				return llm.MkOk(runBash(ctx, a.Command))
 			}),
-		spec("read_file", "Read file contents. When you only need a specific fact, symbol, constant value, or a few lines (NOT the whole file), first locate it with `bash` grep/rg (e.g. rg -n \"TokenThreshold\" .) and read only what you need - pass `limit` to cap the number of lines returned for large files. Reading entire large files just to check one value wastes context and forces compaction.",
-			map[string]any{"path": strProp(), "limit": intProp()}, []string{"path"}, security.ApproveAuto,
+		spec("read_file", "Read file contents. When you only need a specific fact, symbol, constant value, or a few lines (NOT the whole file), first locate it with `bash` grep/rg (e.g. rg -n \"TokenThreshold\" .) and read only what you need - pass `offset` + `limit` to narrow the range. Reading entire large files just to check one value wastes context and forces compaction.",
+			map[string]any{"path": strProp(), "offset": intProp(), "limit": intProp()}, []string{"path"}, security.ApproveAuto,
 			func(ctx context.Context, r json.RawMessage) ToolResult {
 				var a struct {
-					Path  string `json:"path"`
-					Limit int    `json:"limit"`
+					Path   string `json:"path"`
+					Offset int    `json:"offset"`
+					Limit  int    `json:"limit"`
 				}
 				if e := llm.ParseArgs(r, &a); e != "" {
 					return llm.MkErr(e)
 				}
-				return llm.MkOk(runRead(ctx, a.Path, a.Limit))
+				return llm.MkOk(runRead(ctx, a.Path, a.Offset, a.Limit))
+			}),
+		spec("list_dir", "List directory contents (type, size, name). Defaults to workdir.",
+			map[string]any{"path": strProp()}, nil, security.ApproveAuto,
+			func(ctx context.Context, r json.RawMessage) ToolResult {
+				var a struct {
+					Path string `json:"path"`
+				}
+				if e := llm.ParseArgs(r, &a); e != "" {
+					return llm.MkErr(e)
+				}
+				dir := workdirFromCtx(ctx)
+				if a.Path != "" {
+					resolved, err := security.SecurePath(dir, a.Path, false)
+					if err != nil {
+						return llm.MkErr(fmt.Sprintf("%v", err))
+					}
+					dir = resolved
+				}
+				entries, err := os.ReadDir(dir)
+				if err != nil {
+					return llm.MkErr(fmt.Sprintf("%v", err))
+				}
+				var lines []string
+				for _, e := range entries {
+					info, _ := e.Info()
+					marker := "  "
+					if e.IsDir() {
+						marker = "d "
+					}
+					lines = append(lines, fmt.Sprintf("%s%8d  %s", marker, info.Size(), e.Name()))
+				}
+				return llm.MkOk(strings.Join(lines, "\n"))
+			}),
+		spec("search_file", "Find files by name pattern (glob, e.g. '*.go'). Searches recursively, skipping .git/node_modules.",
+			map[string]any{
+				"pattern": strProp(),
+				"path":    strProp(),
+			}, []string{"pattern"}, security.ApproveAuto,
+			func(ctx context.Context, r json.RawMessage) ToolResult {
+				var a struct {
+					Pattern string `json:"pattern"`
+					Path    string `json:"path"`
+				}
+				if e := llm.ParseArgs(r, &a); e != "" {
+					return llm.MkErr(e)
+				}
+				root := workdirFromCtx(ctx)
+				if a.Path != "" {
+					resolved, err := security.SecurePath(root, a.Path, false)
+					if err != nil {
+						return llm.MkErr(fmt.Sprintf("%v", err))
+					}
+					root = resolved
+				}
+				var matches []string
+				skipDirs := map[string]bool{".git": true, "node_modules": true, ".go-code-agent": true}
+				filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+					if err != nil {
+						return nil
+					}
+					if d.IsDir() {
+						if skipDirs[d.Name()] {
+							return filepath.SkipDir
+						}
+						return nil
+					}
+					if ok, _ := filepath.Match(a.Pattern, d.Name()); ok {
+						rel, _ := filepath.Rel(workdirFromCtx(ctx), p)
+						matches = append(matches, rel)
+					}
+					return nil
+				})
+				if len(matches) == 0 {
+					return llm.MkOk("No files matched.")
+				}
+				return llm.MkOk(utils.Truncate(strings.Join(matches, "\n"), infra.MaxOutputLen))
+			}),
+		spec("search_content", "Search file contents by regex (like grep -rn). Returns file:line:content for each match.",
+			map[string]any{
+				"pattern": strProp(),
+				"path":    strProp(),
+			}, []string{"pattern"}, security.ApproveAuto,
+			func(ctx context.Context, r json.RawMessage) ToolResult {
+				var a struct {
+					Pattern string `json:"pattern"`
+					Path    string `json:"path"`
+				}
+				if e := llm.ParseArgs(r, &a); e != "" {
+					return llm.MkErr(e)
+				}
+				if a.Pattern == "" {
+					return llm.MkErr("pattern is required")
+				}
+				root := workdirFromCtx(ctx)
+				if a.Path != "" {
+					resolved, err := security.SecurePath(root, a.Path, false)
+					if err != nil {
+						return llm.MkErr(fmt.Sprintf("%v", err))
+					}
+					root = resolved
+				}
+				searchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(searchCtx, "grep",
+					"-rnI",
+					"--exclude-dir=.git",
+					"--exclude-dir=node_modules",
+					"--exclude-dir=.go-code-agent",
+					"-E", a.Pattern, root,
+				)
+				out, err := cmd.CombinedOutput()
+				if searchCtx.Err() == context.DeadlineExceeded {
+					return llm.MkErr("search timed out after 30s")
+				}
+				result := strings.TrimSpace(string(out))
+				if err != nil && result == "" {
+					return llm.MkOk("No matches found.")
+				}
+				return llm.MkOk(utils.Truncate(result, infra.MaxOutputLen))
 			}),
 	}
 	if !writeTools {
@@ -169,13 +305,14 @@ func coreToolSpecs(writeTools bool) []ToolSpec {
 				}
 				return llm.MkOk(runWrite(ctx, a.Path, a.Content))
 			}),
-		spec("edit_file", "Replace exact text in file.",
-			map[string]any{"path": strProp(), "old_text": strProp(), "new_text": strProp()}, []string{"path", "old_text", "new_text"}, security.ApproveSafe,
+		spec("edit_file", "Replace exact text in file. By default replaces only the first occurrence; set replace_all=true to replace every occurrence. When there are multiple non-unique matches and replace_all is false, only the first is changed and the rest are left untouched.",
+			map[string]any{"path": strProp(), "old_text": strProp(), "new_text": strProp(), "replace_all": boolProp()}, []string{"path", "old_text", "new_text"}, security.ApproveSafe,
 			func(ctx context.Context, r json.RawMessage) ToolResult {
 				var a struct {
-					Path    string `json:"path"`
-					OldText string `json:"old_text"`
-					NewText string `json:"new_text"`
+					Path       string `json:"path"`
+					OldText    string `json:"old_text"`
+					NewText    string `json:"new_text"`
+					ReplaceAll bool   `json:"replace_all"`
 				}
 				if e := llm.ParseArgs(r, &a); e != "" {
 					return llm.MkErr(e)
@@ -186,7 +323,23 @@ func coreToolSpecs(writeTools bool) []ToolSpec {
 				if a.OldText == "" {
 					return llm.MkErr("Error: 'old_text' parameter is required and cannot be empty. Provide the exact text to replace.")
 				}
-				return llm.MkOk(runEdit(ctx, a.Path, a.OldText, a.NewText))
+				return llm.MkOk(runEdit(ctx, a.Path, a.OldText, a.NewText, a.ReplaceAll))
+			}),
+		spec("insert_file", "Insert text at a specific line in a file. after_line is 1-based: 0 prepends before the first line, N inserts after line N, and values >= line count append to the end. Newlines are added between the existing content and the inserted text automatically.",
+			map[string]any{"path": strProp(), "after_line": intProp(), "content": strProp()}, []string{"path", "after_line", "content"}, security.ApproveSafe,
+			func(ctx context.Context, r json.RawMessage) ToolResult {
+				var a struct {
+					Path      string `json:"path"`
+					AfterLine int    `json:"after_line"`
+					Content   string `json:"content"`
+				}
+				if e := llm.ParseArgs(r, &a); e != "" {
+					return llm.MkErr(e)
+				}
+				if a.Path == "" {
+					return llm.MkErr("Error: 'path' parameter is required and cannot be empty. Please provide the target file path.")
+				}
+				return llm.MkOk(runInsert(ctx, a.Path, a.AfterLine, a.Content))
 			}),
 		spec("delete_file", "Delete a file (requires confirmation).",
 			map[string]any{"path": strProp()}, []string{"path"}, security.ApproveDanger,

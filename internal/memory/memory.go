@@ -74,11 +74,11 @@ type MemoryStore struct {
 }
 
 func NewMemoryStore(dir string) *MemoryStore {
-	// Store memory under {workdir}/.go-code-agent/memory/daily/
-	appRoot := filepath.Join(dir, infra.AppRootDirName)
-	memDir := filepath.Join(appRoot, "memory", "daily")
+	// Store memory under {dataDir}/memory/daily/ where dataDir is the
+	// resolved per-project state directory (see infra.ResolveDataDir).
+	memDir := filepath.Join(dir, "memory", "daily")
 	os.MkdirAll(memDir, 0o755)
-	ms := &MemoryStore{workspaceDir: appRoot, memoryDir: memDir}
+	ms := &MemoryStore{workspaceDir: dir, memoryDir: memDir}
 	ms.cleanExpired()
 	ms.rebuildCache()
 	return ms

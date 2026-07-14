@@ -15,7 +15,6 @@ import (
 	"go-code-agent/internal/task"
 	"go-code-agent/internal/team"
 	"go-code-agent/utils"
-	"os"
 )
 
 // AppContext is the agent's root object: process-wide config, workdir-global
@@ -23,7 +22,8 @@ import (
 type AppContext struct {
 	// Process-wide config
 	Model   string
-	Workdir string
+	Workdir string // project root the agent edits / runs commands in
+	DataDir string // per-project state root (sessions, memory, etc.); normally under the user-level config dir
 	System  string // assembled system prompt, rebuilt per-session
 
 	// Embedded holds documentation baked into the binary (e.g. the
@@ -58,26 +58,32 @@ var App *AppContext
 
 // NewApp constructs the AppContext and every workdir-global subsystem
 // it owns: Skills, MemStore, MCPMgr (with its on-disk config loaded),
-// PromptLoader and SessionManager. main only supplies the two values
-// it alone knows - the model id and workdir (from env/CWD) and the
-// bash command validator (security policy is a cmd-layer choice) - and
-// gets back a fully wired root object. main never needs to know any
-// subsystem's constructor signature.
-func NewApp(model, workdir string, bashValidate session.BashValidator) *AppContext {
+// PromptLoader and SessionManager. main supplies the model id, the
+// project workdir, the resolved dataDir (per-project state directory)
+// and the bash command validator (security policy is a cmd-layer
+// choice); it gets back a fully wired root object. main never needs to
+// know any subsystem's constructor signature.
+//
+// Note the split: workdir is the project the agent edits and runs
+// commands in (skills, MCP config, file tools all live there), while
+// dataDir is where persistent state (memory, sessions, permissions,
+// usage, HITL audit) is stored - normally under the user-level config
+// dir rather than inside the project. This keeps the code directory
+// clean and lets the same project map to the same state across launches.
+func NewApp(model, workdir, dataDir string, bashValidate session.BashValidator) *AppContext {
 	skills := skill.NewSkillLoader(utils.JoinWorkdir(workdir, "skills"))
 	if skills.Len() == 0 {
 		logging.PrintSystem("Warning: no skills loaded from " + utils.JoinWorkdir(workdir, "skills"))
 	}
-	memStore := memory.NewMemoryStore(workdir)
+	memStore := memory.NewMemoryStore(dataDir)
 	mcpMgr := mcp.NewMCPManager(workdir)
 	mcpMgr.LoadConfig(workdir)
 
 	// Load user-editable permission rules from
-	// {workdir}/.go-code-agent/permissions.json (see
-	// security.PermissionRules). Absent file -> no rules -> behavior
-	// unchanged. A malformed file is reported but non-fatal so a typo
-	// never bricks startup.
-	permPath := utils.JoinWorkdir(workdir, infra.AppRootDirName+string(os.PathSeparator)+"permissions.json")
+	// {dataDir}/permissions.json (see security.PermissionRules). Absent
+	// file -> no rules -> behavior unchanged. A malformed file is
+	// reported but non-fatal so a typo never bricks startup.
+	permPath := utils.JoinWorkdir(dataDir, "permissions.json")
 	if warn, err := security.GlobalPermissions.Load(permPath); err != nil {
 		logging.PrintSystem(fmt.Sprintf("[permissions] %v - ignoring rules", err))
 	} else {
@@ -93,11 +99,12 @@ func NewApp(model, workdir string, bashValidate session.BashValidator) *AppConte
 	return &AppContext{
 		Model:          model,
 		Workdir:        workdir,
+		DataDir:        dataDir,
 		Skills:         skills,
 		MemStore:       memStore,
 		MCPMgr:         mcpMgr,
 		PromptLoader:   pl,
-		SessionManager: session.NewSessionManager(workdir, model, pl, memStore, bashValidate),
+		SessionManager: session.NewSessionManager(workdir, dataDir, model, pl, memStore, bashValidate),
 		Snapshot:       &snapshotState{},
 		// Judge starts disabled; main() replaces it when JUDGE_ENABLED
 		// is set. Disabled Verify never touches the prompt loader, but

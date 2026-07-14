@@ -2,8 +2,6 @@ package infra
 
 import "time"
 
-const AppRootDirName = ".go-code-agent"
-
 // Project-wide configuration constants. All tunable thresholds and timeouts.
 
 const (
@@ -63,9 +61,9 @@ const (
 
 	// Process-wide LLM throttle (shared by main agent + subagents). Override via
 	// LLM_MAX_QPS / LLM_MAX_BURST / LLM_MAX_CONCURRENCY.
-	LlmDefaultMaxQPS         = 2.0
-	LlmDefaultMaxBurst       = 4
-	LlmDefaultMaxConcurrency = 2
+	LlmDefaultMaxQPS         = 4.0
+	LlmDefaultMaxBurst       = 8
+	LlmDefaultMaxConcurrency = 4
 
 	// SpawnMinInterval staggers teammate Spawn calls so their first LLM hits don't coincide.
 	SpawnMinInterval = 750 * time.Millisecond

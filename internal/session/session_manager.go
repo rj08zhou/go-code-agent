@@ -22,7 +22,8 @@ import (
 //
 // Responsibilities: index management (sessions.json), create/load sessions,
 // deactivate (SaveToMemory), list/archive/rename/switch.
-// Persisted at {workdir}/.go-code-agent/sessions.json.
+// Persisted at {dataDir}/sessions.json (dataDir is the resolved
+// per-project state directory, normally under the user-level config dir).
 
 const sessionsIndexFile = "sessions.json"
 
@@ -33,7 +34,8 @@ type sessionsIndex struct {
 
 // SessionManager manages all session lifecycles.
 type SessionManager struct {
-	workdir string
+	workdir string // project root (kept for any project-scoped use)
+	dataDir string // per-project state root
 	path    string
 	mu      sync.Mutex
 	idx     sessionsIndex
@@ -49,13 +51,15 @@ type SessionManager struct {
 }
 
 // NewSessionManager constructs the session manager with all dependencies.
-// Called once at startup from main.
-func NewSessionManager(workdir string, model string, pl *prompt.Loader, ms *memory.MemoryStore, bv BashValidator) *SessionManager {
-	appRoot := filepath.Join(workdir, appRootDirName)
-	_ = os.MkdirAll(appRoot, 0o755)
+// Called once at startup from main. dataDir is the resolved per-project
+// state directory (see infra.ResolveDataDir); workdir remains the project
+// root used by bash/file tools.
+func NewSessionManager(workdir, dataDir string, model string, pl *prompt.Loader, ms *memory.MemoryStore, bv BashValidator) *SessionManager {
+	_ = os.MkdirAll(dataDir, 0o755)
 	sm := &SessionManager{
 		workdir:       workdir,
-		path:          filepath.Join(appRoot, sessionsIndexFile),
+		dataDir:       dataDir,
+		path:          filepath.Join(dataDir, sessionsIndexFile),
 		model:         model,
 		promptLoader:  pl,
 		memStore:      ms,
@@ -70,7 +74,7 @@ func NewSessionManager(workdir string, model string, pl *prompt.Loader, ms *memo
 // NewSession creates a new session with all subsystems wired.
 func (sm *SessionManager) NewSession(title string) (*Session, error) {
 	id := newSessionID()
-	dir := sessionDir(sm.workdir, id)
+	dir := sessionDir(sm.dataDir, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create session dir: %w", err)
 	}
@@ -85,6 +89,7 @@ func (sm *SessionManager) NewSession(title string) (*Session, error) {
 		},
 		dir:     dir,
 		workdir: sm.workdir,
+		dataDir: sm.dataDir,
 	}
 	if err := s.initSubSystem(sm.bashValidator); err != nil {
 		return nil, err
@@ -101,7 +106,7 @@ func (sm *SessionManager) NewSession(title string) (*Session, error) {
 
 // LoadSession rehydrates an existing session from disk.
 func (sm *SessionManager) LoadSession(id string) (*Session, error) {
-	dir := sessionDir(sm.workdir, id)
+	dir := sessionDir(sm.dataDir, id)
 	metaPath := filepath.Join(dir, sessionMetaFile)
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
@@ -111,7 +116,7 @@ func (sm *SessionManager) LoadSession(id string) (*Session, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", metaPath, err)
 	}
-	s := &Session{meta: m, dir: dir, workdir: sm.workdir}
+	s := &Session{meta: m, dir: dir, workdir: sm.workdir, dataDir: sm.dataDir}
 	if err := s.initSubSystem(sm.bashValidator); err != nil {
 		return nil, err
 	}
@@ -462,7 +467,7 @@ func (sm *SessionManager) Render() string {
 	}
 	active := sm.ActiveID()
 	var lines []string
-	lines = append(lines, fmt.Sprintf("SessionManager in %s:", filepath.Join(sm.workdir, appRootDirName)))
+	lines = append(lines, fmt.Sprintf("SessionManager in %s:", sm.dataDir))
 	for _, s := range sessions {
 		marker := "  "
 		if s.ID == active {
