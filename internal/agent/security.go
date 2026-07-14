@@ -484,18 +484,20 @@ func secureEditFile(ctx context.Context, path, oldText, newText string, replaceA
 		return fmt.Sprintf("Error: File '%s' was modified during editing (concurrent modification detected)", path)
 	}
 
-	// Atomic write
-	tmpPath := fp + ".tmp.edit.$$"
+	// Atomic write - use same pattern as secureWriteFile
+	tmpPath := fmt.Sprintf("%s.tmp.%d.%d", fp, os.Getpid(), time.Now().UnixNano())
 	if err := os.WriteFile(tmpPath, []byte(newContent), 0o644); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Sprintf("Error writing temp file: %v", err)
 	}
 	if err := os.Rename(tmpPath, fp); err != nil {
 		os.Remove(tmpPath)
+		// Fallback: rename might fail across devices, try direct write
 		if err2 := os.WriteFile(fp, []byte(newContent), 0o644); err2 != nil {
-			return fmt.Sprintf("Error writing file: %v / %v", err, err2)
+			return fmt.Sprintf("Error writing file (atomic+direct both failed): %v / %v", err, err2)
 		}
 	}
+
 	if whitespaceTolerant {
 		return fmt.Sprintf("Edited %s (matched ignoring leading/trailing whitespace differences per line - the file's original indentation was preserved for surrounding text)", path)
 	}
