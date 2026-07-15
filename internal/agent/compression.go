@@ -8,6 +8,7 @@ import (
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/logging"
 	"go-code-agent/internal/session"
+	"go-code-agent/utils"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,14 +50,25 @@ func remapPersistedBoundary(oldBoundary, split int) int {
 	return 3 + max(0, oldBoundary-split)
 }
 
-// estimateTokens is a thin alias over EstimateTokens (llm_types.go).
-// Keeping the lowercase name avoids touching every call site.
-func estimateTokens(msgs []llm.Message) int { return llm.EstimateTokens(msgs) }
+// estimateTokens includes ToolDefs in the estimate (every request carries the
+// full tool schema). Thin alias over EstimateRequestTokens to avoid touching
+// every call site.
+func estimateTokens(msgs []llm.Message) int {
+	return llm.EstimateRequestTokens(msgs, ToolDefs)
+}
 
 // microCompact replaces old tool-result content with short placeholders.
 // Returns the number of tool results folded this pass so the caller can
 // surface a decision event (this used to be completely silent).
 func microCompact(msgs []llm.Message) int {
+	return microCompactImpl(msgs)
+}
+
+// MicroCompact is the exported wrapper for microCompact, used by
+// bootConversation to fold stale tool results on history restore.
+func MicroCompact(msgs []llm.Message) int { return microCompactImpl(msgs) }
+
+func microCompactImpl(msgs []llm.Message) int {
 	// Build tool-call id -> name map for placeholder labels.
 	nameMap := map[string]string{}
 	for _, m := range msgs {
@@ -93,6 +105,85 @@ func microCompact(msgs []llm.Message) int {
 	return cleared
 }
 
+// buildCompressInput renders a message prefix into compact structured text
+// for the summarization LLM call. Unlike raw JSON, it always preserves the
+// first user message (the original task), truncates each message to a short
+// summary (no full tool outputs), and caps total size.
+func buildCompressInput(msgs []llm.Message) string {
+	const (
+		maxMsgChars   = 500
+		maxToolChars  = 200
+		maxArgChars   = 120
+		maxTotalChars = 40000
+	)
+
+	// Build tool-call id -> name map for labeling tool results.
+	nameMap := map[string]string{}
+	for _, m := range msgs {
+		if m.Role == llm.RoleAssistant {
+			for _, tc := range m.ToolCalls {
+				nameMap[tc.ID] = tc.Name
+			}
+		}
+	}
+
+	var b strings.Builder
+
+	// Always include the first real user message as "Original task".
+	for _, m := range msgs {
+		if m.Role == llm.RoleUser && strings.TrimSpace(m.Content) != "" {
+			b.WriteString("## Original task\n")
+			b.WriteString(utils.Truncate(m.Content, maxMsgChars))
+			b.WriteString("\n\n## Session history\n")
+			break
+		}
+	}
+
+	// Render each message as a compact one-liner.
+	var lines []string
+	for _, m := range msgs {
+		switch m.Role {
+		case llm.RoleSystem:
+			continue
+		case llm.RoleUser:
+			if strings.HasPrefix(m.Content, "<background-results>") ||
+				strings.HasPrefix(m.Content, "<inbox>") {
+				continue // skip control-block injections
+			}
+			lines = append(lines, fmt.Sprintf("[user]: %s",
+				utils.Truncate(m.Content, maxMsgChars)))
+		case llm.RoleAssistant:
+			if strings.TrimSpace(m.Content) != "" {
+				lines = append(lines, fmt.Sprintf("[assistant]: %s",
+					utils.Truncate(m.Content, maxMsgChars)))
+			}
+			for _, tc := range m.ToolCalls {
+				lines = append(lines, fmt.Sprintf("  -> calls %s(%s)",
+					tc.Name, utils.Truncate(tc.Arguments, maxArgChars)))
+			}
+		case llm.RoleTool:
+			name := nameMap[m.ToolCallID]
+			if name == "" {
+				name = "unknown"
+			}
+			lines = append(lines, fmt.Sprintf("  [tool:%s]: %s",
+				name, utils.Truncate(m.Content, maxToolChars)))
+		}
+	}
+
+	// Keep the tail of the history (most recent matters most).
+	all := strings.Join(lines, "\n")
+	if len(all) > maxTotalChars {
+		all = all[len(all)-maxTotalChars:]
+		if idx := strings.Index(all, "\n"); idx >= 0 {
+			all = all[idx+1:]
+		}
+	}
+
+	b.WriteString(all)
+	return b.String()
+}
+
 // AutoCompact performs progressive compaction: summarizes the older prefix
 // and keeps recent turns verbatim. The split is snapped to a safe turn
 // boundary so tool_call/result pairs are never orphaned.
@@ -125,16 +216,11 @@ func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 		toSummarize = append(toSummarize, m)
 	}
 
-	convData, _ := json.Marshal(toSummarize)
-	convText := string(convData)
-	// Keep the TAIL of the prefix (most recent matters most for continuity).
-	const maxSummaryInput = 80000
-	if len(convText) > maxSummaryInput {
-		convText = convText[len(convText)-maxSummaryInput:]
-	}
+	convText := buildCompressInput(toSummarize)
 
 	resp, err := llm.NewClient(nil).CallWithRetry(ctx, "compress", llm.CallParams{
-		Model: App.Model,
+		Model:     App.Model,
+		MaxTokens: 4096,
 		Messages: []llm.Message{llm.UserMessage(
 			"Summarize the following EARLIER part of a coding session for continuity. " +
 				"The most recent messages are NOT included here (they are kept verbatim after your summary), " +
