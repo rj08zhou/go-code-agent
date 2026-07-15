@@ -74,7 +74,8 @@ func init() {
 	})
 
 	registerReplCommand(exact("/tasks"), func(ctx context.Context, query string, history []llm.Message) (bool, []llm.Message) {
-		fmt.Println(agent.App.TaskMgr().ListAll())
+		fmt.Println(agent.App.Todo().Render())
+		fmt.Println("(persistent / dependency-tracked tasks are shown via /dag)")
 		return true, history
 	})
 

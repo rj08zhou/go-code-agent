@@ -16,22 +16,8 @@ import (
 	"time"
 )
 
-// MCPManager - manage multiple MCP Server connections via stdio
-//
-// Protocol: JSON-RPC 2.0 over stdin/stdout (see mcp_jsonrpc.go)
-// Flow: connect -> initialize -> tools/list -> ready
-// Tool naming: mcp__<server>__<tool> to avoid conflicts
-//
-// Resilience layer (added)
-// ------------------------
-//   - Per-server circuit breaker: after `mcpBreakerThreshold` consecutive
-//     failures the server is marked OPEN; subsequent Call returns
-//     fast (no IPC) until `mcpBreakerCooldown` elapses, after which
-//     the breaker enters HALF-OPEN — the next call is a probe that
-//     either CLOSES the breaker (success) or re-OPENs it (failure).
-//   - Background health-check: every `mcpHealthInterval`, the manager
-//     sends a `tools/list` ping to each server. Pinging while the
-//     breaker is OPEN serves as the half-open probe.
+// MCPManager manages multiple MCP Server connections via stdio JSON-RPC 2.0.
+// Per-server circuit-breaker, background health-check. Tool naming: mcp__<server>__<tool>.
 
 const (
 	mcpBreakerThreshold = 3
