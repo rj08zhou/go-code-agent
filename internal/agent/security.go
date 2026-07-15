@@ -465,7 +465,6 @@ func secureEditFile(ctx context.Context, path, oldText, newText string, replaceA
 		return fmt.Sprintf("Error: File '%s' was modified during editing (concurrent modification detected)", path)
 	}
 
-	// Atomic write - use same pattern as secureWriteFile
 	tmpPath := fmt.Sprintf("%s.tmp.%d.%d", fp, os.Getpid(), time.Now().UnixNano())
 	if err := os.WriteFile(tmpPath, []byte(newContent), 0o644); err != nil {
 		os.Remove(tmpPath)
