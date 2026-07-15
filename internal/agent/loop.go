@@ -310,8 +310,16 @@ func preRound(ctx context.Context, messages *[]llm.Message, st *loopState) {
 	// Drain background task notifications.
 	if notifs := App.BgMgr().Drain(); len(notifs) > 0 {
 		var lines []string
+		shown := 0
 		for _, n := range notifs {
-			lines = append(lines, fmt.Sprintf("[bg:%s] %s: %s", n["task_id"], n["status"], n["result"]))
+			if shown >= infra.MaxBgNotifications {
+				lines = append(lines, fmt.Sprintf("... (%d more notifications)", len(notifs)-shown))
+				break
+			}
+			result := fmt.Sprintf("%v", n["result"])
+			lines = append(lines, fmt.Sprintf("[bg:%s] %s: %s",
+				n["task_id"], n["status"], utils.Truncate(result, infra.MaxBgResultChars)))
+			shown++
 		}
 		*messages = append(*messages,
 			llm.UserMessage(fmt.Sprintf("<background-results>\n%s\n</background-results>", strings.Join(lines, "\n"))),
@@ -321,9 +329,13 @@ func preRound(ctx context.Context, messages *[]llm.Message, st *loopState) {
 
 	// Check lead inbox for teammate messages.
 	if inbox := App.Bus().ReadInbox("lead"); len(inbox) > 0 {
-		data, _ := json.MarshalIndent(inbox, "", "  ")
+		data, _ := json.Marshal(inbox)
+		dataStr := string(data)
+		if len(dataStr) > infra.MaxInboxBytes {
+			dataStr = dataStr[:infra.MaxInboxBytes] + "\n... (inbox truncated)"
+		}
 		*messages = append(*messages,
-			llm.UserMessage(fmt.Sprintf("<inbox>%s</inbox>", string(data))),
+			llm.UserMessage(fmt.Sprintf("<inbox>%s</inbox>", dataStr)),
 			llm.AssistantMessage("Noted inbox messages."),
 		)
 	}
