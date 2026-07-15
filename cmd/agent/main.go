@@ -399,6 +399,9 @@ func bootConversation(sess *session.Session, systemPrompt string) ([]llm.Message
 		return []llm.Message{llm.SystemMessage(systemPrompt)}, false
 	}
 	if restoredCount > 0 {
+		if cleared := agent.MicroCompact(restored); cleared > 0 {
+			logging.PrintSystem(fmt.Sprintf("[history] folded %d old tool result(s) on restore", cleared))
+		}
 		logging.PrintSystem(fmt.Sprintf("[history] resumed %d messages from previous session", restoredCount))
 		return restored, true
 	}

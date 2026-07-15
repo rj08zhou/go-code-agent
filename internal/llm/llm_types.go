@@ -119,3 +119,15 @@ func EstimateTokens(msgs []Message) int {
 	data, _ := json.Marshal(msgs)
 	return len(data) / 4
 }
+
+// EstimateRequestTokens is like EstimateTokens but also accounts for tool
+// definitions, which are sent verbatim on every request. Omitting tools from
+// the estimate caused AutoCompact to under-count, especially with MCP tools.
+func EstimateRequestTokens(msgs []Message, tools []ToolDef) int {
+	dataMsgs, _ := json.Marshal(msgs)
+	if len(tools) == 0 {
+		return len(dataMsgs) / 4
+	}
+	dataTools, _ := json.Marshal(tools)
+	return (len(dataMsgs) + len(dataTools)) / 4
+}

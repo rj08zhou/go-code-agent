@@ -18,7 +18,12 @@ const (
 const (
 	TokenThreshold = 300000 // autoCompact trigger (estimated total tokens)
 	KeepRecent     = 15     // microCompact keeps N most recent tool messages
-	MaxOutputLen   = 500000 // max bytes per tool output (truncation limit, 500KB)
+
+	// MaxOutputLen caps bytes returned by a single tool handler. The result is
+	// appended verbatim to the conversation and re-sent every round, so this
+	// directly bounds per-round context growth. Callers needing more should
+	// page via offset/limit.
+	MaxOutputLen = 64 * 1024
 
 	// KeepRecentMessages: AutoCompact keeps this many recent messages verbatim;
 	// older prefix is summarized. Snapped to a safe turn boundary.
@@ -90,6 +95,11 @@ const (
 	HybridVectorWeight  = 0.35
 )
 
+// ReadFileDefaultLimit is the line cap read_file applies when the caller
+// omits offset+limit. Bounds the default read to ~16K tokens with the
+// MaxOutputLen byte cap.
+const ReadFileDefaultLimit = 500
+
 const (
 	PlanRequestTTL  = 30 * time.Minute // pending requests expire after 30 min
 	ApprovedPlanTTL = 24 * time.Hour   // approved/rejected requests expire after 24h
@@ -122,6 +132,16 @@ const (
 
 const (
 	MaxTeamMessageSize = 64 * 1024 // 64KB max team message size (prevents inbox flooding)
+)
+
+// Caps for background-notification and inbox injection in preRound.
+// Both are appended verbatim as user messages every round they fire,
+// so bounding them prevents a burst of teammate output or background
+// results from dominating the context.
+const (
+	MaxBgResultChars   = 200  // per-notification result truncation
+	MaxBgNotifications = 10   // max notifications injected per round
+	MaxInboxBytes      = 4096 // total inbox payload cap per round
 )
 
 // LLM-as-Judge verification (see judge.go). Configured via JUDGE_* env vars:
@@ -158,6 +178,6 @@ const (
 //	SEARXNG_INSTANCES      comma-separated override of the built-in public list
 const (
 	WebFetchTimeout  = 20 * time.Second // web_fetch: whole request+redirects
-	WebFetchMaxBytes = 2 * 1024 * 1024  // web_fetch: response body cap (2MB)
+	WebFetchMaxBytes = 128 * 1024       // web_fetch: response body cap — fetched text is injected verbatim into the conversation
 	WebSearchTimeout = 8 * time.Second  // web_search: per-backend timeout in the downgrade chain
 )
