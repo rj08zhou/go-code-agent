@@ -19,11 +19,7 @@ import (
 )
 
 // SessionManager — workdir-scoped session lifecycle manager.
-//
-// Responsibilities: index management (sessions.json), create/load sessions,
-// deactivate (SaveToMemory), list/archive/rename/switch.
-// Persisted at {dataDir}/sessions.json (dataDir is the resolved
-// per-project state directory, normally under the user-level config dir).
+// Persisted at {dataDir}/sessions.json.
 
 const sessionsIndexFile = "sessions.json"
 
@@ -486,13 +482,8 @@ func (sm *SessionManager) Render() string {
 
 // Boot helper.
 
-// BootstrapOrCreate extends BootstrapSession's resolution policy with
-// the CLI's --new-session override: forceNew (with no explicit id)
-// always creates a fresh session, bypassing the most-recent fallback
-// below. Otherwise defers entirely to BootstrapSession's own chain
-// (explicit id > most recent > fresh). Single source of truth for
-// "which session do we start with" - previously this forceNew rule
-// lived in main.go, split from the rest of the same policy here.
+// BootstrapOrCreate resolves the startup session: forceNew → create fresh;
+// otherwise defers to BootstrapSession (explicit id > most recent > brand new).
 func (sm *SessionManager) BootstrapOrCreate(forceNew bool, explicitID string) (*Session, error) {
 	if forceNew && explicitID == "" {
 		return sm.NewSession("New session")

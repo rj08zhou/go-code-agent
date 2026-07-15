@@ -208,11 +208,6 @@ func secureRunBash(ctx context.Context, command string, interactive bool) string
 	output, err := cmd.CombinedOutput()
 
 	if execCtx.Err() == context.DeadlineExceeded {
-		// Actionable message, not a bare "Timeout": otherwise the model
-		// tends to blindly retry the same blocking command under bash or
-		// wrap it in a `timeout` shell command (which isn't installed on
-		// macOS -> "sh: timeout: command not found"). Point it at the
-		// right tool instead.
 		return fmt.Sprintf("Error: command timed out after %v and was killed (along with its child processes). "+
 			"If this is a long-running or blocking process (dev server, watch-mode build, tail -f, etc.), "+
 			"re-run it with the background_run tool instead of bash - do not retry it under bash and do not wrap it in a 'timeout' command.", infra.BashTimeout)
@@ -237,7 +232,7 @@ func secureRunBash(ctx context.Context, command string, interactive bool) string
 // secureReadFile reads a file after validating its path through the securePath sandbox.
 // Optimized version: uses buffered scanner for memory efficiency and supports line limit.
 func secureReadFile(ctx context.Context, path string, offset, limit int) string {
-	fp, err := security.SecurePath(workdirFromCtx(ctx), path, false) // read-only, no sensitive-file check needed
+	fp, err := security.SecurePath(workdirFromCtx(ctx), path, false)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
@@ -247,16 +242,12 @@ func secureReadFile(ctx context.Context, path string, offset, limit int) string 
 	}
 	defer f.Close()
 
-	// Use buffered scanner for memory-efficient line reading
 	var buf bytes.Buffer
 	scanner := bufio.NewScanner(f)
-
-	// Set scanner buffer size for long lines (default is 64K)
 	scanner.Buffer(make([]byte, 1024*64), infra.MaxOutputLen)
 
 	lineCount := 0
 	for scanner.Scan() {
-		// Skip offset lines before counting/collecting.
 		if offset > 0 && lineCount < offset {
 			lineCount++
 			continue
@@ -265,15 +256,11 @@ func secureReadFile(ctx context.Context, path string, offset, limit int) string 
 			buf.WriteString(fmt.Sprintf("... (%d more lines)\n", countRemainingLines(f)))
 			break
 		}
-
-		// Write line to buffer
 		if buf.Len() > 0 {
 			buf.WriteString("\n")
 		}
 		buf.WriteString(scanner.Text())
 		lineCount++
-
-		// Early exit if buffer is getting too large
 		if buf.Len() > infra.MaxOutputLen {
 			buf.Truncate(infra.MaxOutputLen)
 			buf.WriteString("\n... (output truncated)\n")
@@ -294,16 +281,13 @@ func secureReadFile(ctx context.Context, path string, offset, limit int) string 
 	return result
 }
 
-// countRemainingLines estimates remaining lines in a file (fast approximation)
+// countRemainingLines estimates remaining lines (capped at 1000).
 func countRemainingLines(f *os.File) int {
-	// Save current position
 	pos, _ := f.Seek(0, 1)
-	defer f.Seek(pos, 0) // Restore position
-
-	// Quick estimation: scan remaining content
+	defer f.Seek(pos, 0)
 	count := 0
 	scanner := bufio.NewScanner(f)
-	for scanner.Scan() && count < 1000 { // Cap at 1000 for performance
+	for scanner.Scan() && count < 1000 {
 		count++
 	}
 	return count
@@ -371,45 +355,26 @@ func secureEditFile(ctx context.Context, path, oldText, newText string, replaceA
 		return fmt.Sprintf("\u274c %s", msg)
 	}
 
-	fp, err := security.SecurePath(workdirFromCtx(ctx), path, true) // allowWrite=true
+	fp, err := security.SecurePath(workdirFromCtx(ctx), path, true)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
 
-	// Read file with TOCTOU protection
-	// First, get the file's modification time before reading
-	fileInfo, err := os.Stat(fp)
+	// Baseline mtime for the concurrent-modification check below - this
+	// guards against a lost update (someone else changes the file while
+	// we're computing the diff / waiting on PreviewAndConfirm), which
+	// os.Rename's write-atomicity does NOT protect against.
+	fi, err := os.Stat(fp)
 	if err != nil {
 		return fmt.Sprintf("Error stating file: %v", err)
 	}
-	originalMtime := fileInfo.ModTime()
+	originalMtime := fi.ModTime()
 
-	// Read entire file content for matching
 	data, err := os.ReadFile(fp)
 	if err != nil {
 		return fmt.Sprintf("Error reading file: %v", err)
 	}
-
-	// Second check: verify file hasn't changed since we stated it
-	fileInfo2, err := os.Stat(fp)
-	if err != nil {
-		return fmt.Sprintf("Error re-stating file: %v", err)
-	}
-	if !fileInfo2.ModTime().Equal(originalMtime) {
-		return fmt.Sprintf("Error: File '%s' was modified during editing (mtime changed)", path)
-	}
-
 	content := string(data)
-
-	// Match old_text against the file in decreasing order of strictness:
-	//  1. Exact substring (fast path, unchanged behavior).
-	//  2. Whitespace-tolerant (see findWhitespaceTolerantMatch) - only
-	//     accepted when it uniquely identifies one location; ambiguous
-	//     matches are treated as failure, not guessed.
-	//  3. If both fail, attach a diagnostic hint (closestMatchHint)
-	//     pointing at the most similar real content instead of a bare
-	//     "not found" - lets the model self-correct old_text in one
-	//     more turn instead of blindly re-reading the whole file.
 	matchedOld := oldText
 	whitespaceTolerant := false
 	if !strings.Contains(content, oldText) {
@@ -474,17 +439,14 @@ func secureEditFile(ctx context.Context, path, oldText, newText string, replaceA
 		}
 	}
 
-	// Third check (atomic): verify file hasn't changed before writing
-	// This is the critical check that must be atomic with the write
-	fileInfo3, err := os.Stat(fp)
-	if err != nil {
+	// Final check right before the write: catches a concurrent edit
+	// that happened during diff generation / user confirmation above.
+	if fi2, err := os.Stat(fp); err != nil {
 		return fmt.Sprintf("Error checking file before write: %v", err)
-	}
-	if !fileInfo3.ModTime().Equal(originalMtime) {
+	} else if !fi2.ModTime().Equal(originalMtime) {
 		return fmt.Sprintf("Error: File '%s' was modified during editing (concurrent modification detected)", path)
 	}
 
-	// Atomic write - use same pattern as secureWriteFile
 	tmpPath := fmt.Sprintf("%s.tmp.%d.%d", fp, os.Getpid(), time.Now().UnixNano())
 	if err := os.WriteFile(tmpPath, []byte(newContent), 0o644); err != nil {
 		os.Remove(tmpPath)
@@ -504,13 +466,9 @@ func secureEditFile(ctx context.Context, path, oldText, newText string, replaceA
 	return fmt.Sprintf("Edited %s", path)
 }
 
-// secureInsertFile inserts newText into a file after a 1-based line
-// number. afterLine==0 prepends before the first line; afterLine>=N
-// (where N is the line count) appends to the end. Newlines are added
-// around the inserted block automatically so the result is always
-// valid line-oriented text. Shares edit_file's safety posture:
-// approval gate, workdir-anchored SecurePath, mtime TOCTOU checks,
-// diff preview, and atomic temp-file write.
+// secureInsertFile inserts newText after a 1-based line number.
+// afterLine==0 prepends; afterLine>=line count appends.
+// Shares edit_file's safety posture (security gate, TOCTOU, diff preview, atomic write).
 func secureInsertFile(ctx context.Context, path string, afterLine int, newText string) string {
 	if approved, msg := checkToolApproval("insert_file", path); !approved && !security.GlobalApproval.IsAutoApproveSafe() && !security.GlobalApproval.IsAutoApproveAll() {
 		return fmt.Sprintf("\u274c %s", msg)
@@ -521,39 +479,29 @@ func secureInsertFile(ctx context.Context, path string, afterLine int, newText s
 		return fmt.Sprintf("Error: %v", err)
 	}
 
-	// Read existing content (file may not exist yet -> empty content).
+	// Baseline mtime (zero-value means the file didn't exist yet) - see
+	// secureEditFile's comment for why this matters even with atomic rename.
 	var originalMtime time.Time
+	if fi, serr := os.Stat(fp); serr == nil {
+		originalMtime = fi.ModTime()
+	}
+
 	var content string
 	if data, rerr := os.ReadFile(fp); rerr == nil {
 		content = string(data)
-		if fi, serr := os.Stat(fp); serr == nil {
-			originalMtime = fi.ModTime()
-		}
 	} else if !os.IsNotExist(rerr) {
 		return fmt.Sprintf("Error reading file: %v", rerr)
-	}
-
-	// Re-stat to detect concurrent modification before we compute the
-	// new content (mirrors secureEditFile's TOCTOU guard).
-	if fi, serr := os.Stat(fp); serr == nil {
-		if !originalMtime.IsZero() && !fi.ModTime().Equal(originalMtime) {
-			return fmt.Sprintf("Error: File '%s' was modified during editing (mtime changed)", path)
-		}
 	}
 
 	hadTrailingNewline := strings.HasSuffix(content, "\n")
 	lines := strings.Split(content, "\n")
 	if hadTrailingNewline {
-		// Drop the empty artifact produced by the trailing '\n' so
-		// line math stays intuitive (logical lines, not raw split).
 		lines = lines[:len(lines)-1]
 	}
 	if content == "" {
-		// Brand-new file: no logical lines yet.
 		lines = nil
 	}
 
-	// Clamp afterLine into [0, len(lines)].
 	if afterLine < 0 {
 		afterLine = 0
 	}
@@ -569,13 +517,10 @@ func secureInsertFile(ctx context.Context, path string, afterLine int, newText s
 	newLines = append(newLines, insertLines...)
 	newLines = append(newLines, tail...)
 	newContent := strings.Join(newLines, "\n")
-	// Preserve the original trailing newline (or add one for a new file).
 	if hadTrailingNewline || content == "" {
 		newContent += "\n"
 	}
 
-	// Diff preview (insertion of a brand-new file shows the full new
-	// content as an addition).
 	if security.ShouldPreviewDiff() && len(content) < 500000 {
 		diff, derr := security.GenerateUnifiedDiff(content, newContent, path)
 		if derr != nil {
@@ -590,12 +535,15 @@ func secureInsertFile(ctx context.Context, path string, afterLine int, newText s
 		}
 	}
 
-	// Final mtime check, atomic write (mirrors secureEditFile).
+	// Final check right before the write (see secureEditFile).
 	if fi, serr := os.Stat(fp); serr == nil {
 		if !originalMtime.IsZero() && !fi.ModTime().Equal(originalMtime) {
 			return fmt.Sprintf("Error: File '%s' was modified during editing (concurrent modification detected)", path)
 		}
+	} else if !originalMtime.IsZero() {
+		return fmt.Sprintf("Error checking file before write: %v", serr)
 	}
+
 	if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
 		return fmt.Sprintf("Error creating directory: %v", err)
 	}
@@ -613,20 +561,11 @@ func secureInsertFile(ctx context.Context, path string, afterLine int, newText s
 	return fmt.Sprintf("Inserted %d line(s) into %s after line %d", len(insertLines), path, afterLine)
 }
 
-// findWhitespaceTolerantMatch looks for a substring of content whose
-// lines equal old_text's lines after per-line TrimSpace, tolerating
-// differences in indentation / trailing spaces (a common mismatch
-// when a model recalls a file's content slightly off). It returns the
-// exact substring of `content` that matched (so replacement preserves
-// the file's real whitespace) and how many distinct start positions
-// matched - callers should only apply the fix when count == 1;
-// ambiguous or zero matches are the caller's responsibility.
-//
-// Deliberately a plain O(lines*lines) scan over line boundaries, not a
-// generic diff/similarity library: old_text is typically a handful of
-// lines, and this only runs on the (already rare) exact-match-failure
-// path, so simplicity and zero new dependencies win over asymptotic
-// elegance.
+// findWhitespaceTolerantMatch returns a substring of content whose lines
+// match oldText after per-line TrimSpace, tolerating indentation/spacing
+// differences. Returns (match, count) where count is the number of
+// matching positions; callers should only use the match when count==1.
+// O(lines*lines) — oldText is typically only a few lines.
 func findWhitespaceTolerantMatch(content, oldText string) (match string, count int) {
 	oldLines := strings.Split(oldText, "\n")
 	if len(oldLines) == 0 {
@@ -674,10 +613,6 @@ func findWhitespaceTolerantMatch(content, oldText string) (match string, count i
 	return "", count
 }
 
-// findWhitespaceTolerantMatchAt returns the first substring of content
-// whose lines equal oldText's lines after per-line TrimSpace (same
-// matching rule as findWhitespaceTolerantMatch), or "" if none. Used by
-// the replace_all path to iterate matches left-to-right.
 func findWhitespaceTolerantMatchAt(content, oldText string) (match string, found bool) {
 	oldLines := strings.Split(oldText, "\n")
 	if len(oldLines) == 0 {
@@ -716,14 +651,6 @@ func findWhitespaceTolerantMatchAt(content, oldText string) (match string, found
 	return "", false
 }
 
-// closestMatchHint returns a short, actionable diagnostic appended to
-// edit_file's error message when neither exact nor whitespace-tolerant
-// matching found old_text. It locates the file line most similar to
-// old_text's first non-blank line (via a cheap word-overlap score, not
-// a full diff library) and shows a few lines of real file content
-// around it with line numbers - enough for the model to correct
-// old_text in its next call instead of re-reading the entire file.
-// Returns "" if the file has no lines or old_text is empty.
 func closestMatchHint(content, oldText string) string {
 	firstLine := ""
 	for l := range strings.SplitSeq(oldText, "\n") {

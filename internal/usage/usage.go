@@ -11,18 +11,10 @@ import (
 	"time"
 )
 
-// Token-usage telemetry.
-//
-// Every successful LLM call yields a Usage struct. UsageRecorder:
-//   1. Appends one JSONL row per call to {workdir}/memory/usage.jsonl
-//   2. Maintains in-memory rollups (by source, by model) for /usage command
-//
-// Exempt from the 7-day TTL sweep. Best-effort writes.
+// Token-usage telemetry: appends JSONL rows to usage.jsonl + in-memory rollups.
+// Best-effort writes. Exempt from TTL sweep.
 
-// UsageEntry is one row in usage.jsonl.
-//
-// Field names are short and stable; downstream tooling (jq, log
-// shippers) keys off them.
+// UsageEntry is one row in usage.jsonl. Field names are stable for downstream tooling.
 type UsageEntry struct {
 	Timestamp         string `json:"ts"`                          // RFC3339 UTC
 	SessionID         string `json:"session_id"`                  // active session at call time, "" if none

@@ -33,20 +33,8 @@ type DAGScheduler struct {
 	taskMgr *TaskManager // back-reference for loading tasks
 	mu      sync.Mutex
 
-	// In-memory cache of dag_edges.json. loadEdges() used to re-read
-	// and re-parse this file on every single DAG query (ReadyTasks,
-	// IsReady, TopoView, ProgressSummary, ...); with it warm this drops
-	// to one read for the lifetime of the process (until an edge
-	// mutates, which writes through immediately).
-	//
-	// Guarded by its own mutex (edgesMu) rather than ds.mu: loadEdges
-	// is also called directly by TaskManager.ListAll without holding
-	// ds.mu, so the cache must be safe under that access pattern too.
-	//
-	// loadEdges always hands back a freshly-allocated slice (copy of
-	// the cache) so a caller doing `edges = append(edges, ...)` before
-	// saveEdges can never alias — and corrupt — the cached backing
-	// array.
+	// Warm cache of dag_edges.json. Guarded by edgesMu (loadEdges is
+	// also called outside ds.mu).
 	edgesMu     sync.RWMutex
 	edgesCache  []dagEdge
 	edgesLoaded bool
@@ -301,13 +289,7 @@ func (ds *DAGScheduler) TopoView() string {
 
 	markers := map[string]string{"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
 
-	// Group tasks into weakly-connected components (treating dependency
-	// edges as undirected). Unrelated batches — e.g. two independent
-	// chains with no shared node — must be rendered as SEPARATE
-	// workflows, never collapsed into one shared Stage. (Before this
-	// fix a single Kahn pass merged every inDeg==0 root across all
-	// components into Stage 1, falsely implying they were parallel
-	// parts of one plan.)
+	// Group disconnected subgraphs into separate Workflow sections.
 	components := ds.connectedComponents(taskInfo, edges)
 
 	var workflows []string
@@ -341,11 +323,9 @@ type component struct {
 	edges []dagEdge
 }
 
-// connectedComponents partitions all tasks into weakly-connected
-// components using an undirected view of the dependency edges. A BFS
-// from each unvisited node collects every node reachable via any edge
-// direction, so two chains that merely share a transitive shape but no
-// node are still split when they are truly disjoint.
+// connectedComponents partitions tasks into weakly-connected components
+// via BFS (treating dependency edges as undirected). Chains sharing no
+// node are rendered as separate workflows.
 func (ds *DAGScheduler) connectedComponents(taskInfo map[int]map[string]any, edges []dagEdge) []component {
 	undirected := make(map[int][]int)
 	for _, e := range edges {
