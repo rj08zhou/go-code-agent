@@ -290,14 +290,7 @@ func (hs *HistoryStore) LoadRuntime(systemPrompt string) ([]llm.Message, int, er
 		}
 	}
 
-	// Tail-dangling tool_calls guard.
-	//
-	// If the process was killed mid-turn (SIGINT, crash) we may have
-	// persisted an assistant message with pending tool_calls but none
-	// of the tool results. Both OpenAI and Anthropic reject that shape:
-	// every tool_call id must be answered by a matching tool message.
-	// Trim the dangling assistant turn(s) from the tail so the restored
-	// conversation is API-valid.
+	// Trim orphaned tool_calls left after a crash mid-turn.
 	msgs = trimDanglingToolCalls(msgs)
 
 	return msgs, restored, nil
@@ -312,12 +305,8 @@ func (hs *HistoryStore) WrittenCount() int {
 	return hs.written
 }
 
-// trimDanglingToolCalls drops any assistant tool_calls turn not fully
-// answered by the tool messages immediately following it (prevents
-// 400 errors after crash-mid-turn). Scans the whole slice, not just
-// the tail: history.jsonl is append-only, so a mid-turn orphan from a
-// crashed session can end up buried under later sessions' valid turns
-// rather than staying at the end.
+// trimDanglingToolCalls drops assistant tool_calls turns not followed
+// by matching tool results (prevents API 400 after crash mid-turn).
 func trimDanglingToolCalls(msgs []llm.Message) []llm.Message {
 	// out/flushed stay nil/0 until an orphan is actually found - the
 	// overwhelmingly common case is a cleanly-ended session with

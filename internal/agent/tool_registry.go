@@ -21,13 +21,12 @@ import (
 // the comment on ToolSpec for why this matters.
 
 // InitTools (re)builds the global tool registry. Safe to call again
-// (e.g. after /mcp connect|disconnect) — it starts from empty maps.
+// (e.g. after /mcp connect|disconnect) — all three registries are
+// reset to empty first, so repeated calls never accumulate duplicates.
 func InitTools() {
-	// ToolHandlers is a package-level nil map until initialized here;
-	// registerToolSpec assigns into it directly (ToolDefs/ToolSecurityMap
-	// don't need this: append() tolerates a nil slice, and
-	// ToolSecurityMap is already non-nil — see security.go).
+	ToolDefs = nil
 	ToolHandlers = make(map[string]ToolHandler)
+	ToolSecurityMap = map[string]ToolSecurityMeta{}
 
 	// Base tools (bash/read/write/edit/delete) from tool_base.go.
 	registerToolSpecs(coreToolSpecs(true)...)
@@ -142,7 +141,8 @@ func InitTools() {
 
 	// Persistent tasks
 	registerToolSpecs(
-		spec("task_create", "Create a persistent file task. Optionally specify depends_on to set DAG dependencies.",
+		spec("task_create", "Create a persistent file task. Optionally specify depends_on to set DAG dependencies. "+
+			"The response includes the new task's id (e.g. {\"id\": 4, ...}) — always parse it rather than guessing; call task_list if you lose track.",
 			map[string]any{"subject": strProp(), "description": strProp(), "depends_on": intArrayProp()}, []string{"subject"}, security.ApproveSafe,
 			func(ctx context.Context, r json.RawMessage) ToolResult {
 				var a struct {
@@ -165,7 +165,8 @@ func InitTools() {
 				}
 				return llm.MkOk(App.TaskMgr().Get(a.TaskID))
 			}),
-		spec("task_update", "Update task STATUS only (pending/in_progress/completed/deleted). Cannot modify description or subject - use task_create for new tasks with different descriptions.",
+		spec("task_update", "Update task STATUS only (pending/in_progress/completed/deleted). Cannot modify description or subject - use task_create for new tasks with different descriptions. "+
+			"Verify the task id exists (task_list) before updating, and use task_dag first if unsure about dependency ordering.",
 			map[string]any{"task_id": intProp(), "status": enumProp("pending", "in_progress", "completed", "deleted")}, []string{"task_id"}, security.ApproveSafe,
 			func(ctx context.Context, r json.RawMessage) ToolResult {
 				var a struct {
@@ -191,7 +192,7 @@ func InitTools() {
 
 	// DAG dependency tools
 	registerToolSpecs(
-		spec("task_add_dep", "Add a DAG dependency: `from` must complete before `to` can start.", map[string]any{"from": intProp(), "to": intProp()}, []string{"from", "to"}, security.ApproveSafe,
+		spec("task_add_dep", "Add a DAG dependency: `from` must complete before `to` can start. Both task ids must already exist (check task_list if unsure).", map[string]any{"from": intProp(), "to": intProp()}, []string{"from", "to"}, security.ApproveSafe,
 			func(ctx context.Context, r json.RawMessage) ToolResult {
 				var a struct {
 					From int `json:"from"`
@@ -324,7 +325,9 @@ func InitTools() {
 
 	// Memory tools
 	registerToolSpecs(
-		spec("memory_write", "Save an important fact or observation to long-term memory. Use category=change_log to record a code modification with its rationale - critical for later spotting emergent bugs from combined changes.",
+		spec("memory_write", "Save an important fact or observation to long-term memory. Categories: preference (user settings, highest recall priority), "+
+			"lesson (bugs/gotchas, high priority), change_log (a code modification + its rationale + risk reasoning — used later to spot emergent bugs "+
+			"from combined changes, mid-high priority), fact (project facts/architecture, standard), context (temporary, decays fast).",
 			map[string]any{
 				"content":  strProp(),
 				"category": enumProp("preference", "fact", "lesson", "context", "change_log"),

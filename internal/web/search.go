@@ -29,19 +29,9 @@ type SearchResult struct {
 	Snippet string
 }
 
-// Searcher is the pluggable backend interface every search provider
-// implements (DuckDuckGo, SearXNG, Tavily, Brave, ...). Kept minimal
-// deliberately: query in, ranked results out, or an error - anything
-// backend-specific (auth headers, endpoint shape, result parsing)
-// stays inside that backend's own implementation.
+// Searcher is the backend interface every search provider implements.
 type Searcher interface {
-	// Search returns up to limit results for query, or an error if the
-	// backend could not be reached / returned no usable data. An empty
-	// (nil, nil) result is treated the same as an error by chainSearcher
-	// (nothing useful came back), so implementations may return either.
 	Search(ctx context.Context, query string, limit int) ([]SearchResult, error)
-	// Name identifies the backend for logging/diagnostics and for the
-	// "all backends failed" aggregate error message.
 	Name() string
 }
 
