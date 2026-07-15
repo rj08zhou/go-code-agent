@@ -56,20 +56,9 @@ type AppContext struct {
 // main() via NewApp after CLI/env config is parsed.
 var App *AppContext
 
-// NewApp constructs the AppContext and every workdir-global subsystem
-// it owns: Skills, MemStore, MCPMgr (with its on-disk config loaded),
-// PromptLoader and SessionManager. main supplies the model id, the
-// project workdir, the resolved dataDir (per-project state directory)
-// and the bash command validator (security policy is a cmd-layer
-// choice); it gets back a fully wired root object. main never needs to
-// know any subsystem's constructor signature.
-//
-// Note the split: workdir is the project the agent edits and runs
-// commands in (skills, MCP config, file tools all live there), while
-// dataDir is where persistent state (memory, sessions, permissions,
-// usage, HITL audit) is stored - normally under the user-level config
-// dir rather than inside the project. This keeps the code directory
-// clean and lets the same project map to the same state across launches.
+// NewApp constructs the AppContext and every workdir-global subsystem.
+// workdir = project root the agent edits; dataDir = per-project state
+// (memory, sessions, permissions), normally under the user-level config dir.
 func NewApp(model, workdir, dataDir string, bashValidate session.BashValidator) *AppContext {
 	skills := skill.NewSkillLoader(utils.JoinWorkdir(workdir, "skills"))
 	if skills.Len() == 0 {
@@ -113,14 +102,6 @@ func NewApp(model, workdir, dataDir string, bashValidate session.BashValidator) 
 	}
 }
 
-// ActivateSession makes sess the active session: binds it into
-// SessionManager, rebuilds the per-session TeammateManager, and
-// regenerates the system prompt from it. These three steps must
-// always happen together (the system prompt and TeamMgr are only
-// ever valid for whichever session is currently active) - this
-// method is the single place that performs them, called both from
-// main()'s initial bootstrap and from repl_commands.go's
-// sessionSwitchTo (previously duplicated verbatim in both places).
 func (a *AppContext) ActivateSession(sess *session.Session) {
 	a.SessionManager.Activate(sess)
 	wm := NewWorktreeManager(sess.Dir(), a.Workdir)
@@ -150,15 +131,7 @@ func (a *AppContext) DeactivateActiveSession() {
 	}
 }
 
-// ActiveSessionID returns the ID of the currently active session, or
-// "" if none is active - safe to call even before App/SessionManager
-// exist (nil receiver, nil SessionManager). Centralizes a nil-chain
-// (App != nil && SessionManager != nil && SessionManager.Active() !=
-// nil, then .Active().ID()) that was previously duplicated at every
-// call site needing the active session's ID without caring whether
-// one exists yet (main.go's usage session-id callback and post-turn
-// Touch, repl_commands.go's /session rename|archive, security.go's
-// HITL gate).
+// ActiveSessionID returns the ID of the currently active session, or "" if none.
 func (a *AppContext) ActiveSessionID() string {
 	if a == nil || a.SessionManager == nil {
 		return ""

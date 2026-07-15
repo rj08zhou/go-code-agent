@@ -19,9 +19,7 @@ import (
 	"time"
 )
 
-// TeammateManager - persistent named agents with WORK/IDLE cycle.
-// Lives in internal/agent (not a separate package) to directly use
-// package-level symbols (App, coreToolDefs, etc.).
+// TeammateManager manages persistent named agents with a WORK/IDLE cycle.
 
 type memberInfo struct {
 	Name   string `json:"name"`
@@ -89,11 +87,7 @@ func (tm *TeammateManager) setStatus(name, status string) {
 }
 
 func (tm *TeammateManager) Spawn(ctx context.Context, name, role, prompt string) string {
-	// Stagger consecutive spawns. Cheap per-process serialization: even
-	// when callers issue several Spawn() back-to-back from one reflect
-	// step, the goroutines start at least SpawnMinInterval apart so
-	// their first LLM calls don't all hit the gateway at the same
-	// instant. The wait is bounded by ctx.
+	// Stagger spawns so concurrent LLM calls don't all hit the gateway at once.
 	tm.spawnMu.Lock()
 	if !tm.lastSpawn.IsZero() {
 		gap := time.Since(tm.lastSpawn)

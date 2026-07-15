@@ -29,19 +29,8 @@ type memoryChunk struct {
 	Path     string
 	Text     string
 	Category string
-
-	// File/Line locate this chunk's exact source line for in-place
-	// rewrite (tryReplaceDuplicate) or removal (DeleteMemory) without
-	// re-scanning every daily file on disk. Line is the 0-indexed
-	// position within strings.Split(fileContents, "\n") — the same
-	// convention every read/rewrite site in this file uses.
-	//
-	// File is empty for chunks parsed out of the evergreen MEMORY.md:
-	// those are not per-line JSONL records and are not eligible for
-	// WriteMemory's dedup-replace or DeleteMemory (both only ever
-	// touch daily/*.jsonl).
-	File string
-	Line int
+	File     string // source file (empty for MEMORY.md; only daily/*.jsonl entries have File)
+	Line     int    // 0-indexed line in File
 }
 
 // categoryWeights controls search ranking priority by memory type.
@@ -169,11 +158,8 @@ func (ms *MemoryStore) WriteMemory(content, category string) string {
 	return fmt.Sprintf("Memory saved to %s.jsonl (%s)", today, category)
 }
 
-// tryReplaceDuplicate scans the in-memory chunk cache (no disk IO) for
-// a same-category daily entry similar to content. On a hit, it
-// rewrites only that entry's single line in its source file — not
-// every daily file, as the previous Glob+ReadFile-all-files version
-// did.
+// tryReplaceDuplicate scans the cache for a same-category daily entry
+// similar to content; rewrites that line in the source file on disk.
 func (ms *MemoryStore) tryReplaceDuplicate(content, category string, newTokens []string) string {
 	for i, c := range ms.chunks {
 		if c.File == "" || c.Category != category {
@@ -283,16 +269,7 @@ func (ms *MemoryStore) loadAllChunksFromDisk() []memoryChunk {
 	return chunks
 }
 
-// GetStats returns memory statistics.
-//
-// Unlike WriteMemory/tryReplaceDuplicate/DeleteMemory (which now search
-// the in-memory chunk cache instead of re-reading every daily file),
-// this intentionally stays disk-based: it is only called from the
-// startup banner and the `/memory` REPL command — not the per-turn hot
-// path — and daily jsonl files are occasionally created/edited outside
-// the WriteMemory API (tests do this; so could an operator), which the
-// write-through cache has no way to observe. Trading a rarely-called
-// O(N) disk scan for guaranteed freshness is the right call here.
+// GetStats returns memory statistics (disk-based for fresh counts, not from cache).
 func (ms *MemoryStore) GetStats() (evergreenChars, dailyFiles, dailyEntries int) {
 	evergreenChars = len(ms.LoadEvergreen())
 	files, _ := filepath.Glob(filepath.Join(ms.memoryDir, "*.jsonl"))
