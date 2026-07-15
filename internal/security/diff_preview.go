@@ -11,30 +11,8 @@ import (
 )
 
 // ReadLine reads one line of interactive user input for confirmation
-// prompts (diff preview, bash confirmation, HITL approval, ...).
-//
-// It defaults to reading directly from os.Stdin, but main() overrides
-// it to go through the same chzyer/readline Instance that drives the
-// main REPL loop. That override matters: once readline.NewEx creates
-// an Instance, it owns the terminal in raw mode for the rest of the
-// process's life (not just while its own Readline() call is in
-// flight). A second, independent reader on os.Stdin - fmt.Scanln or a
-// fresh bufio.Reader, as this file and internal/hitlaudit used to use
-// - races with readline's raw-mode key handling: keystrokes are
-// consumed by readline's internal buffer without producing visible
-// echo or a clean line for our reader, so Scanln/ReadString return
-// near-instantly with an empty/garbage answer. Every confirmation
-// prompt then falls through to its "invalid option" branch and
-// silently auto-rejects, no matter what the operator types (this is
-// exactly what caused every diff-preview chunk in a real session to
-// print "Invalid option, rejecting chunk" without giving the user a
-// chance to respond). Reusing the one Instance that already owns the
-// terminal is the fix - it enters/exits raw mode correctly around a
-// single line read, with proper echo.
-//
-// Any package needing a blocking interactive line of input (bash
-// confirmation, diff preview, HITL approval) should call ReadLine
-// instead of touching os.Stdin directly.
+// prompts. Overridable by main() to route through the readline instance
+// that owns the terminal, so confirmation prompts work in raw mode.
 var ReadLine = defaultReadLine
 
 func defaultReadLine() (string, error) {
@@ -42,13 +20,6 @@ func defaultReadLine() (string, error) {
 	return strings.TrimSpace(line), err
 }
 
-// P0-5: Diff Preview System
-//
-// Generates unified diff and asks for user confirmation before file modifications.
-// This provides a "git diff" like experience before applying changes.
-
-// GenerateUnifiedDiff creates a unified diff format string between old and new content.
-// It uses the system 'diff' command for accurate diff generation.
 func GenerateUnifiedDiff(oldContent, newContent, filename string) (string, error) {
 	// Create temporary files for old and new content
 	oldTmp, err := os.CreateTemp("", "old-*.txt")
@@ -426,14 +397,7 @@ func applyAcceptedHunks(oldContent, filename string, hunks []diffHunk, accepted 
 	return string(patched), nil
 }
 
-// ShouldPreviewDiff determines if we should show diff preview.
-//
-// By default it returns true so the user always sees and confirms
-// changes. When the session has auto-approved all tools (i.e. the
-// operator ran /approve danger, which gates every tool including
-// destructive ones), the diff preview is skipped too - /approve danger
-// is an explicit "trust everything, don't interrupt me" signal, so
-// showing a per-chunk preview would just be noise.
+// ShouldPreviewDiff returns false when the operator ran /approve danger.
 func ShouldPreviewDiff() bool {
 	return !GlobalApproval.IsAutoApproveAll()
 }
