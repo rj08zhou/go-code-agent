@@ -230,8 +230,12 @@ func secureRunBash(ctx context.Context, command string, interactive bool) string
 }
 
 // secureReadFile reads a file after validating its path through the securePath sandbox.
-// Optimized version: uses buffered scanner for memory efficiency and supports line limit.
+// Uses a buffered scanner for memory efficiency. When offset and limit are both 0,
+// ReadFileDefaultLimit is applied to avoid injecting an entire large file at once.
 func secureReadFile(ctx context.Context, path string, offset, limit int) string {
+	if offset == 0 && limit == 0 {
+		limit = infra.ReadFileDefaultLimit
+	}
 	fp, err := security.SecurePath(workdirFromCtx(ctx), path, false)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
@@ -274,11 +278,25 @@ func secureReadFile(ctx context.Context, path string, offset, limit int) string 
 
 	result := buf.String()
 
+	// Hint the model to page when the default cap truncated the file.
+	if offset == 0 && limit == infra.ReadFileDefaultLimit && hasMoreLines(f) {
+		result += fmt.Sprintf("\n... (showing first %d lines; pass a larger `limit` or an `offset` to read more)", infra.ReadFileDefaultLimit)
+	}
+
 	// Sanitize secrets from file content (only if content is not too large)
 	if len(result) < 50000 && security.GlobalSecretsSanitizer.Detect(result) {
 		result = security.GlobalSecretsSanitizer.Sanitize(result)
 	}
 	return result
+}
+
+// hasMoreLines reports whether the file has unread content past the scanner position.
+func hasMoreLines(f *os.File) bool {
+	pos, _ := f.Seek(0, 1)
+	defer f.Seek(pos, 0)
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1024*64), 64*1024)
+	return scanner.Scan()
 }
 
 // countRemainingLines estimates remaining lines (capped at 1000).

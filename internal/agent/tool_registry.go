@@ -21,13 +21,12 @@ import (
 // the comment on ToolSpec for why this matters.
 
 // InitTools (re)builds the global tool registry. Safe to call again
-// (e.g. after /mcp connect|disconnect) — it starts from empty maps.
+// (e.g. after /mcp connect|disconnect) — all three registries are
+// reset to empty first, so repeated calls never accumulate duplicates.
 func InitTools() {
-	// ToolHandlers is a package-level nil map until initialized here;
-	// registerToolSpec assigns into it directly (ToolDefs/ToolSecurityMap
-	// don't need this: append() tolerates a nil slice, and
-	// ToolSecurityMap is already non-nil — see security.go).
+	ToolDefs = nil
 	ToolHandlers = make(map[string]ToolHandler)
+	ToolSecurityMap = map[string]ToolSecurityMeta{}
 
 	// Base tools (bash/read/write/edit/delete) from tool_base.go.
 	registerToolSpecs(coreToolSpecs(true)...)
