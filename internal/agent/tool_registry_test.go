@@ -68,3 +68,57 @@ func TestInitTools_RegistryConsistency(t *testing.T) {
 		}
 	}
 }
+
+// TestInitTools_Idempotent ensures repeated InitTools() calls don't
+// accumulate tool definitions — each call must fully rebuild from empty.
+func TestInitTools_Idempotent(t *testing.T) {
+	savedApp := App
+	savedDefs, savedHandlers, savedSecurity := ToolDefs, ToolHandlers, ToolSecurityMap
+	t.Cleanup(func() {
+		App = savedApp
+		ToolDefs, ToolHandlers, ToolSecurityMap = savedDefs, savedHandlers, savedSecurity
+	})
+
+	App = &AppContext{} // MCPMgr nil => no MCP tools appended
+	ToolDefs = nil
+	ToolHandlers = nil
+	ToolSecurityMap = map[string]ToolSecurityMeta{}
+
+	InitTools()
+	firstCount := len(ToolDefs)
+	firstNames := map[string]bool{}
+	for _, d := range ToolDefs {
+		firstNames[d.Name] = true
+	}
+	if firstCount == 0 {
+		t.Fatal("first InitTools() produced no tool definitions")
+	}
+
+	// Second call must NOT grow the registries — it rebuilds from empty.
+	InitTools()
+	secondCount := len(ToolDefs)
+
+	if secondCount != firstCount {
+		t.Fatalf("InitTools() is not idempotent: first call produced %d defs, second produced %d (ToolDefs not reset between calls — tool schema would accumulate and inflate per-request tokens)",
+			firstCount, secondCount)
+	}
+
+	// Names must still be unique after the second call.
+	seen := map[string]bool{}
+	for _, d := range ToolDefs {
+		if seen[d.Name] {
+			t.Fatalf("tool %q appears more than once in ToolDefs after repeated InitTools() — registry was not reset", d.Name)
+		}
+		seen[d.Name] = true
+	}
+
+	// Every advertised tool must still resolve to a handler + security level.
+	for _, d := range ToolDefs {
+		if _, ok := ToolHandlers[d.Name]; !ok {
+			t.Errorf("after second InitTools(): tool %q has a Def but no Handler", d.Name)
+		}
+		if _, ok := ToolSecurityMap[d.Name]; !ok {
+			t.Errorf("after second InitTools(): tool %q has a Def but no security Level", d.Name)
+		}
+	}
+}
