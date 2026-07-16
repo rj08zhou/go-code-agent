@@ -19,59 +19,67 @@ func runSubagent(ctx context.Context, prompt, agentType string) string {
 	subTools := coreToolDefs(false)
 	subHandlers := coreToolHandlers(false)
 
+	// Inject type-specific tools.
+	switch agentType {
+	case "web_fetch":
+		raw := rawWebFetchSpec()
+		subTools = append(subTools, raw.Def)
+		subHandlers[raw.Def.Name] = raw.Handler
+	}
+
 	role := agentType
 	if role == "" {
 		role = "Explore"
 	}
-	sysPrompt := fmt.Sprintf(
-		"You are a coding subagent (role=%s). You can read files and run safe shell "+
-			"commands to investigate, but you have NO write/edit/delete tools. "+
-			"Investigate efficiently: when you need a specific fact, symbol, constant "+
-			"or a few lines, locate it first with grep/rg via bash (e.g. rg -n \"Name\" .) "+
-			"and read only the relevant part (pass read_file's `limit` for large files). "+
-			"Do NOT read entire large files just to check one value - it burns context "+
-			"and triggers compaction. "+
-			"If the task requires modifying files, do the investigation, then "+
-			"return a concise summary describing exactly what change is needed "+
-			"and why — the parent agent will perform the write.",
-		role,
-	)
+
+	// Build a role-tailored system prompt.
+	var sysPrompt string
+	switch agentType {
+	case "web_fetch":
+		sysPrompt = fmt.Sprintf(
+			"You are a web research subagent (role=%s). You fetch and analyze web pages, then return a concise summary to the parent agent. "+
+				"You can also read local files and run safe shell commands for reference. "+
+				"You have NO write/edit/delete tools. "+
+				"Use web_fetch to retrieve the target page. Read the content carefully, then answer the user's question directly from the page. "+
+				"Keep your response focused and relevant — do NOT add unrelated commentary or repeat boilerplate.",
+			role,
+		)
+	default:
+		sysPrompt = fmt.Sprintf(
+			"You are a coding subagent (role=%s). You can read files and run safe shell "+
+				"commands to investigate, but you have NO write/edit/delete tools. "+
+				"Investigate efficiently: when you need a specific fact, symbol, constant "+
+				"or a few lines, locate it first with grep/rg via bash (e.g. rg -n \"Name\" .) "+
+				"and read only the relevant part (pass read_file's `limit` for large files). "+
+				"Do NOT read entire large files just to check one value - it burns context "+
+				"and triggers compaction. "+
+				"If the task requires modifying files, do the investigation, then "+
+				"return a concise summary describing exactly what change is needed "+
+				"and why — the parent agent will perform the write.",
+			role,
+		)
+	}
 
 	msgs := []llm.Message{
 		llm.SystemMessage(sysPrompt),
 		llm.UserMessage(prompt),
 	}
 
-	// softDeadline lets us return an honest "here's what I found so far"
-	// summary instead of being hard-killed by the caller's ctx deadline
-	// (runToolWithTimeout's toolTimeoutOverrides["task"], see loop.go)
-	// with the entire investigation discarded. Only armed when ctx
-	// actually carries a deadline (it always does via the task tool
-	// path, but callers/tests may pass a bare context.Background()).
 	var softDeadline time.Time
 	if dl, ok := ctx.Deadline(); ok {
 		softDeadline = dl.Add(-infra.SubagentSoftDeadlineBuffer)
 	}
 
-	// steps is a lightweight, append-only trail of what the subagent
-	// actually did (tool name + a short arg hint per call). Cheap to
-	// maintain, and is exactly the information that used to be thrown
-	// away on timeout - the parent had to re-read every file from
-	// scratch to rediscover what the subagent had already found.
 	var steps []string
 	var lastContent string
 	timedOut := false
 
-roundLoop:
 	for range infra.SubagentMaxRounds {
 		if !softDeadline.IsZero() && !time.Now().Before(softDeadline) {
 			timedOut = true
 			break
 		}
 		if ctx.Err() != nil {
-			// Real cancellation (Ctrl-C, parent already gone) - no
-			// point drafting a summary nobody will read, but still
-			// distinguish it in the fallback message below.
 			timedOut = true
 			break
 		}
@@ -79,14 +87,9 @@ roundLoop:
 		sr, err := llm.NewClient(nil).StreamWithRetrySink(ctx, "subagent", llm.CallParams{Model: App.Model, Messages: msgs, Tools: subTools, MaxTokens: infra.DefaultMaxOutputTokens},
 			&llm.PrefixedStreamSink{Prefix: "[sub]", Color: logging.ColorCyan})
 		if err != nil {
-			// A ctx-deadline/cancellation error surfacing from the LLM
-			// call itself is just the hard ceiling catching up to us
-			// slightly before our own soft check did - treat it the
-			// same as a soft-deadline stop rather than a hard failure,
-			// so the caller still gets the partial-progress summary.
 			if ctx.Err() != nil {
 				timedOut = true
-				break roundLoop
+				break
 			}
 			return fmt.Sprintf("Subagent error: %v", err)
 		}
@@ -134,6 +137,7 @@ func subagentArgHint(rawArgs string) string {
 		Path    string `json:"path"`
 		Command string `json:"command"`
 		Query   string `json:"query"`
+		URL     string `json:"url"`
 	}
 	if json.Unmarshal([]byte(rawArgs), &a) == nil {
 		switch {
@@ -143,6 +147,8 @@ func subagentArgHint(rawArgs string) string {
 			return utils.Truncate(a.Command, 60)
 		case a.Query != "":
 			return utils.Truncate(a.Query, 60)
+		case a.URL != "":
+			return utils.Truncate(a.URL, 60)
 		}
 	}
 	return utils.Truncate(rawArgs, 60)

@@ -137,6 +137,14 @@ func PrintAgentEnd() {
 	agentBuf = nil
 }
 
+// PrintThinkingHeader emits a single dim "深度思考" section marker
+// before the model's reasoning text begins streaming. This gives the
+// user a visual partition between tool output and the next round of
+// reasoning, without changing the color of the reasoning text itself.
+func PrintThinkingHeader() {
+	fmt.Printf("%s💭 深度思考%s\n", ColorDim, ColorReset)
+}
+
 // PrintTool prints a tool execution result (truncated for terminal
 // readability — full text still hits the file handler via the message).
 func PrintTool(name, output string) {

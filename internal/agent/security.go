@@ -176,8 +176,8 @@ func secureRunBash(ctx context.Context, command string, interactive bool) string
 			return fmt.Sprintf("\u26a0\ufe0f Command requires confirmation (non-interactive): %s\n"+
 				"Use /approve danger to auto-approve, or run interactively.", reason)
 		}
-		fmt.Printf("\u26a0\ufe0f [CONFIRM] %s\n   Command: %s\n   Allow? [y/N]: ", reason, command)
-		line, _ := security.ReadLine()
+		fmt.Printf("\u26a0\ufe0f [CONFIRM] %s\n   Command: %s\n", reason, command)
+		line, _ := security.ReadLine("   Allow? [y/N]: ")
 		answer := strings.ToLower(strings.TrimSpace(line))
 		if answer != "y" && answer != "yes" {
 			return "\u274c User rejected the command"
@@ -189,8 +189,8 @@ func secureRunBash(ctx context.Context, command string, interactive bool) string
 		if !interactive {
 			return fmt.Sprintf("\u274c %s", msg)
 		}
-		fmt.Printf("%s\n   Allow? [y/N]: ", msg)
-		line, _ := security.ReadLine()
+		fmt.Println(msg)
+		line, _ := security.ReadLine("   Allow? [y/N]: ")
 		answer := strings.ToLower(strings.TrimSpace(line))
 		if answer != "y" && answer != "yes" {
 			return "\u274c User rejected the command"

@@ -10,12 +10,15 @@ import (
 	"strings"
 )
 
-// ReadLine reads one line of interactive user input for confirmation
-// prompts. Overridable by main() to route through the readline instance
-// that owns the terminal, so confirmation prompts work in raw mode.
+// ReadLine reads one line of interactive user input, displaying the
+// given prompt. Overridable by main() to route through the readline
+// instance that owns the terminal, so confirmation prompts work in
+// raw mode. The prompt is displayed by the implementation (not by the
+// caller) so that readline's line-refresh logic doesn't erase it.
 var ReadLine = defaultReadLine
 
-func defaultReadLine() (string, error) {
+func defaultReadLine(prompt string) (string, error) {
+	fmt.Print(prompt)
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	return strings.TrimSpace(line), err
 }
@@ -185,9 +188,8 @@ func previewSingleHunk(path string, hunk diffHunk, fullDiff string) bool {
 	coloredDiff := colorizeDiff(fullDiff)
 	fmt.Println(coloredDiff)
 	fmt.Println()
-	fmt.Print("  [A]pply  [R]eject  [D]iff again  [Q]uit: ")
 
-	line, _ := ReadLine()
+	line, _ := ReadLine("  [A]pply  [R]eject  [D]iff again  [Q]uit: ")
 	answer := strings.ToLower(strings.TrimSpace(line))
 
 	switch answer {
@@ -238,9 +240,7 @@ func previewChunkByChunk(path, oldContent, newContent string, hunks []diffHunk) 
 		fmt.Println(coloredHunk)
 		fmt.Println()
 
-		fmt.Print("  [A]ccept  [R]eject  a[L]l accept  [N]o all  [D]iff again  [Q]uit: ")
-
-		line, _ := ReadLine()
+		line, _ := ReadLine("  [A]ccept  [R]eject  a[L]l accept  [N]o all  [D]iff again  [Q]uit: ")
 		answer := strings.ToLower(strings.TrimSpace(line))
 
 		switch answer {
@@ -301,8 +301,7 @@ func previewChunkByChunk(path, oldContent, newContent string, hunks []diffHunk) 
 	finalContent, err := applyAcceptedHunks(oldContent, path, hunks, acceptedHunks)
 	if err != nil {
 		fmt.Printf("  ⚠️  Partial apply failed: %v\n", err)
-		fmt.Print("  Apply ALL changes instead? [y/N]: ")
-		ansLine, _ := ReadLine()
+		ansLine, _ := ReadLine("  Apply ALL changes instead? [y/N]: ")
 		ans := strings.ToLower(strings.TrimSpace(ansLine))
 		if ans == "y" || ans == "yes" {
 			return newContent, true

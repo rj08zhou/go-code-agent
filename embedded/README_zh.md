@@ -208,7 +208,7 @@ agentLoop(ctx, &conv)
   │    └─ drain team inbox → 注入为用户消息
   │
   ├─ [gates]
-  │    ├─ think-gate (round 0): 规划前强制使用 `think` 工具
+  │    ├─ think-gate (round 0): 规划前强制进行纯文本深度思考（打印 `💭 深度思考` 标记）
   │    ├─ planning-gate (round 1): 执行前强制创建任务
   │    └─ write-gate: 文件写入前要求计划审批（teammate）
   │
@@ -366,12 +366,12 @@ go-code-agent/
 │   │   ├── judge.go              #   LLM-as-Judge 完成后验证器
 │   │   ├── decisions.go          #   自主决策审计轨迹（decisions.jsonl，/decisions）
 │   │   ├── compression.go        #   microCompact + autoCompact（token 管理）
-│   │   ├── subagent.go           #   只读子 Agent 生成器（task 工具）
+│   │   ├── subagent.go           #   `explore` 只读子 Agent 生成器（多文件调查委托，隔离上下文）
 │   │   ├── team.go               #   TeammateManager：WORK/IDLE 自治循环
-│   │   ├── tool_registry.go      #   工具定义（30+ 工具在此注册）
-│   │   ├── tool_base.go          #   基础工具处理器（bash、文件、think 等）
-│   │   ├── web_tools.go          #   web_fetch/web_search 工具（格式化+密钥脱敏）
-│   │   ├── system_prompt.go      #   系统提示词组装
+│   │   ├── tool_registry.go      #   工具定义（34+ 工具在此注册）
+│   │   ├── tool_base.go          #   基础工具处理器（bash、文件、compress 等）
+│   │   ├── web_tools.go          #   web_fetch（子代理摘要+密钥脱敏）/web_search（直连列表）工具
+│   │   ├── system_prompt.go      #   系统提示词组装（提示词从内嵌二进制加载）
 │   │   ├── security.go           #   工具安全注册表、checkToolApproval、HITL 门控 glue
 │   │   ├── snapshot.go           #   基于 git-stash 的 Saga 模式快照/回滚
 │   │   └── log_file.go           #   每会话文件日志（session.log）
@@ -440,8 +440,8 @@ go-code-agent/
 ├── utils/                        # 共享工具函数
 │   └── utils.go                  # 路径辅助函数（JoinWorkdir、Truncate 等）
 │
-├── prompts/                      # 提示词模板（*.md）
-│   ├── system.md                 # 主系统提示词模板
+├── prompts/                      # 提示词模板（*.md）→ 通过 prompts/embed.go 编译期内嵌为二进制
+│   ├── system.md                 # 主系统提示词模板（embed.go 内嵌，运行时不依赖 {workdir}/prompts/）
 │   ├── think_required.md         # Think-gate 注入内容
 │   ├── planning_required.md      # Planning-gate 注入内容
 │   ├── strategy_change.md        # Strategy-change 反思内容
@@ -478,7 +478,7 @@ go-code-agent/
 | `/session archive [id]` | 归档会话（从活跃列表中移除） |
 | `/compact` | 手动触发对话压缩（LLM 摘要） |
 | `/tasks` | 列出当前会话中所有任务及其状态 |
-| `/dag` | 展示 DAG 执行计划（拓扑阶段） |
+| `/dag` | 展示 DAG 执行计划（拓扑阶段）。互不相关的任务批次（互不连通的分量）会被拆分为各自独立、带标签的 `Workflow`，每个 `Workflow` 内给出确定性的执行顺序 |
 | `/decisions` | 显示当前会话的自主决策审计轨迹（decisions.jsonl） |
 | `/team` | 列出活跃 teammates 及其状态（WORK/IDLE） |
 | `/inbox` | 读取主导 Agent 的收件箱消息 |
@@ -528,8 +528,9 @@ go-code-agent/
 
 | 工具 | 说明 |
 |------|------|
-| `think` | 推理暂存区（不发送给用户，持久化在上下文中） |
 | `compress` | 手动触发上下文压缩 |
+
+> **深度思考**：`think` 工具已移除。Agent 现在以纯文本进行结构化深度思考（带权衡分析），并在每轮推理前打印 `💭 深度思考` 暗色分隔标记呈现给用户，不再占用工具调用。
 
 ### 规划与任务
 
@@ -549,7 +550,7 @@ go-code-agent/
 
 | 工具 | 说明 |
 |------|------|
-| `task` | 生成只读子 Agent 用于研究/分析（30 轮上限） |
+| `explore` | 委托多文件调查给只读子 Agent（30 轮上限）。子 Agent 在自身隔离上下文中读文件/跑安全 shell，只回传简洁摘要，原始文件内容不进入主 Agent 上下文——适合架构梳理、跨多文件的调用链追踪等需要阅读大量源码的场景 |
 | `load_skill` | 将技能定义加载到上下文中 |
 
 ### 后台执行
@@ -563,8 +564,8 @@ go-code-agent/
 
 | 工具 | 说明 |
 |------|------|
-| `web_fetch` | 抓取公开 URL 并返回其可读文本（HTML → 纯文本；默认拦截内网/私有地址） |
-| `web_search` | 通过零配置降级链（SearXNG → DuckDuckGo）搜索网络，或使用配置的付费后端（Tavily/Brave） |
+| `web_fetch` | 抓取公开 URL 并返回**简洁摘要**（HTML → 纯文本后交由只读子 Agent 消化，原始页面内容不进入主 Agent 上下文；默认拦截内网/私有地址）。可选 `prompt` 参数可指定子 Agent 针对具体问题回答 |
+| `web_search` | 通过零配置降级链（SearXNG → DuckDuckGo）搜索网络，或使用配置的付费后端（Tavily/Brave）。**直连**返回紧凑的 title/url/snippet 列表，主 Agent 需要看到 URL 以决定下一步 fetch |
 
 这两个工具背后的安全模型详见[网络访问与 SSRF 防护](#网络访问与-ssrf-防护)章节。
 
@@ -650,10 +651,10 @@ LLM_PROVIDER 环境变量已设置？
 
 | 级别 | 行为 |
 |------|------|
-| `auto` | 所有工具无需确认直接执行 |
-| `safe` | 仅"安全"工具自动执行；其他工具提示确认 |
-| `danger` | 所有工具均需确认 |
-| `off` | 审批系统禁用 |
+| `auto`（默认） | 只读/自动批准类工具无需确认直接执行；安全级和危险级工具仍需确认 |
+| `safe` | 仅"安全"类工具自动执行；危险级工具仍需确认 |
+| `danger`（别名 `all`） | **所有**工具（含破坏性工具）全部无需确认直接执行——最宽松级别（请谨慎使用） |
+| `off`（别名 `reset`） | 所有工具都需要手动确认（关闭自动审批） |
 
 运行时使用 `/approve [level]` 切换。
 
@@ -669,7 +670,7 @@ LLM_PROVIDER 环境变量已设置？
 
 ### 额外安全特性
 
-- **Diff 预览**：任何文件修改前在终端显示统一 diff
+- **Diff 预览**：任何文件修改前在终端显示统一 diff。当自动审批完全开启（`/approve danger`/`all`）时，逐块 diff 预览也会一并跳过——该模式表示完全信任、用于非交互式运行，此时冗长 diff 只会变成噪声
 - **HITL 审批**：4 种模式（interactive/auto-approve/auto-reject/notify-only）
 - **快照/回滚**：基于 git-stash 的 Saga 模式，用于写工具（通过 `SNAPSHOT_ENABLED=1` 选择启用）
 - **每工具超时**：5 分钟硬性上限，防止挂起的处理器冻结 REPL
@@ -708,7 +709,7 @@ LLM_PROVIDER 环境变量已设置？
 
 ### 不可信内容处理
 
-`web_fetch` 抓取的正文在加入对话前会被显式的 `BEGIN/END UNTRUSTED PAGE CONTENT` 标记包裹——提示模型将其当作"待阅读的数据"而非"待执行的指令"（防御来自被抓取页面的提示词注入）。两个工具的输出都会经过与 bash/文件工具相同的 `SecretsSanitizer` 脱敏处理，因为抓取到的页面可能反射出看起来像凭证的文本。
+`web_fetch` 现在采用**子代理隔离**模式：页面由只读 `web_fetch` 子代理拉取并消化，**原始页面内容不进入主 Agent 上下文**，子代理只回传简洁摘要（模仿用轻量模型消化网页的做法，既节省上下文也降低注入面）。可选的 `prompt` 参数可让子代理针对具体问题作答。两个工具的输出都会经过与 bash/文件工具相同的 `SecretsSanitizer` 脱敏处理，因为抓取到的页面可能反射出看起来像凭证的文本。
 
 ---
 
@@ -717,7 +718,7 @@ LLM_PROVIDER 环境变量已设置？
 ### Think → Plan → Act → Reflect 循环
 
 ```
-Round 0:  [think-gate] → 强制 Agent 先使用 `think` 工具
+Round 0:  [think-gate] → 强制 Agent 先进行纯文本深度思考（打印 `💭 深度思考` 标记）
 Round 1:  [planning-gate] → 强制创建任务（如果查询 > 80 字符）
 Round 2+: [execution] → Agent 执行任务
 每 5 轮:  [periodic reflection] → Agent 回顾进展
@@ -726,6 +727,8 @@ Round 2+: [execution] → Agent 执行任务
 10 轮后:  [stuck detection] → 通知 Agent 已卡住
 100 轮:   [maxRounds] → 硬性停止
 ```
+
+> **深度思考机制**：原 `think` 工具已移除。Agent 改为以纯文本进行结构化思考（含权衡分析），在每轮 LLM 推理前打印暗色 `💭 深度思考` 分隔标记，渲染为「深度思考」区块呈现给用户。多文件/架构级调查应直接委托 `explore` 子代理，而非手动 `list_dir`/`bash` 遍历（详见[系统提示词 Exploration Strategy](#agentic-特性)）。
 
 ### DAG 调度器
 

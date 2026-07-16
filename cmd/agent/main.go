@@ -60,7 +60,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -80,7 +79,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/chzyer/readline"
 )
@@ -265,38 +263,26 @@ func main() {
 	}
 	defer rl.Close()
 
-	// Route interactive confirmation prompts (diff preview, bash confirm,
-	// HITL approval) through a cooked-mode read on os.Stdin. Between
-	// rl.Readline() calls the terminal is in cooked mode, so a plain
-	// ReadString works. We exit raw mode defensively and drain stdin to
-	// clear stray \r/\n left by the raw→cooked transition.
-	security.ReadLine = func() (string, error) {
-		_ = rl.Terminal.ExitRawMode()
+	security.ReadLine = func(prompt string) (string, error) {
+		saved := rl.Config.Prompt
+		rl.SetPrompt(prompt)
+		defer rl.SetPrompt(saved)
 
-		// 1. 启动一个 goroutine 来读取一行
-		lineChan := make(chan string, 1)
-		errChan := make(chan error, 1)
-		go func() {
-			reader := bufio.NewReader(os.Stdin)
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				errChan <- err
-				return
+		for attempt := 0; attempt < 3; attempt++ {
+			line, err := rl.Readline()
+			if err == readline.ErrInterrupt {
+				return "", nil
 			}
-			lineChan <- strings.TrimSpace(line)
-		}()
-
-		// 2. 使用 select 等待结果，并设置超时防止永久阻塞
-		select {
-		case line := <-lineChan:
-			return line, nil
-		case err := <-errChan:
-			return "", err
-		case <-time.After(100 * time.Millisecond): // 等待100ms，可根据需要调整
-			// 超时了，没有输入。这里返回空字符串和 nil 错误
-			// 你的逻辑可能需要在这里处理“无输入”的情况
-			return "", nil
+			if err != nil {
+				return "", err
+			}
+			line = strings.TrimSpace(line)
+			if line != "" {
+				return line, nil
+			}
+			fmt.Print("\033[1A\033[2K")
 		}
+		return "", nil
 	}
 
 	for {
@@ -318,8 +304,6 @@ func main() {
 			continue
 		}
 
-		// One-shot resume boundary: not persisted, placed before the
-		// user's message so the model reads guidance first.
 		if resumeBoundaryPending {
 			conv = append(conv, llm.UserMessage(resumeBoundaryNote))
 			resumeBoundaryPending = false
@@ -334,14 +318,11 @@ func main() {
 		}
 
 		before := len(conv)
-		// AutoCompact may replace conv mid-turn; WithPersistedBoundary
-		// keeps `before` in sync.
 		runCtx := agent.WithPersistedBoundary(ctx, &before)
 		if err := agent.Run(runCtx, &conv); err != nil {
 			logging.PrintError(err.Error())
 			continue
 		}
-		// Defensive clamp in case any path missed the remap above.
 		if before > len(conv) {
 			before = len(conv)
 		}

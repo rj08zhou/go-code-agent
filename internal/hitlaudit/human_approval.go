@@ -583,11 +583,10 @@ func (h *HITLManager) promptInteractive(req HITLRequest) HITLResponse {
 	fmt.Println("  [y] approve  - run the tool as-is")
 	fmt.Println("  [n] reject   - veto, agent will pick another approach")
 	fmt.Println("  [m] modify   - veto and provide guidance to the agent")
-	fmt.Print("Your choice [y/n/m]: ")
 
 	reader := security.ReadLine
 	for {
-		raw, err := reader()
+		raw, err := reader("Your choice [y/n/m]: ")
 		if err != nil {
 			// stdin closed or unreadable: default to reject, never silently
 			// approve something that couldn't be confirmed.
@@ -603,13 +602,11 @@ func (h *HITLManager) promptInteractive(req HITLRequest) HITLResponse {
 			fmt.Println("[hitl] rejected")
 			return HITLResponse{Decision: HITLReject}
 		case "m", "modify":
-			fmt.Print("Feedback / instructions for the agent: ")
-			fb, _ := reader()
+			fb, _ := reader("Feedback / instructions for the agent: ")
 			fb = strings.TrimSpace(fb)
 			fmt.Println("[hitl] modified with feedback")
 			return HITLResponse{Decision: HITLModify, Feedback: fb}
 		default:
-			fmt.Print("Invalid option. Please enter y / n / m: ")
 		}
 	}
 }

@@ -1,34 +1,35 @@
 package prompt
 
 import (
-	"os"
-	"path/filepath"
+	"io/fs"
 	"strings"
+
+	"go-code-agent/prompts"
 )
 
 // Package prompt provides prompt template loading and rendering.
 //
-// Prompt templates live in {workdir}/prompts/{name}.md. This package
-// is dependency-free (no imports from internal/*) so any sub-package
-// can use it without creating circular imports.
+// Prompt templates are system-level assets embedded in the binary
+// (see prompts/embed.go). They are available regardless of the
+// working directory the agent is launched from.
 
-// Loader holds the directory path for prompt templates.
+// Loader reads prompt templates from the embedded filesystem.
 type Loader struct {
-	dir string
+	fsys fs.FS
 }
 
-// NewLoader creates a Loader rooted at the given directory.
-func NewLoader(promptsDir string) *Loader {
-	return &Loader{dir: promptsDir}
+// NewLoader creates a Loader backed by the embedded prompt files.
+func NewLoader() *Loader {
+	return &Loader{fsys: prompts.FS}
 }
 
-// Load reads a prompt template from {dir}/{name}.md.
-// Returns empty string if the file doesn't exist.
+// Load reads a prompt template named "{name}.md" from the embedded
+// prompts. Returns empty string if the file doesn't exist.
 func (l *Loader) Load(name string) string {
-	if l == nil || l.dir == "" {
+	if l == nil || l.fsys == nil {
 		return ""
 	}
-	data, err := os.ReadFile(filepath.Join(l.dir, name+".md"))
+	data, err := fs.ReadFile(l.fsys, name+".md")
 	if err != nil {
 		return ""
 	}

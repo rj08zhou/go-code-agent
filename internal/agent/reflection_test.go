@@ -14,7 +14,7 @@ import (
 func setupReflectApp(t *testing.T) *session.Session {
 	t.Helper()
 	dir := t.TempDir()
-	pl := prompt.NewLoader("") // empty dir -> LoadOr falls back to defaults
+	pl := prompt.NewLoader()
 	bv := func(string) (bool, bool, string) { return true, false, "" }
 	sm := session.NewSessionManager(dir, dir, "test-model", pl, nil, bv)
 	s, err := sm.NewSession("reflect-test")

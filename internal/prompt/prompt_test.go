@@ -1,10 +1,20 @@
 package prompt
 
 import (
-	"os"
-	"path/filepath"
+	"io/fs"
 	"testing"
+	"testing/fstest"
 )
+
+// newTestLoader returns a Loader backed by an in-memory filesystem
+// for testing, so individual tests can supply their own prompt content.
+func newTestLoader(files map[string]string) *Loader {
+	m := make(fstest.MapFS)
+	for name, content := range files {
+		m[name] = &fstest.MapFile{Data: []byte(content)}
+	}
+	return &Loader{fsys: m}
+}
 
 // --- Render ----------------------------------------------------------------
 
@@ -62,10 +72,10 @@ func TestRenderVarNameWithSpecialChars(t *testing.T) {
 
 // --- Loader.Load -----------------------------------------------------------
 
-func TestLoadEmptyDirReturnsEmpty(t *testing.T) {
-	l := NewLoader("")
+func TestLoadNilFSReturnsEmpty(t *testing.T) {
+	l := &Loader{fsys: nil}
 	if got := l.Load("system"); got != "" {
-		t.Errorf("Load with empty dir = %q, want empty", got)
+		t.Errorf("Load with nil fs = %q, want empty", got)
 	}
 }
 
@@ -77,49 +87,100 @@ func TestLoadNilReceiverReturnsEmpty(t *testing.T) {
 }
 
 func TestLoadMissingFileReturnsEmpty(t *testing.T) {
-	dir := t.TempDir()
-	l := NewLoader(dir)
+	l := NewLoader()
 	if got := l.Load("does-not-exist"); got != "" {
 		t.Errorf("Load missing file = %q, want empty", got)
 	}
 }
 
 func TestLoadReadsAndTrims(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "sys.md"), []byte("  line one  \n\n"), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	l := NewLoader(dir)
+	l := newTestLoader(map[string]string{
+		"sys.md": "  line one  \n\n",
+	})
 	if got := l.Load("sys"); got != "line one" {
 		t.Errorf("Load = %q, want trimmed %q", got, "line one")
+	}
+}
+
+func TestLoadEmbeddedSystemPrompt(t *testing.T) {
+	l := NewLoader()
+	got := l.Load("system")
+	if got == "" {
+		t.Fatal("system.md not found in embedded FS")
+	}
+	if !contains(got, "coding agent") {
+		t.Errorf("system.md looks wrong: %s", got[:min(len(got), 80)])
 	}
 }
 
 // --- Loader.LoadOr ---------------------------------------------------------
 
 func TestLoadOrUsesTemplateWhenPresent(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "p.md"), []byte("from-disk"), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	l := NewLoader(dir)
-	if got := l.LoadOr("p", "fallback"); got != "from-disk" {
+	l := newTestLoader(map[string]string{
+		"p.md": "from-test-fs",
+	})
+	if got := l.LoadOr("p", "fallback"); got != "from-test-fs" {
 		t.Errorf("LoadOr = %q, want template content", got)
 	}
 }
 
 func TestLoadOrUsesFallbackWhenMissing(t *testing.T) {
-	dir := t.TempDir()
-	l := NewLoader(dir)
+	l := NewLoader()
 	if got := l.LoadOr("missing", "fallback-text"); got != "fallback-text" {
 		t.Errorf("LoadOr = %q, want fallback", got)
 	}
 }
 
 func TestLoadOrEmptyFallbackWhenMissing(t *testing.T) {
-	dir := t.TempDir()
-	l := NewLoader(dir)
+	l := NewLoader()
 	if got := l.LoadOr("missing", ""); got != "" {
 		t.Errorf("LoadOr empty fallback = %q, want empty", got)
 	}
 }
+
+// helpers
+
+func contains(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Check that the embedded FS actually contains the expected files.
+func TestEmbeddedFSContainsAllPrompts(t *testing.T) {
+	names := []string{
+		"system.md",
+		"think_required.md",
+		"planning_required.md",
+		"judge_system.md",
+		"judge_critical.md",
+		"teammate.md",
+		"auto_lesson.md",
+		"human_reject.md",
+		"human_modify.md",
+		"session_to_memory.md",
+		"strategy_change.md",
+		"todo_nag.md",
+	}
+	l := NewLoader()
+	for _, name := range names {
+		// strip .md suffix for Load
+		key := name[:len(name)-3]
+		if got := l.Load(key); got == "" {
+			t.Errorf("embedded FS missing %s", name)
+		}
+	}
+}
+
+// Ensure fs.ReadFile is used (compile-time check via the fstest path).
+var _ fs.FS = fstest.MapFS{}
