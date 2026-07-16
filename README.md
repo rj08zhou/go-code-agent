@@ -211,7 +211,7 @@ agentLoop(ctx, &conv)
   │    └─ drain team inbox → inject as user messages
   │
   ├─ [gates]
-  │    ├─ think-gate (round 0): force `think` tool before planning
+  │    ├─ think-gate (round 0): force plain-text deep thinking before planning (prints `💭 深度思考` separator)
   │    ├─ planning-gate (round 1): force task creation before execution
   │    └─ write-gate: require plan approval before file writes (teammates)
   │
@@ -376,12 +376,12 @@ go-code-agent/
 │   │   ├── judge.go              #   LLM-as-Judge post-completion verifier
 │   │   ├── decisions.go          #   Autonomous-decision audit trail (decisions.jsonl, /decisions)
 │   │   ├── compression.go        #   microCompact + autoCompact (token management)
-│   │   ├── subagent.go           #   Read-only sub-agent spawner (task tool)
+│   │   ├── subagent.go           #   `explore` read-only sub-agent spawner (multi-file investigation delegation, isolated context)
 │   │   ├── team.go               #   TeammateManager: WORK/IDLE autonomous loop
-│   │   ├── tool_registry.go      #   Tool definitions (30+ tools registered here)
-│   │   ├── tool_base.go          #   Base tool handlers (bash, files, think, etc.)
-│   │   ├── web_tools.go          #   web_fetch/web_search tools (formatting + secrets redaction)
-│   │   ├── system_prompt.go      #   System prompt assembly + memory recall
+│   │   ├── tool_registry.go      #   Tool definitions (34+ tools registered here)
+│   │   ├── tool_base.go          #   Base tool handlers (bash, files, compress, etc.)
+│   │   ├── web_tools.go          #   web_fetch (sub-agent summary + secrets redaction) / web_search (direct list) tools
+│   │   ├── system_prompt.go      #   System prompt assembly + memory recall (prompts loaded from embedded binary)
 │   │   ├── security.go           #   Tool security registry, checkToolApproval, HITL gate glue
 │   │   ├── snapshot.go           #   Saga-pattern snapshot/rollback via git-stash
 │   │   └── log_file.go           #   Per-session file logging (session.log)
@@ -450,8 +450,8 @@ go-code-agent/
 ├── utils/                        # Shared utilities
 │   └── utils.go                  # Path helpers (JoinWorkdir, Truncate, etc.)
 │
-├── prompts/                      # Prompt templates (*.md)
-│   ├── system.md                 # Main system prompt template
+├── prompts/                      # Prompt templates (*.md) → compiled into the binary via prompts/embed.go
+│   ├── system.md                 # Main system prompt template (embedded via embed.go; no runtime dependency on {workdir}/prompts/)
 │   ├── think_required.md         # Think-gate injection
 │   ├── planning_required.md      # Planning-gate injection
 │   ├── strategy_change.md        # Strategy-change reflection
@@ -539,8 +539,9 @@ go-code-agent/
 
 | Tool | Description |
 |------|-------------|
-| `think` | Scratchpad for reasoning (not sent to user, persisted in context) |
 | `compress` | Manually trigger context compression |
+
+> **Deep thinking**: the `think` tool has been removed. The agent now reasons in plain text (with trade-off analysis) and prints a `💭 深度思考` (Deep Thinking) separator before each reasoning turn, shown to the user as a "deep thinking" block — it no longer consumes a tool call.
 
 ### Planning & Tasks
 
@@ -560,7 +561,7 @@ go-code-agent/
 
 | Tool | Description |
 |------|-------------|
-| `task` | Spawn a read-only sub-agent for research/analysis (30 round cap) |
+| `explore` | Delegate multi-file investigation to a read-only sub-agent (30 round cap). The sub-agent reads files and runs safe shell in its own isolated context, returning only a concise summary — raw file contents never enter the main agent context. Ideal for architecture reviews and cross-file call-chain tracing |
 | `load_skill` | Load a skill definition into context |
 
 ### Background Execution
@@ -574,8 +575,8 @@ go-code-agent/
 
 | Tool | Description |
 |------|-------------|
-| `web_fetch` | Fetch a public URL and return its readable text (HTML → plain text; blocked for private/internal addresses by default) |
-| `web_search` | Search the web via a zero-config downgrade chain (SearXNG → DuckDuckGo), or a paid backend (Tavily/Brave) if configured |
+| `web_fetch` | Fetch a public URL and return a **concise summary** (HTML → plain text, then digested by a read-only sub-agent; raw page content never enters the main agent context; blocked for private/internal addresses by default). Optional `prompt` parameter directs the sub-agent at a specific question |
+| `web_search` | Search the web via a zero-config downgrade chain (SearXNG → DuckDuckGo), or a paid backend (Tavily/Brave) if configured. **Direct** returns a compact title/url/snippet list so the main agent can see URLs to decide the next fetch |
 
 See [Web Access & SSRF Protection](#web-access--ssrf-protection) for the security model behind these two tools.
 
@@ -720,7 +721,7 @@ WEB_SEARCH_PROVIDER=tavily|brave + WEB_SEARCH_API_KEY set?
 
 ### Untrusted content handling
 
-`web_fetch`'s extracted page text is wrapped in an explicit `BEGIN/END UNTRUSTED PAGE CONTENT` marker before being added to the conversation — the model is instructed to treat it as data to read, never as instructions to follow (defense against prompt injection from a fetched page). Both tools also run their output through the same `SecretsSanitizer` used for bash/file output, since a fetched page could echo back something that looks like a credential.
+`web_fetch` now uses **sub-agent isolation**: the page is fetched and digested by a read-only `web_fetch` sub-agent, and the **raw page content never enters the main agent context** — the sub-agent returns only a concise summary (mirroring the practice of digesting web pages with a lightweight model, saving context and shrinking the injection surface). An optional `prompt` parameter lets the sub-agent answer a specific question. Both tools also run their output through the same `SecretsSanitizer` used for bash/file output, since a fetched page could echo back something that looks like a credential.
 
 ---
 
@@ -729,7 +730,7 @@ WEB_SEARCH_PROVIDER=tavily|brave + WEB_SEARCH_API_KEY set?
 ### Think → Plan → Act → Reflect Cycle
 
 ```
-Round 0:  [think-gate] → forces agent to use `think` tool first
+Round 0:  [think-gate] → forces agent to do plain-text deep thinking first (prints `💭 深度思考` separator)
 Round 1:  [planning-gate] → forces task creation (if query > 80 chars)
 Round 2+: [execution] → agent works through tasks
 Every 5:  [periodic reflection] → agent reviews progress

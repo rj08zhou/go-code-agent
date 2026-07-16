@@ -84,7 +84,7 @@ func NewApp(model, workdir, dataDir string, bashValidate session.BashValidator) 
 		}
 	}
 
-	pl := prompt.NewLoader(utils.JoinWorkdir(workdir, "prompts"))
+	pl := prompt.NewLoader()
 	return &AppContext{
 		Model:          model,
 		Workdir:        workdir,

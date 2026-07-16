@@ -84,7 +84,6 @@ var planningTools = map[string]bool{
 
 // exploreTools are read-only / discovery tools that count as "thinking activity".
 var exploreTools = map[string]bool{
-	"think":          true,
 	"memory_search":  true,
 	"read_file":      true,
 	"search_content": true,
@@ -124,8 +123,11 @@ func Run(ctx context.Context, messages *[]llm.Message) error {
 		// 2) Pre-round housekeeping: compress, drain background / inbox.
 		preRound(ctx, messages, st)
 
-		// 3) LLM call.
-		sr, err := llm.NewClient(nil).StreamWithRetry(ctx, "agent", llm.CallParams{Model: App.Model, Messages: *messages, Tools: ToolDefs, MaxTokens: infra.DefaultMaxOutputTokens})
+		// 3) LLM call. Print a thinking section marker so the user can
+		// visually separate each round of model reasoning from tool output.
+		logging.PrintThinkingHeader()
+		sr, err := llm.NewClient(nil).StreamWithRetrySink(ctx, "agent", llm.CallParams{Model: App.Model, Messages: *messages, Tools: ToolDefs, MaxTokens: infra.DefaultMaxOutputTokens},
+			llm.NewStdoutStreamSink())
 		if err != nil {
 			return fmt.Errorf("API call failed: %w", err)
 		}
@@ -478,9 +480,9 @@ var interactiveConfirmTools = map[string]bool{
 }
 
 // toolTimeoutOverrides gives specific tools a longer timeout ceiling.
-// task (subagent) needs more time for real codebase exploration.
+// explore (subagent) needs more time for real codebase exploration.
 var toolTimeoutOverrides = map[string]time.Duration{
-	"task": infra.SubagentTimeout,
+	"explore": infra.SubagentTimeout,
 }
 
 // runToolWithTimeout invokes a handler with perToolTimeout + snapshot/rollback.
@@ -582,7 +584,8 @@ func runJudgeIfApplicable(ctx context.Context, st *loopState, msgs *[]llm.Messag
 func finalizeMaxRounds(ctx context.Context, messages *[]llm.Message) error {
 	*messages = append(*messages, llm.UserMessage(
 		"<limit>Maximum tool rounds reached. Wrap up and respond now in plain text.</limit>"))
-	sr, err := llm.NewClient(nil).StreamWithRetry(ctx, "agent-final", llm.CallParams{Model: App.Model, Messages: *messages, Tools: nil})
+	sr, err := llm.NewClient(nil).StreamWithRetrySink(ctx, "agent-final", llm.CallParams{Model: App.Model, Messages: *messages, Tools: nil},
+		llm.NewStdoutStreamSink())
 	if err != nil {
 		// Even on error, leave a closing assistant turn so the next
 		// REPL prompt isn't waiting on an unanswered user message.

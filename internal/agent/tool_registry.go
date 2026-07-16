@@ -33,20 +33,6 @@ func InitTools() {
 
 	// Reasoning
 	registerToolSpecs(
-		spec("think", "Record your reasoning before taking action. Does NOT run anything or fetch data - it only logs structured thought into the conversation. Use this to: restate the user's request, list assumptions, decide scope, or plan an approach before calling planning/action tools.",
-			map[string]any{"thought": strProp()}, []string{"thought"}, security.ApproveAuto,
-			func(ctx context.Context, r json.RawMessage) ToolResult {
-				var a struct {
-					Thought string `json:"thought"`
-				}
-				if e := llm.ParseArgs(r, &a); e != "" {
-					return llm.MkErr(e)
-				}
-				if strings.TrimSpace(a.Thought) == "" {
-					return llm.MkErr("empty thought - provide meaningful reasoning")
-				}
-				return llm.MkOk("Thought recorded. Proceed with your next action.")
-			}),
 		spec("compress", "Manually compress conversation context.", map[string]any{}, nil, security.ApproveAuto,
 			func(ctx context.Context, r json.RawMessage) ToolResult {
 				return llm.MkOk("Compressing...")
@@ -79,8 +65,10 @@ func InitTools() {
 
 	// Subagent + skills
 	registerToolSpecs(
-		spec("task", "Spawn a read-only subagent to investigate code, search files, or summarize findings. The subagent has NO write/edit/delete tools — if it concludes a change is needed, it returns a summary describing the change and you (the parent) perform the write yourself. "+
-			"Has a generous internal time budget for large investigations; if it runs out before finishing, the result is a partial-progress report (files/commands already investigated + last reasoning) rather than a bare failure — use it as a starting point instead of re-exploring from scratch.",
+		spec("explore", "Delegate multi-file investigation to a read-only subagent. The subagent reads files and runs safe shell commands in its own isolated context, then returns only a concise summary — you receive the findings without burning your context on raw file content. Ideal when you need to understand architecture, trace call chains, or find how a feature is implemented across multiple files. "+
+			"For single-file lookups (one function, constant, or signature) use read_file directly instead. "+
+			"The subagent has NO write/edit/delete tools — if it concludes a change is needed, it describes the change and you perform the write. "+
+			"Large time budget; if it doesn't finish in time you get a partial-progress report rather than a bare failure.",
 			map[string]any{"prompt": strProp(), "agent_type": enumProp("Explore", "general-purpose")}, []string{"prompt"}, security.ApproveSafe,
 			func(ctx context.Context, r json.RawMessage) ToolResult {
 				var a struct {
