@@ -1,5 +1,4 @@
-<human-feedback>
-A human reviewer vetoed your `{{tool}}` call and asks you to incorporate this guidance before retrying:
+Human operator requests modifications to tool {{.tool}}:
+{{.feedback}}
 
-{{feedback}}
-</human-feedback>
+Please adjust your approach and retry. Do not repeat the exact same tool call.

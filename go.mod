@@ -1,4 +1,4 @@
-module go-code-agent
+module go-code-agent-refactor
 
 go 1.25.3
 
@@ -6,9 +6,7 @@ require (
 	github.com/anthropics/anthropic-sdk-go v1.41.0
 	github.com/chzyer/readline v1.5.1
 	github.com/openai/openai-go v1.12.0
-	github.com/yuin/goldmark v1.4.13
 	golang.org/x/net v0.57.0
-	golang.org/x/time v0.15.0
 )
 
 require (

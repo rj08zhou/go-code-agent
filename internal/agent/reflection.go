@@ -1,45 +1,50 @@
-// Reflection module: self-evaluation triggers with independent cool-downs.
-// Triggers: mini-reflect (1 failure), strategy-change (N failures),
-// stuck (no completion), periodic (every N rounds), todo-nag.
 package agent
 
 import (
 	"fmt"
+	"go-code-agent-refactor/internal/prompt"
 	"strings"
 )
 
-// Reflection trigger kinds. Used as map keys in `lastTriggered`.
+// Reflection trigger kinds.
 const (
-	reflectKindMini     = "mini"
-	reflectKindStrategy = "strategy"
-	reflectKindStuck    = "stuck"
-	reflectKindPeriodic = "periodic"
-	reflectKindTodoNag  = "todo_nag"
+	reflectKindMini          = "mini"
+	reflectKindStrategy      = "strategy"
+	reflectKindStuck         = "stuck"
+	reflectKindInvestigation = "investigation_stuck"
+	reflectKindPeriodic      = "periodic"
+	reflectKindTodoNag       = "todo_nag"
 )
 
 // Cool-down windows (in tool-round units).
 const (
 	strategyChangeCooldown = 5
 	stuckCooldown          = 5
-	periodicCooldown       = 0 // governed by reflectInterval already
+	investigationCooldown  = 3
 	todoNagCooldown        = 3
 )
 
-// reflect evaluates agent state and returns reflection prompts to inject.
-// `lastTriggered` maps trigger-kind → toolRounds; `triggered` is the set
-// of kinds that fired this round.
-func reflect(
-	consecutiveFailures int, lastFailedTool string, maxConsecutiveFailures int,
+// Reflection evaluates agent state and returns reflection prompts to inject.
+type Reflection struct {
+	promptLoader *prompt.Loader
+}
+
+func NewReflection(pl *prompt.Loader) *Reflection {
+	return &Reflection{promptLoader: pl}
+}
+
+// Eval generates reflection prompts based on agent state.
+func (r *Reflection) Eval(
+	consecutiveFailures int, lastFailedTool string,
+	maxConsecutiveFailures int,
 	toolRounds int, totalFailures int,
 	roundsSinceLastComplete int, roundsWithoutTodo int,
 	stuckThreshold int, reflectInterval int,
 	hasOpenItems bool,
 	lastTriggered map[string]int,
+	taskCount int, progressSummary string,
 ) (prompts []string, resetFailures, resetTodoNag, resetStuck bool, triggered []string) {
 
-	// onCooldown returns true when `kind` was triggered within the
-	// last `window` rounds (inclusive). A window of <=0 disables the
-	// cool-down for that kind.
 	onCooldown := func(kind string, window int) bool {
 		if window <= 0 {
 			return false
@@ -51,9 +56,7 @@ func reflect(
 		return toolRounds-last < window
 	}
 
-	// 1) Immediate mini-reflect on first failure. No cool-down: this
-	//    is already gated by the "first failure of a tool" condition,
-	//    so it is naturally one-shot.
+	// 1) Mini-reflect on first failure.
 	if consecutiveFailures == 1 {
 		prompts = append(prompts, fmt.Sprintf(
 			"<mini-reflect>Tool '%s' failed. Before retrying, consider: "+
@@ -63,16 +66,15 @@ func reflect(
 		triggered = append(triggered, reflectKindMini)
 	}
 
-	// 2) Force strategy change after repeated failures.
+	// 2) Strategy change after repeated failures.
 	if consecutiveFailures >= maxConsecutiveFailures && !onCooldown(reflectKindStrategy, strategyChangeCooldown) {
-		// Fallback ensures reflection still works if the prompt file
-		// is missing — silent empty injection here would defeat the
-		// whole point of the strategy-change gate.
-		tmpl := App.PromptLoader.LoadOr("strategy_change",
-			"<strategy-change>Tool '{{tool}}' has failed {{count}} times in a row. "+
-				"STOP retrying the same approach. Re-read the error, then either: "+
-				"(a) try a different tool, (b) gather more context first, or "+
-				"(c) ask the user for clarification.</strategy-change>")
+		tmpl := r.promptLoader.Load("strategy_change")
+		if tmpl == "" {
+			tmpl = "<strategy-change>Tool '{{tool}}' has failed {{count}} times in a row. " +
+				"STOP retrying the same approach. Re-read the error, then either: " +
+				"(a) try a different tool, (b) gather more context first, or " +
+				"(c) ask the user for clarification.</strategy-change>"
+		}
 		msg := strings.Replace(strings.Replace(tmpl,
 			"{{tool}}", lastFailedTool, 1),
 			"{{count}}", fmt.Sprintf("%d", consecutiveFailures), 1)
@@ -80,16 +82,32 @@ func reflect(
 		resetFailures = true
 		triggered = append(triggered, reflectKindStrategy)
 	} else if consecutiveFailures >= maxConsecutiveFailures {
-		// Even when suppressed by cool-down, still reset the failure
-		// counter so we don't re-trigger every round and so the next
-		// failure starts a fresh streak. Without this reset the loop
-		// would be stuck above the threshold and only the cooldown
-		// would gate output, hiding real progress.
 		resetFailures = true
 	}
 
-	// 3) Stuck detection: too many rounds without completing any DAG task.
-	if roundsSinceLastComplete >= stuckThreshold && App.DagSched().TaskCount() > 0 &&
+	// 3) Investigation stuck — tools are succeeding but no progress is made.
+	// Common in explore subagents that read the same files repeatedly
+	// without converging on a summary. Fires earlier than the generic
+	// stuck detector to save tokens.
+	if consecutiveFailures == 0 && totalFailures == 0 &&
+		roundsSinceLastComplete >= 10 && taskCount > 0 &&
+		!onCooldown(reflectKindInvestigation, investigationCooldown) {
+		prompts = append(prompts,
+			"<investigation-stuck>You have been running tools successfully for "+
+				fmt.Sprintf("%d", roundsSinceLastComplete)+
+				" rounds but haven't completed the task. Your tools are working — the problem is your approach. "+
+				"STOP reading more files. Instead:\n"+
+				"1. Summarize what you already know in 2-3 sentences.\n"+
+				"2. Identify the single missing piece of information you still need.\n"+
+				"3. Use the most direct tool to get ONLY that piece.\n"+
+				"4. Then respond with your final answer immediately.\n"+
+				"Do NOT read another large file or list another directory.</investigation-stuck>")
+		resetStuck = true
+		triggered = append(triggered, reflectKindInvestigation)
+	}
+
+	// 4) Stuck detection.
+	if roundsSinceLastComplete >= stuckThreshold && taskCount > 0 &&
 		!onCooldown(reflectKindStuck, stuckCooldown) {
 		prompts = append(prompts, fmt.Sprintf(
 			"<stuck>You have spent %d rounds without completing a task. "+
@@ -99,30 +117,24 @@ func reflect(
 			roundsSinceLastComplete))
 		resetStuck = true
 		triggered = append(triggered, reflectKindStuck)
-	} else if roundsSinceLastComplete >= stuckThreshold && App.DagSched().TaskCount() > 0 {
-		// Same idea as the strategy branch: clear the counter so the
-		// next "stuck" episode starts from zero rather than firing
-		// every round once we cross the threshold.
+	} else if roundsSinceLastComplete >= stuckThreshold && taskCount > 0 {
 		resetStuck = true
 	}
 
-	// 4) Periodic reflection / 5) task nag.
+	// 4) Periodic reflection / 5) todo nag.
 	needReflect := reflectInterval > 0 && toolRounds > 0 && toolRounds%reflectInterval == 0 &&
-		!onCooldown(reflectKindPeriodic, periodicCooldown)
+		!onCooldown(reflectKindPeriodic, 0)
 	needNag := hasOpenItems && roundsWithoutTodo >= 3 &&
 		!onCooldown(reflectKindTodoNag, todoNagCooldown)
 
 	if needReflect {
-		// Build context-aware reflection with actual data.
 		var rb strings.Builder
-		rb.WriteString("<reflect>Pause and evaluate (round ")
-		rb.WriteString(fmt.Sprintf("%d", toolRounds))
-		rb.WriteString("):\n")
+		rb.WriteString(fmt.Sprintf("<reflect>Pause and evaluate (round %d):\n", toolRounds))
 		if totalFailures > 0 {
 			rb.WriteString(fmt.Sprintf("- %d tool failures so far this session.\n", totalFailures))
 		}
-		if ps := App.DagSched().ProgressSummary(); ps != "" {
-			rb.WriteString(fmt.Sprintf("- %s\n", ps))
+		if progressSummary != "" {
+			rb.WriteString(fmt.Sprintf("- %s\n", progressSummary))
 		}
 		rb.WriteString("1. Are your actions achieving the intended goal?\n")
 		rb.WriteString("2. Did any tool call fail? If so, change strategy.\n")
@@ -136,11 +148,14 @@ func reflect(
 		prompts = append(prompts, rb.String())
 		triggered = append(triggered, reflectKindPeriodic)
 	} else if needNag {
-		prompts = append(prompts, App.PromptLoader.LoadOr("todo_nag",
-			"<task-nag>You have open task items. Update them via TodoWrite before continuing.</task-nag>"))
+		tmpl := r.promptLoader.Load("todo_nag")
+		if tmpl == "" {
+			tmpl = "<task-nag>You have open task items. Update them via TodoWrite before continuing.</task-nag>"
+		}
+		prompts = append(prompts, tmpl)
 		resetTodoNag = true
 		triggered = append(triggered, reflectKindTodoNag)
 	}
 
-	return prompts, resetFailures, resetTodoNag, resetStuck, triggered
+	return
 }

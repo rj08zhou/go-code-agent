@@ -3,17 +3,21 @@ package task
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
 
-// TodoManager
-
+// TodoItem is the short-lived turn checklist shown by /tasks.
 type TodoItem struct {
 	Content    string
 	Status     string
 	ActiveForm string
 }
 
+// TodoManager stores the current session's TodoWrite checklist.
+// It is intentionally separate from Service: persistent DAG tasks and the
+// model-facing checklist are two different task systems.
 type TodoManager struct {
+	mu    sync.RWMutex
 	items []TodoItem
 }
 
@@ -21,12 +25,12 @@ func (t *TodoManager) Update(items []map[string]string) (string, error) {
 	if len(items) > 20 {
 		return "", fmt.Errorf("max 20 todos")
 	}
-	var validated []TodoItem
+	validated := make([]TodoItem, 0, len(items))
 	inProgress := 0
 	for i, raw := range items {
-		content := trimStr(raw["content"])
-		status := toLowerTrim(raw["status"])
-		activeForm := trimStr(raw["activeForm"])
+		content := strings.TrimSpace(raw["content"])
+		status := strings.ToLower(strings.TrimSpace(raw["status"]))
+		activeForm := strings.TrimSpace(raw["activeForm"])
 		if content == "" {
 			return "", fmt.Errorf("item %d: content required", i)
 		}
@@ -39,23 +43,28 @@ func (t *TodoManager) Update(items []map[string]string) (string, error) {
 		if status == "in_progress" {
 			inProgress++
 		}
-		validated = append(validated, TodoItem{content, status, activeForm})
+		validated = append(validated, TodoItem{Content: content, Status: status, ActiveForm: activeForm})
 	}
 	if inProgress > 1 {
 		return "", fmt.Errorf("only one in_progress allowed")
 	}
+	t.mu.Lock()
 	t.items = validated
+	t.mu.Unlock()
 	return t.Render(), nil
 }
 
 func (t *TodoManager) Render() string {
-	if len(t.items) == 0 {
+	t.mu.RLock()
+	items := append([]TodoItem(nil), t.items...)
+	t.mu.RUnlock()
+	if len(items) == 0 {
 		return "No todos."
 	}
 	markers := map[string]string{"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}
-	var lines []string
+	lines := make([]string, 0, len(items)+1)
 	done := 0
-	for _, item := range t.items {
+	for _, item := range items {
 		line := markers[item.Status] + " " + item.Content
 		if item.Status == "in_progress" {
 			line += " <- " + item.ActiveForm
@@ -65,11 +74,13 @@ func (t *TodoManager) Render() string {
 			done++
 		}
 	}
-	lines = append(lines, fmt.Sprintf("\n(%d/%d completed)", done, len(t.items)))
+	lines = append(lines, fmt.Sprintf("\n(%d/%d completed)", done, len(items)))
 	return strings.Join(lines, "\n")
 }
 
 func (t *TodoManager) HasOpenItems() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	for _, item := range t.items {
 		if item.Status != "completed" {
 			return true
@@ -77,6 +88,3 @@ func (t *TodoManager) HasOpenItems() bool {
 	}
 	return false
 }
-
-func trimStr(s string) string     { return strings.TrimSpace(s) }
-func toLowerTrim(s string) string { return strings.ToLower(strings.TrimSpace(s)) }

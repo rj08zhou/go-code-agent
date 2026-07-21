@@ -1,1 +1,0 @@
-<auto-lesson>Task complete. If you learned anything useful (gotchas, patterns, user preferences), save it now with memory_write(category="lesson") or memory_write(category="preference"). If nothing worth remembering, just respond briefly.</auto-lesson>
