@@ -1,142 +1,66 @@
 package agent
 
-// Autonomous-decision audit trail: appends each decision to decisions.jsonl
-// for replay via /decisions.
-
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
-	"go-code-agent/internal/logging"
-	"go-code-agent/internal/session"
 	"os"
-	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
-// decisionRecord is the on-disk shape of one decisions.jsonl line.
-type decisionRecord struct {
-	TS      string `json:"ts"`
-	Kind    string `json:"kind"`
-	Summary string `json:"summary"`
+type DecisionLog struct {
+	path string
+	mu   sync.Mutex
 }
 
-// Decision kinds. decisionKindOrder controls rendering order in RenderDecisions.
-const (
-	DecisionPlan    = "plan"
-	DecisionContext = "context"
-	DecisionMemory  = "memory"
-	DecisionJudge   = "judge"
-	DecisionReflect = "reflect"
-	DecisionTurn    = "turn"
-)
-
-var decisionKindOrder = []string{
-	DecisionPlan, DecisionContext, DecisionMemory,
-	DecisionJudge, DecisionReflect, DecisionTurn,
+type decisionEntry struct {
+	Time   string `json:"time"`
+	Tool   string `json:"tool"`
+	Action string `json:"action"`
+	Reason string `json:"reason"`
+	Round  int    `json:"round"`
 }
 
-// InitDecisionLog wires logging.PrintDecision to also persist each event to the
-// active session's decisions.jsonl. The sink resolves the active session
-// lazily, so it automatically follows session switches.
-func InitDecisionLog() {
-	logging.SetDecisionSink(appendDecision)
+func NewDecisionLog(dir string) (*DecisionLog, error) {
+	return &DecisionLog{path: dir + "/decisions.jsonl"}, nil
 }
 
-// decisionsPath returns the active session's decisions.jsonl path, or "" if
-// no session is active.
-func decisionsPath() string {
-	if App == nil || App.SessionManager == nil || App.SessionManager.Active() == nil {
-		return ""
+func (d *DecisionLog) Record(tool, action, reason string, round int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e := decisionEntry{
+		Time: time.Now().Format(time.RFC3339), Tool: tool,
+		Action: action, Reason: reason, Round: round,
 	}
-	return filepath.Join(App.SessionManager.Active().Dir(), session.SessionDecisionsFile)
-}
-
-// appendDecision persists one decision event. Best-effort: failures are
-// silent so a logging hiccup never disrupts the agent loop.
-func appendDecision(kind, summary string) {
-	path := decisionsPath()
-	if path == "" {
-		return
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	data, _ := json.Marshal(e)
+	f, err := os.OpenFile(d.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	data, err := json.Marshal(decisionRecord{
-		TS:      time.Now().Format(time.RFC3339),
-		Kind:    kind,
-		Summary: summary,
-	})
-	if err != nil {
-		return
-	}
 	f.Write(append(data, '\n'))
 }
 
-// RenderDecisions reads the active session's decisions.jsonl and returns a
-// human-readable timeline for the /decisions command.
-func RenderDecisions() string {
-	path := decisionsPath()
-	if path == "" {
-		return "(no active session)"
+func (d *DecisionLog) Render() string {
+	data, err := os.ReadFile(d.path)
+	if err != nil || len(data) == 0 {
+		return "No decisions recorded."
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "(no autonomous decisions recorded this session yet)"
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	start := len(lines) - 20
+	if start < 0 {
+		start = 0
 	}
-	defer f.Close()
-
-	var b strings.Builder
-	counts := map[string]int{}
-	total := 0
-	var body strings.Builder
-
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+	var result []string
+	for _, line := range lines[start:] {
+		var e decisionEntry
+		if json.Unmarshal([]byte(line), &e) == nil {
+			result = append(result, fmt.Sprintf("  %s %-15s %-10s %s", e.Time[:19], e.Tool, e.Action, e.Reason))
 		}
-		var rec decisionRecord
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue
-		}
-		total++
-		counts[rec.Kind]++
-		fmt.Fprintf(&body, "  %s  [%-7s] %s\n", rec.TS, rec.Kind, rec.Summary)
 	}
-
-	if total == 0 {
-		return "(no autonomous decisions recorded this session yet)"
+	if len(result) == 0 {
+		return "No valid decisions."
 	}
-
-	fmt.Fprintf(&b, "--- Autonomous decision timeline (%d events) ---\n", total)
-	b.WriteString("by kind: ")
-	first := true
-	for _, k := range decisionKindOrder {
-		if counts[k] == 0 {
-			continue
-		}
-		if !first {
-			b.WriteString(", ")
-		}
-		fmt.Fprintf(&b, "%s=%d", k, counts[k])
-		first = false
-		delete(counts, k)
-	}
-	// Any kinds not in the known ordering.
-	for k, c := range counts {
-		if !first {
-			b.WriteString(", ")
-		}
-		fmt.Fprintf(&b, "%s=%d", k, c)
-		first = false
-	}
-	b.WriteString("\n\n")
-	b.WriteString(body.String())
-	return b.String()
+	return strings.Join(result, "\n")
 }

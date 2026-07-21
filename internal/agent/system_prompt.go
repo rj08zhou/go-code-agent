@@ -1,49 +1,74 @@
 package agent
 
 import (
-	"fmt"
-	"go-code-agent/infra"
-	"go-code-agent/internal/logging"
+	"go-code-agent-refactor/internal/memory"
+	"go-code-agent-refactor/internal/prompt"
+	"go-code-agent-refactor/internal/skill"
+	"go-code-agent-refactor/internal/task"
 	"strings"
 )
 
-// System prompt assembly + memory auto-recall.
+// SystemPromptBuilder constructs the system prompt from context.
+type SystemPromptBuilder struct {
+	promptLoader *prompt.Loader
+	skillLoader  *skill.Loader
+	memStore     *memory.Store
+	taskSvc      *task.Service
+	mcpListFn    func() string
+	embedded     []byte
+}
 
-// BuildSystemPrompt assembles the system prompt with dynamic sections:
-// evergreen memory and DAG resume context.
-func BuildSystemPrompt() string {
-	raw := App.PromptLoader.Load("system")
-	if raw == "" {
-		logging.PrintSystem("ERROR: prompts/system.md not found, using minimal fallback")
-		raw = "You are a coding agent. Use tools to solve tasks."
+func NewSystemPromptBuilder(
+	pl *prompt.Loader,
+	sl *skill.Loader,
+	ms *memory.Store,
+	ts *task.Service,
+	mcpFn func() string,
+	embedded []byte,
+) *SystemPromptBuilder {
+	return &SystemPromptBuilder{
+		promptLoader: pl,
+		skillLoader:  sl,
+		memStore:     ms,
+		taskSvc:      ts,
+		mcpListFn:    mcpFn,
+		embedded:     embedded,
 	}
-	prompt := strings.Replace(strings.Replace(raw,
-		"{{workdir}}", App.Workdir, 1),
-		"{{skills}}", App.Skills.Descriptions(), 1)
+}
 
-	// Inject evergreen memory (truncated to prevent prompt bloat).
-	if eg := App.MemStore.LoadEvergreen(); eg != "" {
-		if len(eg) > infra.MaxEvergreenChars {
-			cut := strings.LastIndex(eg[:infra.MaxEvergreenChars], "\n")
-			if cut <= 0 {
-				cut = infra.MaxEvergreenChars
-			}
-			eg = eg[:cut] + fmt.Sprintf("\n\n[... truncated, %d/%d chars shown. Consider cleaning up MEMORY.md.]", cut, len(eg))
-		}
-		prompt += "\n\n## Evergreen Memory\n\n" + eg
-	}
+func (b *SystemPromptBuilder) Build(workdir string) string {
+	tmpl := b.promptLoader.Load("system")
 
-	// Inject task resume context (unfinished DAG tasks from previous session).
-	if rc := App.DagSched().ResumeContext(); rc != "" {
-		prompt += "\n\n" + rc
-	}
-
-	// Inject MCP server instructions so the model knows what each server does.
-	if App.MCPMgr != nil {
-		if instructions := App.MCPMgr.ServerInstructions(); instructions != "" {
-			prompt += "\n\n## MCP Server Instructions\n\n" + instructions
-		}
+	memoryCtx := ""
+	if b.memStore != nil {
+		memoryCtx = b.memStore.GetEvergreen()
 	}
 
-	return prompt
+	skillCtx := ""
+	if b.skillLoader != nil && b.skillLoader.Len() > 0 {
+		skillCtx = b.skillLoader.All()
+	}
+
+	taskCtx := ""
+	if b.taskSvc != nil {
+		taskCtx = b.taskSvc.ProgressSummary()
+	}
+
+	mcpCtx := ""
+	if b.mcpListFn != nil {
+		mcpCtx = b.mcpListFn()
+	}
+
+	result := strings.NewReplacer(
+		"{{memory_context}}", memoryCtx,
+		"{{skill_context}}", skillCtx,
+		"{{task_context}}", taskCtx,
+		"{{mcp_context}}", mcpCtx,
+	).Replace(tmpl)
+
+	if len(b.embedded) > 0 {
+		result += "\n\n## Project Documentation\n" + string(b.embedded)
+	}
+
+	return result
 }

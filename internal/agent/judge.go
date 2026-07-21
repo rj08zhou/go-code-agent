@@ -4,50 +4,46 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent/internal/llm"
-	"go-code-agent/internal/prompt"
-	"go-code-agent/utils"
+	"go-code-agent-refactor/internal/llm"
+	"go-code-agent-refactor/internal/model"
+	"go-code-agent-refactor/internal/prompt"
+	"go-code-agent-refactor/internal/tool"
+	"go-code-agent-refactor/internal/utils"
 	"strings"
 	"sync"
 )
 
-// LLM-as-Judge verifier: a secondary LLM call evaluates whether the
-// agent's actions match the user's intent. Triggered after task
-// completion. Disabled by default; opt-in via JUDGE_ENABLED.
-
-// JudgeVerdict is the structured output produced by the Judge LLM.
+// JudgeVerdict is the structured output from the Judge LLM.
 type JudgeVerdict struct {
-	Approved    bool     `json:"approved"`     // overall pass/fail
-	Score       int      `json:"score"`        // 1-10
-	Issues      []string `json:"issues"`       // concrete problems observed
-	Suggestions []string `json:"suggestions"`  // how to fix / improve
-	ShouldRetry bool     `json:"should_retry"` // if true, force another round
-	Reason      string   `json:"reason"`       // brief explanation
+	Approved    bool     `json:"approved"`
+	Score       int      `json:"score"` // 1-10
+	Issues      []string `json:"issues"`
+	Suggestions []string `json:"suggestions"`
+	ShouldRetry bool     `json:"should_retry"`
+	Reason      string   `json:"reason"`
 }
 
-// JudgeToolResult captures a single tool execution for the judge's review.
+// JudgeToolResult captures a single tool execution for review.
 type JudgeToolResult struct {
 	ToolName string
 	Args     string
+	Status   tool.Status
 	Output   string
-	Failed   bool
+	Reason   string
 }
 
-// Judge evaluates the agent's recent work using a secondary LLM call.
+// Judge evaluates agent work using a secondary LLM call.
 type Judge struct {
 	enabled      bool
 	model        string
 	minScore     int
 	maxHistory   int
 	promptLoader *prompt.Loader
+	gateway      *model.Gateway
 	mu           sync.RWMutex
 }
 
-// NewJudge constructs a Judge. enabled=false makes Verify a no-op pass.
-// promptLoader is used to render the "judge_system" template; it may be
-// nil as long as the judge stays disabled (Verify short-circuits before
-// ever touching it).
-func NewJudge(enabled bool, model string, minScore int, promptLoader *prompt.Loader) *Judge {
+func NewJudge(enabled bool, model string, minScore int, pl *prompt.Loader, gw *model.Gateway) *Judge {
 	if minScore <= 0 {
 		minScore = 7
 	}
@@ -55,55 +51,41 @@ func NewJudge(enabled bool, model string, minScore int, promptLoader *prompt.Loa
 		enabled:      enabled,
 		model:        model,
 		minScore:     minScore,
-		maxHistory:   12, // last 12 messages is usually enough context
-		promptLoader: promptLoader,
+		maxHistory:   12,
+		promptLoader: pl,
+		gateway:      gw,
 	}
 }
 
-// IsEnabled reports whether the judge is active.
 func (j *Judge) IsEnabled() bool {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
 	return j.enabled
 }
 
-// SetEnabled toggles the judge at runtime (e.g., via /judge REPL command).
 func (j *Judge) SetEnabled(v bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.enabled = v
 }
 
-// Verify asks the judge LLM to evaluate the agent's recent actions.
-// fallbackModel is used when the judge has no explicit model configured
-// (i.e. it should reuse the main agent's model). On internal error,
-// returns a permissive default (never blocks progress).
+// Verify asks the judge LLM to evaluate agent actions.
 func (j *Judge) Verify(ctx context.Context, originalTask string, conversation []llm.Message, toolResults []JudgeToolResult, fallbackModel string) (*JudgeVerdict, error) {
 	if !j.IsEnabled() {
 		return &JudgeVerdict{Approved: true, Score: 10, Reason: "judge disabled"}, nil
 	}
 
-	prompt := j.buildPrompt(originalTask, conversation, toolResults)
+	jPrompt := j.buildPrompt(originalTask, conversation, toolResults)
 
-	// Pick model: explicit judge model > main model as fallback.
 	callModel := j.model
 	if callModel == "" {
 		callModel = fallbackModel
 	}
 
-	// Route to the backend that serves the judge. The judge is designed
-	// to run a *different* (cheaper) model than the main agent;
-	// JudgeProvider honours the JUDGE_PROVIDER / JUDGE_API_KEY /
-	// JUDGE_BASE_URL env vars so it can even live behind a separate
-	// endpoint, falling back to the main model's provider otherwise.
-	// UserMessage, not SystemMessage - see the matching comment in
-	// SessionManager.SaveToMemory (internal/session/session_manager.go):
-	// some OpenAI-compatible endpoints (GLM/bigmodel.cn) 400 on a
-	// messages array containing only a system turn.
-	comp, err := llm.NewClient(llm.JudgeProvider(callModel)).CallWithRetry(ctx, "judge", llm.CallParams{
+	comp, err := j.gateway.Call(ctx, "judge", llm.CallParams{
 		Model:       callModel,
-		Messages:    []llm.Message{llm.UserMessage(prompt)},
-		Temperature: 0.0, // deterministic judgment
+		Messages:    []llm.Message{llm.UserMessage(jPrompt)},
+		Temperature: 0.0,
 	})
 	if err != nil {
 		return permissiveVerdict("judge LLM error: " + err.Error()), err
@@ -117,20 +99,14 @@ func (j *Judge) Verify(ctx context.Context, originalTask string, conversation []
 		return permissiveVerdict("judge parse error: " + perr.Error()), perr
 	}
 
-	// Enforce minScore: any sub-threshold verdict gets ShouldRetry=true.
 	if verdict.Score < j.minScore {
 		verdict.ShouldRetry = true
-		if verdict.Approved {
-			verdict.Approved = false
-		}
+		verdict.Approved = false
 	}
-
 	return verdict, nil
 }
 
-// buildPrompt assembles the judge's evaluation prompt.
 func (j *Judge) buildPrompt(originalTask string, conversation []llm.Message, toolResults []JudgeToolResult) string {
-	// Conversation tail: focus on what the agent actually did recently.
 	var convo strings.Builder
 	start := 0
 	if len(conversation) > j.maxHistory {
@@ -138,8 +114,6 @@ func (j *Judge) buildPrompt(originalTask string, conversation []llm.Message, too
 	}
 	for i := start; i < len(conversation); i++ {
 		msg := conversation[i]
-		// Skip system messages; the judge doesn't need the agent's
-		// (huge) own system prompt to evaluate outcomes.
 		if msg.Role == llm.RoleSystem {
 			continue
 		}
@@ -155,18 +129,16 @@ func (j *Judge) buildPrompt(originalTask string, conversation []llm.Message, too
 		}
 	}
 
-	// Tool results: omitted entirely when the round had none.
 	toolResultsBlock := ""
 	if len(toolResults) > 0 {
 		var tr strings.Builder
 		tr.WriteString("<tool_results>\n")
 		for _, t := range toolResults {
-			status := "ok"
-			if t.Failed {
-				status = "FAILED"
-			}
 			fmt.Fprintf(&tr, "- [%s] %s(%s) -> %s\n",
-				status, t.ToolName, utils.Truncate(t.Args, 120), utils.Truncate(t.Output, 400))
+				t.Status, t.ToolName, utils.Truncate(t.Args, 120), utils.Truncate(t.Output, 400))
+			if t.Reason != "" {
+				fmt.Fprintf(&tr, "  reason: %s\n", utils.Truncate(t.Reason, 240))
+			}
 		}
 		tr.WriteString("</tool_results>\n\n")
 		toolResultsBlock = tr.String()
@@ -181,21 +153,17 @@ func (j *Judge) buildPrompt(originalTask string, conversation []llm.Message, too
 	})
 }
 
-// parseJudgeResponse extracts JSON verdict from the LLM's raw output.
 func parseJudgeResponse(content string) (*JudgeVerdict, error) {
 	start := strings.Index(content, "{")
 	end := strings.LastIndex(content, "}")
 	if start < 0 || end < 0 || end <= start {
-		return nil, fmt.Errorf("no JSON object found in judge response: %s", utils.Truncate(content, 200))
+		return nil, fmt.Errorf("no JSON object found: %s", utils.Truncate(content, 200))
 	}
 	raw := content[start : end+1]
-
 	var v JudgeVerdict
 	if err := json.Unmarshal([]byte(raw), &v); err != nil {
-		return nil, fmt.Errorf("unmarshal failed: %w, raw=%s", err, utils.Truncate(raw, 200))
+		return nil, fmt.Errorf("unmarshal failed: %w", err)
 	}
-
-	// Normalize score to [1, 10]; defensive against bogus LLM output.
 	if v.Score < 1 {
 		v.Score = 1
 	}
@@ -205,7 +173,6 @@ func parseJudgeResponse(content string) (*JudgeVerdict, error) {
 	return &v, nil
 }
 
-// permissiveVerdict produces a pass-through verdict for infrastructure failures.
 func permissiveVerdict(reason string) *JudgeVerdict {
 	return &JudgeVerdict{
 		Approved:    true,

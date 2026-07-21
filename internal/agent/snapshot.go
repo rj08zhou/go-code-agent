@@ -1,69 +1,97 @@
-// Snapshot-and-rollback (Saga) for risky write tools.
-//
-// Before each risky tool call, snapshot via `git stash create`;
-// on failure, restore via `git read-tree`. Opt-in via SNAPSHOT_ENABLED=1.
-// No-op outside a git repo. Untracked files are not snapshotted.
 package agent
 
 import (
 	"context"
 	"fmt"
-	"go-code-agent/internal/logging"
+	"go-code-agent-refactor/internal/tool"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 )
 
-var riskySnapshotTools = map[string]bool{
-	"write_file":      true,
-	"edit_file":       true,
-	"delete_file":     true,
-	"bash":            true,
-	"execute_command": true,
-	"background_run":  true,
+// riskySnapshotTools is read-only after init; safe for concurrent access.
+func isRiskySnapshotTool(name string) bool {
+	_, ok := riskySnapshotTools[name]
+	return ok
 }
 
-type snapshotState struct {
+var riskySnapshotTools = map[string]bool{
+	"write_file":     true,
+	"edit_file":      true,
+	"delete_file":    true,
+	"bash":           true,
+	"background_run": true,
+}
+
+// SnapshotManager handles git stash-based snapshot and rollback.
+type SnapshotManager struct {
 	mu      sync.Mutex
 	enabled bool
+	workdir string
 }
 
-func (s *snapshotState) Enable()  { s.mu.Lock(); defer s.mu.Unlock(); s.enabled = true }
-func (s *snapshotState) Disable() { s.mu.Lock(); defer s.mu.Unlock(); s.enabled = false }
-func (s *snapshotState) IsEnabled() bool {
+func NewSnapshotManager(enabled bool, workdir string) *SnapshotManager {
+	return &SnapshotManager{enabled: enabled, workdir: workdir}
+}
+
+func (s *SnapshotManager) Enable()  { s.mu.Lock(); defer s.mu.Unlock(); s.enabled = true }
+func (s *SnapshotManager) Disable() { s.mu.Lock(); defer s.mu.Unlock(); s.enabled = false }
+func (s *SnapshotManager) IsEnabled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.enabled
 }
 
-func snapshotShouldWrap(toolName string) bool {
-	if App.Snapshot == nil || !App.Snapshot.IsEnabled() {
+// ShouldWrap reports whether a tool call should be snapshotted.
+func (s *SnapshotManager) ShouldWrap(toolName string) bool {
+	if !s.IsEnabled() || !isRiskySnapshotTool(toolName) {
 		return false
 	}
-	if !riskySnapshotTools[toolName] {
-		return false
-	}
-	return isGitRepo()
+	return isGitRepo(s.workdir)
 }
 
-func isGitRepo() bool {
+// WithSnapshot wraps a tool invocation with snapshot/rollback.
+func (s *SnapshotManager) WithSnapshot(toolName string, run func() tool.Result) tool.Result {
+	if !s.ShouldWrap(toolName) {
+		return run()
+	}
+	sha, err := takeSnapshot(s.workdir)
+	if err != nil {
+		fmt.Printf("[snapshot] skip (%v)\n", err)
+		return run()
+	}
+	result := run()
+	if result.Succeeded() {
+		return result
+	}
+	// Failed — rollback
+	if rerr := restoreSnapshot(s.workdir, sha); rerr != nil {
+		fmt.Printf("[snapshot] rollback failed: %v\n", rerr)
+		result.Output += fmt.Sprintf("\n[snapshot] rollback FAILED: %v", rerr)
+		return result
+	}
+	if sha != "" {
+		fmt.Printf("[snapshot] rolled back '%s' to %s\n", toolName, sha[:8])
+		result.Output += fmt.Sprintf("\n[snapshot] working tree restored to pre-call state (%s)", sha[:8])
+	}
+	return result
+}
+
+func isGitRepo(dir string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--is-inside-work-tree")
-	cmd.Dir = App.Workdir
+	cmd.Dir = dir
 	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(out)) == "true"
+	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
-func takeSnapshot() (string, error) {
+func takeSnapshot(dir string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "stash", "create")
-	cmd.Dir = App.Workdir
+	cmd := exec.CommandContext(ctx, "git", "stash", "create", "--include-untracked")
+	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("git stash create: %w", err)
@@ -71,49 +99,16 @@ func takeSnapshot() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func restoreSnapshot(sha string) error {
+func restoreSnapshot(dir, sha string) error {
 	if sha == "" {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	cmd := exec.CommandContext(ctx, "git", "read-tree", "-u", "--reset", sha)
-	cmd.Dir = App.Workdir
+	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("read-tree: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
-}
-
-// withSnapshot wraps a tool invocation with snapshot/rollback.
-func withSnapshot(toolName string, run func() ToolResult) ToolResult {
-	if !snapshotShouldWrap(toolName) {
-		return run()
-	}
-
-	sha, err := takeSnapshot()
-	if err != nil {
-		// If snapshot itself fails, proceed without it — never block
-		// the agent on infra issues.
-		logging.PrintSystem(fmt.Sprintf("[snapshot] skip (%v)", err))
-		return run()
-	}
-
-	result := run()
-	if result.OK {
-		return result
-	}
-
-	// Failed — try rollback.
-	if rerr := restoreSnapshot(sha); rerr != nil {
-		logging.PrintSystem(fmt.Sprintf("[snapshot] rollback failed: %v", rerr))
-		result.Output += fmt.Sprintf("\n[snapshot] rollback FAILED: %v (workspace may be in partial state)", rerr)
-		return result
-	}
-	if sha != "" {
-		logging.PrintSystem(fmt.Sprintf("[snapshot] rolled back '%s' to %s", toolName, sha[:8]))
-		result.Output += fmt.Sprintf("\n[snapshot] working tree restored to pre-call state (%s)", sha[:8])
-	}
-	return result
 }

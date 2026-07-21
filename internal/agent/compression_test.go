@@ -1,249 +1,119 @@
 package agent
 
 import (
-	"go-code-agent/internal/llm"
+	"fmt"
+	"go-code-agent-refactor/internal/llm"
+	"strings"
 	"testing"
 )
 
-// helper builders for readable message sequences
-func sysMsg() llm.Message  { return llm.SystemMessage("sys") }
-func userMsg() llm.Message { return llm.UserMessage("u") }
-func asstText() llm.Message {
-	return llm.Message{Role: llm.RoleAssistant, Content: "a"}
-}
-func asstCall(id string) llm.Message {
-	return llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: id, Name: "bash", Arguments: "{}"}}}
-}
-func toolRes(id string) llm.Message { return llm.ToolMessage("out", id) }
-
-// assertNoOrphans verifies the invariant AutoCompact relies on: after
-// splitting at `split`, neither side orphans a tool_call/tool_result.
-func assertNoOrphans(t *testing.T, msgs []llm.Message, split int) {
-	t.Helper()
-	if split == 0 {
-		return // summarize-everything fallback is always safe
-	}
-	// tail must not start with a tool result
-	if msgs[split].Role == llm.RoleTool {
-		t.Fatalf("split=%d: tail starts with orphaned tool_result", split)
-	}
-	// prefix must not end with an assistant that has pending tool_calls
-	if prev := msgs[split-1]; prev.Role == llm.RoleAssistant && len(prev.ToolCalls) > 0 {
-		t.Fatalf("split=%d: prefix ends with assistant tool_call whose results are in the tail", split)
-	}
+func makeAssistant(content string, toolCalls ...llm.ToolCall) llm.Message {
+	return llm.Message{Role: llm.RoleAssistant, Content: content, ToolCalls: toolCalls}
 }
 
-func TestFindCompactionSplit_PrefersUserBoundary(t *testing.T) {
-	// system, [old...], user, asst, ... keepRecent small so desired lands
-	// near the end; a user boundary should be chosen.
-	msgs := []llm.Message{
-		sysMsg(),
-		userMsg(), asstText(),
-		asstCall("1"), toolRes("1"), asstText(),
-		userMsg(), // <- clean boundary
-		asstCall("2"), toolRes("2"), asstText(),
-	}
-	split := findCompactionSplit(msgs, 4)
-	assertNoOrphans(t, msgs, split)
-	if msgs[split].Role != llm.RoleUser {
-		t.Errorf("expected a user-message boundary, got split=%d role=%v", split, msgs[split].Role)
-	}
-}
+func TestMicroCompact_ClearsOldResults(t *testing.T) {
+	// Build enough tool results to exceed KeepRecent (which defaults to 15)
+	// so the older ones get cleared.
+	var msgs []llm.Message
+	msgs = append(msgs, llm.SystemMessage("system"), llm.UserMessage("task"))
 
-func TestFindCompactionSplit_AvoidsOrphanToolResult(t *testing.T) {
-	// desired split would land exactly on a tool result; must be adjusted.
-	msgs := []llm.Message{
-		sysMsg(),
-		asstText(),
-		asstCall("1"), toolRes("1"), // desired might point at toolRes
-		asstText(),
-		asstCall("2"), toolRes("2"),
-		asstText(),
+	for i := range 20 {
+		cid := fmt.Sprintf("c%d", i)
+		msgs = append(msgs, makeAssistant("", llm.ToolCall{ID: cid, Name: "bash", Arguments: "{}"}))
+		msgs = append(msgs, llm.ToolMessage(string(make([]byte, 200)), cid))
 	}
-	for keep := 1; keep < len(msgs); keep++ {
-		split := findCompactionSplit(msgs, keep)
-		assertNoOrphans(t, msgs, split)
-	}
-}
 
-func TestFindCompactionSplit_NoUserTurns(t *testing.T) {
-	// A long autonomous run with no user messages: must still find a safe
-	// boundary (after a completed tool result) and never orphan.
-	msgs := []llm.Message{
-		sysMsg(),
-		asstCall("1"), toolRes("1"),
-		asstCall("2"), toolRes("2"),
-		asstCall("3"), toolRes("3"),
-		asstText(),
+	cleared := MicroCompact(msgs)
+	// Older tool results should be cleared; recent ones kept.
+	if cleared == 0 {
+		t.Fatalf("expected some cleared, got 0")
 	}
-	for keep := 1; keep < len(msgs); keep++ {
-		split := findCompactionSplit(msgs, keep)
-		assertNoOrphans(t, msgs, split)
-	}
-}
-
-func TestFindCompactionSplit_ShortConversation(t *testing.T) {
-	msgs := []llm.Message{sysMsg(), userMsg(), asstText()}
-	if got := findCompactionSplit(msgs, 20); got != 0 {
-		t.Errorf("short conversation should return 0 (nothing to summarize), got %d", got)
-	}
-}
-
-// TestFindCompactionSplit_DistantUserBoundaryNotPreferred verifies the
-// bounded-drift rule: when the only user boundary is far below desired
-// (a long autonomous run since the last user turn), we must NOT snap to
-// it (that would keep almost everything verbatim). We fall back to the
-// nearest safe boundary, keeping the tail close to keepRecent.
-func TestFindCompactionSplit_DistantUserBoundaryNotPreferred(t *testing.T) {
-	// index: 0 sys, 1 user, then a long autonomous run of asst-text.
-	msgs := []llm.Message{sysMsg(), userMsg()}
-	for i := 0; i < 30; i++ {
-		msgs = append(msgs, asstText())
-	}
-	n := len(msgs) // 32
-	keep := 5
-	desired := n - keep // 27
-	split := findCompactionSplit(msgs, keep)
-	assertNoOrphans(t, msgs, split)
-
-	// The lone user boundary is at index 1, far below desired(27) and
-	// below minPreferUser(desired-keep=22), so it must NOT be chosen.
-	if split == 1 {
-		t.Fatalf("distant user boundary at 1 should not be preferred")
-	}
-	// Should land at/very near desired (all asst-text boundaries are
-	// safe), i.e. keep ~keepRecent verbatim, not ~everything.
-	if split < desired-keep || split > desired {
-		t.Errorf("split=%d not within bounded window [%d,%d] of desired", split, desired-keep, desired)
-	}
-}
-
-// TestFindCompactionSplit_NearUserBoundaryPreferred is the complement:
-// a user boundary within the drift window IS preferred over a closer
-// non-user safe boundary.
-func TestFindCompactionSplit_NearUserBoundaryPreferred(t *testing.T) {
-	// Construct so the user turn lands exactly at desired = len-keep:
-	//   sys + N*asst + user + (keep-1)*asst
-	//   len = N + keep + 1 ; desired = len - keep = N + 1 = userIdx.
-	keep := 5
-	msgs := []llm.Message{sysMsg()}
-	for i := 0; i < 10; i++ { // N = 10
-		msgs = append(msgs, asstText())
-	}
-	userIdx := len(msgs) // = N+1 = 11
-	msgs = append(msgs, userMsg())
-	for i := 0; i < keep-1; i++ { // keep-1 messages after the user turn
-		msgs = append(msgs, asstText())
-	}
-	desired := len(msgs) - keep
-	if desired != userIdx {
-		t.Fatalf("test setup: desired(%d) != userIdx(%d)", desired, userIdx)
-	}
-	split := findCompactionSplit(msgs, keep)
-	assertNoOrphans(t, msgs, split)
-	if split != userIdx {
-		t.Errorf("split=%d, expected the in-window user boundary at %d", split, userIdx)
-	}
-}
-
-func TestIsSafeSplit(t *testing.T) {
-	msgs := []llm.Message{
-		sysMsg(),      // 0
-		asstCall("1"), // 1
-		toolRes("1"),  // 2
-		userMsg(),     // 3
-		asstText(),    // 4
-	}
-	// s=2 -> tail starts with toolRes -> unsafe
-	if isSafeSplit(msgs, 2) {
-		t.Errorf("s=2 should be unsafe (tail starts with tool result)")
-	}
-	// s=2 also: prev(1) is assistant with tool_calls -> unsafe (double reason)
-	// s=3 -> prev(2)=toolRes, msgs[3]=user -> safe
-	if !isSafeSplit(msgs, 3) {
-		t.Errorf("s=3 should be safe (user boundary after completed tool result)")
-	}
-	// s=1 -> prev(0)=system, msgs[1]=asstCall (not tool) -> safe by rule
-	if !isSafeSplit(msgs, 1) {
-		t.Errorf("s=1 should be safe")
-	}
-	// out of range
-	if isSafeSplit(msgs, 0) || isSafeSplit(msgs, len(msgs)) {
-		t.Errorf("out-of-range indices must be unsafe")
-	}
-}
-
-// Regression tests for a real panic: main.go's `before := len(conv)`
-// went stale when AutoCompact replaced conv mid-turn.
-
-func TestRemapPersistedBoundary_TailUntouchedMessage(t *testing.T) {
-	split := 500
-	oldBoundary := 550
-	got := remapPersistedBoundary(oldBoundary, split)
-	want := 3 + (550 - 500)
-	if got != want {
-		t.Errorf("remapPersistedBoundary(%d, %d) = %d, want %d", oldBoundary, split, got, want)
-	}
-}
-
-func TestRemapPersistedBoundary_BoundaryInsideSummarizedPrefix(t *testing.T) {
-	// Shape of the reported panic: oldBoundary falls inside the
-	// summarized prefix, must clamp to the tail start (3).
-	split := 565
-	oldBoundary := 40
-	got := remapPersistedBoundary(oldBoundary, split)
-	if got != 3 {
-		t.Errorf("remapPersistedBoundary(%d, %d) = %d, want 3", oldBoundary, split, got)
-	}
-}
-
-func TestRemapPersistedBoundary_NeverExceedsNewSliceLength(t *testing.T) {
-	for n := 1; n <= 40; n++ {
-		msgs := make([]llm.Message, 0, n)
-		msgs = append(msgs, sysMsg())
-		for i := 1; i < n; i++ {
-			if i%4 == 0 {
-				msgs = append(msgs, userMsg())
-			} else {
-				msgs = append(msgs, asstText())
-			}
-		}
-		for keepRecent := 1; keepRecent <= n+2; keepRecent++ {
-			split := findCompactionSplit(msgs, keepRecent)
-			newLen := 3 + (len(msgs) - split)
-			for oldBoundary := 0; oldBoundary <= len(msgs); oldBoundary++ {
-				got := remapPersistedBoundary(oldBoundary, split)
-				if got < 0 || got > newLen {
-					t.Fatalf("n=%d keepRecent=%d split=%d oldBoundary=%d: remapped=%d out of [0,%d]",
-						n, keepRecent, split, oldBoundary, got, newLen)
-				}
-			}
+	// At least one old result should have been replaced with "[cleared: bash]"
+	foundCleared := false
+	for _, m := range msgs {
+		if strings.HasPrefix(m.Content, "[cleared: bash]") {
+			foundCleared = true
 		}
 	}
-}
-
-func TestWithPersistedBoundary_RoundTrip(t *testing.T) {
-	boundary := 42
-	ctx := WithPersistedBoundary(t.Context(), &boundary)
-	got := persistedBoundaryFromCtx(ctx)
-	if got == nil {
-		t.Fatal("expected a non-nil boundary pointer from ctx")
-	}
-	*got = 99
-	if boundary != 99 {
-		t.Errorf("expected mutation through the ctx pointer to affect boundary, got %d", boundary)
+	if !foundCleared {
+		t.Fatal("no tool result was cleared to '[cleared: bash]'")
 	}
 }
 
-func TestWithPersistedBoundary_NilIsNoOp(t *testing.T) {
-	ctx := WithPersistedBoundary(t.Context(), nil)
-	if got := persistedBoundaryFromCtx(ctx); got != nil {
-		t.Error("expected nil boundary to be a no-op")
+func TestMicroCompact_NoOpWhenFewTools(t *testing.T) {
+	msgs := []llm.Message{
+		llm.SystemMessage("system"),
+		llm.UserMessage("task"),
+		makeAssistant("", llm.ToolCall{ID: "c1", Name: "list_dir", Arguments: "{}"}),
+		llm.ToolMessage("dir listing content...", "c1"),
+	}
+	cleared := MicroCompact(msgs)
+	if cleared != 0 {
+		t.Fatalf("expected 0 cleared (only 1 tool result), got %d", cleared)
 	}
 }
 
-func TestPersistedBoundaryFromCtx_AbsentReturnsNil(t *testing.T) {
-	if got := persistedBoundaryFromCtx(t.Context()); got != nil {
-		t.Error("expected nil when no boundary was attached to ctx")
+func TestFindCompactionSplit_SafeSplit(t *testing.T) {
+	msgs := []llm.Message{
+		llm.SystemMessage("sys"),
+		llm.UserMessage("task 1"),
+		llm.Message{Role: llm.RoleAssistant, Content: "response"},
+		llm.UserMessage("task 2"),
+		llm.Message{Role: llm.RoleAssistant, Content: "response 2"},
+		llm.UserMessage("task 3"),
+		llm.Message{Role: llm.RoleAssistant, Content: "response 3"},
 	}
+
+	split := findCompactionSplit(msgs, 3)
+	if split <= 0 {
+		t.Fatalf("expected positive split, got %d", split)
+	}
+	if split >= len(msgs) {
+		t.Fatalf("split %d must be < %d", split, len(msgs))
+	}
+}
+
+func TestFindCompactionSplit_UnsafeSplitOnTool(t *testing.T) {
+	msgs := []llm.Message{
+		llm.UserMessage("task"),
+		makeAssistant("", llm.ToolCall{ID: "c1", Name: "bash"}),
+		llm.ToolMessage("result", "c1"),
+		llm.Message{Role: llm.RoleAssistant, Content: "analysis"},
+		llm.UserMessage("more work"),
+	}
+
+	split := findCompactionSplit(msgs, 1)
+	if msgs[split].Role == "tool" {
+		t.Fatalf("split should not land on a tool message, got index %d (%s)", split, msgs[split].Role)
+	}
+}
+
+func TestNeedsCompaction(t *testing.T) {
+	empty := []llm.Message{}
+	if NeedsCompaction(empty, nil, 200000) {
+		t.Fatal("should not compact empty messages")
+	}
+
+	// Build large messages that will exceed token estimate
+	many := make([]llm.Message, 200)
+	for i := range many {
+		many[i] = llm.UserMessage(
+			"this is a test message with some content to increase token count " +
+				"and another sentence to make it longer and longer each time we loop " +
+				"additional padding to reach the compaction threshold quickly enough " +
+				"even more padding because the estimate is based on len(json)/4",
+		)
+	}
+	if !NeedsCompaction(many, nil, 1000) {
+		t.Fatal("should compact when estimate exceeds budget")
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }

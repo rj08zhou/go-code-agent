@@ -4,131 +4,137 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent/infra"
-	"go-code-agent/internal/llm"
-	"go-code-agent/internal/logging"
-	"go-code-agent/utils"
+	"go-code-agent-refactor/internal/event"
+	"go-code-agent-refactor/internal/llm"
+	"go-code-agent-refactor/internal/model"
+	"go-code-agent-refactor/internal/tool"
+	"go-code-agent-refactor/internal/utils"
 	"strings"
-	"time"
 )
 
-// Subagent - isolated read-only agent loop, returns summary only.
+// SubagentRunner runs an isolated read-only agent loop using the unified Runner
+// and returns a summary string.
+type SubagentRunner struct {
+	gateway   *model.Gateway
+	catalog   *tool.ToolCatalog
+	modelID   string
+	eventSink event.Sink
+	compress  *Compression
+}
 
-func runSubagent(ctx context.Context, prompt, agentType string) string {
-	// Subagents never receive write tools.
-	subTools := coreToolDefs(false)
-	subHandlers := coreToolHandlers(false)
+func NewSubagentRunner(gw *model.Gateway, catalog *tool.ToolCatalog, modelID string) *SubagentRunner {
+	return &SubagentRunner{gateway: gw, catalog: catalog, modelID: modelID}
+}
 
-	// Inject type-specific tools.
-	switch agentType {
-	case "web_fetch":
-		raw := rawWebFetchSpec()
-		subTools = append(subTools, raw.Def)
-		subHandlers[raw.Def.Name] = raw.Handler
-	}
+func (s *SubagentRunner) SetEventSink(sink event.Sink) {
+	s.eventSink = sink
+}
 
+// SetCompression enables auto-compaction for subagent runners.
+// Without it, subagent context grows unboundedly over many rounds
+// (MicroCompact only clears old tool results, not the growing
+// assistant / user message stack).
+func (s *SubagentRunner) SetCompression(c *Compression) {
+	s.compress = c
+}
+
+// Run executes a subagent investigation using the unified Runner and returns a summary.
+func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir string) string {
 	role := agentType
 	if role == "" {
-		role = "Explore"
+		role = "explore"
+		agentType = "explore"
 	}
 
-	// Build a role-tailored system prompt.
-	var sysPrompt string
-	switch agentType {
-	case "web_fetch":
-		sysPrompt = fmt.Sprintf(
-			"You are a web research subagent (role=%s). You fetch and analyze web pages, then return a concise summary to the parent agent. "+
-				"You can also read local files and run safe shell commands for reference. "+
-				"You have NO write/edit/delete tools. "+
-				"Use web_fetch to retrieve the target page. Read the content carefully, then answer the user's question directly from the page. "+
-				"Keep your response focused and relevant — do NOT add unrelated commentary or repeat boilerplate.",
-			role,
-		)
-	default:
-		sysPrompt = fmt.Sprintf(
-			"You are a coding subagent (role=%s). You can read files and run safe shell "+
-				"commands to investigate, but you have NO write/edit/delete tools. "+
-				"Investigate efficiently: when you need a specific fact, symbol, constant "+
-				"or a few lines, locate it first with grep/rg via bash (e.g. rg -n \"Name\" .) "+
-				"and read only the relevant part (pass read_file's `limit` for large files). "+
-				"Do NOT read entire large files just to check one value - it burns context "+
-				"and triggers compaction. "+
-				"If the task requires modifying files, do the investigation, then "+
-				"return a concise summary describing exactly what change is needed "+
-				"and why — the parent agent will perform the write.",
-			role,
-		)
+	sysPrompt := buildSubagentSystemPrompt(role, agentType)
+
+	// Build scope and profile for the subagent
+	scope := &tool.ToolScope{
+		Role:       "explore",
+		Workdir:    workdir,
+		AgentID:    fmt.Sprintf("subagent-%s", agentType),
+		CanRead:    true,
+		CanWrite:   false,
+		CanExecute: true,
+		CanNetwork: (agentType == "web_fetch"),
+		CanTeam:    false,
+		CanMemory:  false,
 	}
 
-	msgs := []llm.Message{
+	profile := NewExploreProfile()
+	profile.SystemPrompt = sysPrompt
+	profile.CanNetwork = (agentType == "web_fetch")
+
+	// Create executor and runner for this subagent invocation.
+	// Subagent tool output is truncated so raw file contents don't
+	// collapse DeepSeek's prefix cache (each read_file appends
+	// thousands of chars to the message list, reshuffling the
+	// entire prefix for subsequent requests).
+	exec := tool.NewExecutor(s.catalog, nil, nil).
+		WithSanitizer(&truncateSanitizer{maxLen: 3000})
+	runner := NewRunner(profile, s.gateway, exec, scope)
+	runner.SetEventSink(s.eventSink)
+	if s.compress != nil {
+		runner.SetCompression(s.compress)
+	}
+
+	messages := []llm.Message{
 		llm.SystemMessage(sysPrompt),
 		llm.UserMessage(prompt),
 	}
 
-	var softDeadline time.Time
-	if dl, ok := ctx.Deadline(); ok {
-		softDeadline = dl.Add(-infra.SubagentSoftDeadlineBuffer)
-	}
+	traceID := model.NewTraceID()
+	outcome := runner.Run(ctx, messages, traceID)
 
+	finalText := lastAssistantText(outcome.Messages)
+
+	// Collect tool step descriptions before handling errors so partial work
+	// is not lost when the parent context is cancelled or the budget expires.
 	var steps []string
-	var lastContent string
-	timedOut := false
+	for _, tr := range outcome.ToolResults {
+		steps = append(steps, fmt.Sprintf("%s(%s)", tr.Name, subagentArgHint(tr.Args)))
+	}
 
-	for range infra.SubagentMaxRounds {
-		if !softDeadline.IsZero() && !time.Now().Before(softDeadline) {
-			timedOut = true
-			break
-		}
+	if outcome.Error != nil {
 		if ctx.Err() != nil {
-			timedOut = true
-			break
+			return formatSubagentTimeoutSummary(steps, finalText)
 		}
-
-		sr, err := llm.NewClient(nil).StreamWithRetrySink(ctx, "subagent", llm.CallParams{Model: App.Model, Messages: msgs, Tools: subTools, MaxTokens: infra.DefaultMaxOutputTokens},
-			&llm.PrefixedStreamSink{Prefix: "[sub]", Color: logging.ColorCyan})
-		if err != nil {
-			if ctx.Err() != nil {
-				timedOut = true
-				break
-			}
-			return fmt.Sprintf("Subagent error: %v", err)
-		}
-		if sr == nil {
-			return "Subagent error: empty response"
-		}
-		lastContent = sr.Content
-		msgs = append(msgs, sr.ToAssistantMessage())
-		if sr.FinishReason != "tool_calls" {
-			break
-		}
-		for _, tc := range sr.ToolCalls {
-			// Skip tool calls with truncated JSON arguments.
-			if tc.Arguments != "" && !json.Valid([]byte(tc.Arguments)) {
-				out := fmt.Sprintf("[SKIPPED] tool call '%s' has truncated arguments", tc.Name)
-				logging.PrintSubTool(tc.Name, out)
-				msgs = append(msgs, llm.ToolMessage(out, tc.ID))
-				continue
-			}
-			out := dispatchSubagentTool(ctx, tc, subHandlers)
-			logging.PrintSubTool(tc.Name, out)
-			msgs = append(msgs, llm.ToolMessage(out, tc.ID))
-			steps = append(steps, fmt.Sprintf("%s(%s)", tc.Name, subagentArgHint(tc.Arguments)))
-		}
+		return fmt.Sprintf("Subagent error: %v", outcome.Error)
 	}
 
-	if timedOut {
-		return formatSubagentTimeoutSummary(steps, lastContent)
+	if outcome.StoppedReason == "prompt_budget" {
+		return formatSubagentStoppedSummary("prompt budget exhausted", steps, finalText)
 	}
-	if lastContent != "" {
-		return lastContent
+	if outcome.Completed {
+		return finalText
 	}
-	return "(no summary)"
+	if finalText != "" {
+		return finalText
+	}
+	return formatSubagentTimeoutSummary(steps, finalText)
 }
 
-// subagentArgHint extracts a short, human-readable hint from a tool
-// call's raw JSON arguments for the progress trail (e.g. a file path),
-// falling back to a truncated raw dump for tools with no recognized
-// field. Best-effort only - never fails the caller.
+func buildSubagentSystemPrompt(role, agentType string) string {
+	switch agentType {
+	case "web_fetch":
+		return fmt.Sprintf(
+			"You are a web research subagent (role=%s). You fetch and analyze web pages, then return a concise summary. "+
+				"You have NO write/edit/delete tools. Use web_fetch to retrieve the target page. "+
+				"Keep your response focused and relevant.",
+			role)
+	default:
+		return fmt.Sprintf(
+			"You are a coding subagent (role=%s). You can read files and run safe shell "+
+				"commands to investigate, but you have NO write/edit/delete tools. "+
+				"Investigate efficiently: when you need a specific fact, locate it first with grep/rg. "+
+				"Do NOT read entire large files just to check one value. "+
+				"If the task requires modifying files, return a concise summary of what change is needed. "+
+				"Report only files, symbols, and command results you actually observed; never invent paths, tests, or implementation details. "+
+				"If something was not verified, say so explicitly.",
+			role)
+	}
+}
+
 func subagentArgHint(rawArgs string) string {
 	if rawArgs == "" {
 		return ""
@@ -154,16 +160,13 @@ func subagentArgHint(rawArgs string) string {
 	return utils.Truncate(rawArgs, 60)
 }
 
-// formatSubagentTimeoutSummary builds the partial-progress report
-// returned when the subagent hits its soft deadline (or real
-// cancellation) instead of finishing normally. This is the fix for
-// the failure mode where a task call that ran out of time used to
-// return a bare timeout error and silently discard every file it had
-// already read - forcing the parent agent to redo the same
-// exploration from scratch.
 func formatSubagentTimeoutSummary(steps []string, lastContent string) string {
+	return formatSubagentStoppedSummary("time budget exhausted", steps, lastContent)
+}
+
+func formatSubagentStoppedSummary(reason string, steps []string, lastContent string) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("[Subagent stopped early - time budget exhausted after %d tool call(s)]\n", len(steps)))
+	b.WriteString(fmt.Sprintf("[Subagent stopped early - %s after %d tool call(s)]\n", reason, len(steps)))
 	if len(steps) > 0 {
 		b.WriteString("Investigated so far:\n")
 		for _, s := range steps {
@@ -176,33 +179,80 @@ func formatSubagentTimeoutSummary(steps []string, lastContent string) string {
 	if lastContent != "" {
 		b.WriteString(lastContent)
 	} else {
-		b.WriteString("(none yet)")
+		b.WriteString("(none)")
 	}
-	b.WriteString("\n\nThe investigation above is INCOMPLETE. Use it as a starting point " +
-		"(e.g. avoid re-reading the files already listed) rather than re-exploring from scratch.")
+	b.WriteString("\n\nThe investigation above is INCOMPLETE. Use it as a starting point.")
 	return b.String()
 }
 
-// dispatchSubagentTool runs security/HITL gates against the subagent's
-// restricted handler map. On rejection, returns a tool-result describing it.
-func dispatchSubagentTool(ctx context.Context, tc llm.ToolCall, handlers map[string]ToolHandler) string {
-	// Security gate.
-	if approved, reason := checkToolApproval(tc.Name, tc.Arguments); !approved {
-		return fmt.Sprintf("[SECURITY] %s", reason)
-	}
-
-	// HITL gate.
-	if g := runHITLGate(tc); g != nil {
-		if g.Rejected {
-			return fmt.Sprintf("[HITL-REJECTED] %s", g.Reason)
+// lastAssistantText returns the content of the last assistant message.
+func lastAssistantText(msgs []llm.Message) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" && msgs[i].Content != "" {
+			return msgs[i].Content
 		}
-		return fmt.Sprintf("[HITL-MODIFY] %s", g.Feedback)
 	}
+	return ""
+}
 
-	h, ok := handlers[tc.Name]
-	if !ok {
-		return fmt.Sprintf("[ERROR] tool %q is not available in subagent context", tc.Name)
+// prefixedSink wraps a model.StreamSink with a prefix and color consistent
+// with the original project's terminal output conventions.
+//
+//	lead   → green body, no [lead] prefix
+//	explore/teammate → cyan [sub] prefix, cyan body
+type prefixedSink struct {
+	Prefix string
+	color  string
+	isLead bool
+}
+
+func newPrefixedSink(role string) *prefixedSink {
+	s := &prefixedSink{Prefix: role}
+	if role == "lead" {
+		s.isLead = true
+		s.color = utils.Green
+	} else {
+		s.color = utils.Cyan
 	}
-	result := h(ctx, json.RawMessage(tc.Arguments))
-	return result.Output
+	return s
+}
+
+func (s *prefixedSink) OnTextDelta(text string) {
+	// Print immediately instead of buffering until OnDone.
+	// This avoids the user-perceived "hang" when the model is
+	// generating a long response: streaming content is visible in
+	// real time, and Ctrl-C during generation doesn't lose
+	// already-seen output.
+	if s.isLead {
+		fmt.Printf("%s%s%s", s.color, text, utils.Reset)
+	} else {
+		fmt.Printf("%s[sub] %s%s", s.color, text, utils.Reset)
+	}
+}
+
+func (s *prefixedSink) OnDone() {
+	if s.isLead {
+		fmt.Println()
+	} else {
+		fmt.Println()
+	}
+}
+
+// truncateSanitizer caps tool output length in subagents so that
+// raw file contents don't inflate the message list and collapse the
+// prompt prefix cache.
+type truncateSanitizer struct{ maxLen int }
+
+func (t *truncateSanitizer) Sanitize(s string) string {
+	if len(s) <= t.maxLen {
+		return s
+	}
+	if t.maxLen <= 256 {
+		return s[:t.maxLen] + "\n... (truncated)"
+	}
+	// Keep the tail because bounded read/search tools put continuation
+	// metadata (such as next_offset) there. This prevents the model from
+	// repeatedly requesting the same file prefix after truncation.
+	headLen := t.maxLen - 256
+	return s[:headLen] + fmt.Sprintf("\n... (truncated at %d chars) ...\n", t.maxLen) + s[len(s)-256:]
 }

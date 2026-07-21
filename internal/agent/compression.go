@@ -4,30 +4,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent/infra"
-	"go-code-agent/internal/llm"
-	"go-code-agent/internal/logging"
-	"go-code-agent/internal/session"
-	"go-code-agent/utils"
+	"go-code-agent-refactor/internal/config"
+	"go-code-agent-refactor/internal/history"
+	"go-code-agent-refactor/internal/llm"
+	"go-code-agent-refactor/internal/model"
+	"go-code-agent-refactor/internal/utils"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-// Compression layers: microCompact (in-place truncation), AutoCompact (LLM summary).
-
 // CompactedMarker prefixes AutoCompact's synthetic user-message.
-// Used by persistNewMessages (cmd/agent/main.go) to avoid duplicate
-// history entries.
 const CompactedMarker = "[Compressed. "
 
 // persistedBoundaryKey carries a caller-owned "not yet persisted"
-// index pointer through ctx. See WithPersistedBoundary.
+// index pointer through ctx. Used by WithPersistedBoundary so that
+// AutoCompact can keep the boundary valid when it replaces the message
+// slice mid-turn.
 type persistedBoundaryKey struct{}
 
 // WithPersistedBoundary lets AutoCompact keep *boundary valid when it
-// replaces the message slice mid-turn. nil boundary is a no-op.
+// replaces the message slice. nil boundary is a no-op. Matching original.
 func WithPersistedBoundary(ctx context.Context, boundary *int) context.Context {
 	if boundary == nil {
 		return ctx
@@ -45,31 +43,40 @@ func persistedBoundaryFromCtx(ctx context.Context) *int {
 
 // remapPersistedBoundary converts an old-slice index into AutoCompact's
 // new [system, summary, ack, tail...] slice. A boundary in the summarized
-// prefix clamps to 3 (start of tail).
+// prefix clamps to 3 (start of tail). Matching original.
 func remapPersistedBoundary(oldBoundary, split int) int {
-	return 3 + max(0, oldBoundary-split)
+	return 3 + maxval(oldBoundary-split, 0)
 }
 
-// estimateTokens includes ToolDefs in the estimate (every request carries the
-// full tool schema). Thin alias over EstimateRequestTokens to avoid touching
-// every call site.
-func estimateTokens(msgs []llm.Message) int {
-	return llm.EstimateRequestTokens(msgs, ToolDefs)
+func maxval(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
-// microCompact replaces old tool-result content with short placeholders.
-// Returns the number of tool results folded this pass so the caller can
-// surface a decision event (this used to be completely silent).
-func microCompact(msgs []llm.Message) int {
-	return microCompactImpl(msgs)
+// Compression handles microCompact (in-place truncation) and
+// AutoCompact (LLM summary) to keep context windows under budget.
+type Compression struct {
+	gateway    *model.Gateway
+	histStore  *history.Store
+	dataDir    string
+	modelID    string
+	keepRecent int
 }
 
-// MicroCompact is the exported wrapper for microCompact, used by
-// bootConversation to fold stale tool results on history restore.
-func MicroCompact(msgs []llm.Message) int { return microCompactImpl(msgs) }
+func NewCompression(gw *model.Gateway, hs *history.Store, dataDir, modelID string) *Compression {
+	return &Compression{
+		gateway:    gw,
+		histStore:  hs,
+		dataDir:    dataDir,
+		modelID:    modelID,
+		keepRecent: config.KeepRecentMessages,
+	}
+}
 
-func microCompactImpl(msgs []llm.Message) int {
-	// Build tool-call id -> name map for placeholder labels.
+// MicroCompact replaces old tool-result content with short placeholders.
+func MicroCompact(msgs []llm.Message) int {
 	nameMap := map[string]string{}
 	for _, m := range msgs {
 		if m.Role == llm.RoleAssistant {
@@ -88,11 +95,11 @@ func microCompactImpl(msgs []llm.Message) int {
 			toolMsgs = append(toolMsgs, tmInfo{i, m.ToolCallID})
 		}
 	}
-	if len(toolMsgs) <= infra.KeepRecent {
+	if len(toolMsgs) <= config.KeepRecent {
 		return 0
 	}
 	cleared := 0
-	for _, ti := range toolMsgs[:len(toolMsgs)-infra.KeepRecent] {
+	for _, ti := range toolMsgs[:len(toolMsgs)-config.KeepRecent] {
 		if len(msgs[ti.index].Content) > 100 {
 			name := nameMap[ti.callID]
 			if name == "" {
@@ -105,19 +112,13 @@ func microCompactImpl(msgs []llm.Message) int {
 	return cleared
 }
 
-// buildCompressInput renders a message prefix into compact structured text
-// for the summarization LLM call. Unlike raw JSON, it always preserves the
-// first user message (the original task), truncates each message to a short
-// summary (no full tool outputs), and caps total size.
+// buildCompressInput renders a message prefix into compact structured text.
 func buildCompressInput(msgs []llm.Message) string {
-	const (
-		maxMsgChars   = 500
-		maxToolChars  = 200
-		maxArgChars   = 120
-		maxTotalChars = 40000
-	)
+	const maxMsgChars = 500
+	const maxToolChars = 200
+	const maxArgChars = 120
+	const maxTotalChars = 40000
 
-	// Build tool-call id -> name map for labeling tool results.
 	nameMap := map[string]string{}
 	for _, m := range msgs {
 		if m.Role == llm.RoleAssistant {
@@ -126,10 +127,7 @@ func buildCompressInput(msgs []llm.Message) string {
 			}
 		}
 	}
-
 	var b strings.Builder
-
-	// Always include the first real user message as "Original task".
 	for _, m := range msgs {
 		if m.Role == llm.RoleUser && strings.TrimSpace(m.Content) != "" {
 			b.WriteString("## Original task\n")
@@ -138,8 +136,6 @@ func buildCompressInput(msgs []llm.Message) string {
 			break
 		}
 	}
-
-	// Render each message as a compact one-liner.
 	var lines []string
 	for _, m := range msgs {
 		switch m.Role {
@@ -148,30 +144,24 @@ func buildCompressInput(msgs []llm.Message) string {
 		case llm.RoleUser:
 			if strings.HasPrefix(m.Content, "<background-results>") ||
 				strings.HasPrefix(m.Content, "<inbox>") {
-				continue // skip control-block injections
+				continue
 			}
-			lines = append(lines, fmt.Sprintf("[user]: %s",
-				utils.Truncate(m.Content, maxMsgChars)))
+			lines = append(lines, fmt.Sprintf("[user]: %s", utils.Truncate(m.Content, maxMsgChars)))
 		case llm.RoleAssistant:
 			if strings.TrimSpace(m.Content) != "" {
-				lines = append(lines, fmt.Sprintf("[assistant]: %s",
-					utils.Truncate(m.Content, maxMsgChars)))
+				lines = append(lines, fmt.Sprintf("[assistant]: %s", utils.Truncate(m.Content, maxMsgChars)))
 			}
 			for _, tc := range m.ToolCalls {
-				lines = append(lines, fmt.Sprintf("  -> calls %s(%s)",
-					tc.Name, utils.Truncate(tc.Arguments, maxArgChars)))
+				lines = append(lines, fmt.Sprintf("  -> calls %s(%s)", tc.Name, utils.Truncate(tc.Arguments, maxArgChars)))
 			}
 		case llm.RoleTool:
 			name := nameMap[m.ToolCallID]
 			if name == "" {
 				name = "unknown"
 			}
-			lines = append(lines, fmt.Sprintf("  [tool:%s]: %s",
-				name, utils.Truncate(m.Content, maxToolChars)))
+			lines = append(lines, fmt.Sprintf("  [tool:%s]: %s", name, utils.Truncate(m.Content, maxToolChars)))
 		}
 	}
-
-	// Keep the tail of the history (most recent matters most).
 	all := strings.Join(lines, "\n")
 	if len(all) > maxTotalChars {
 		all = all[len(all)-maxTotalChars:]
@@ -179,18 +169,18 @@ func buildCompressInput(msgs []llm.Message) string {
 			all = all[idx+1:]
 		}
 	}
-
 	b.WriteString(all)
 	return b.String()
 }
 
 // AutoCompact performs progressive compaction: summarizes the older prefix
-// and keeps recent turns verbatim. The split is snapped to a safe turn
-// boundary so tool_call/result pairs are never orphaned.
-func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Message {
+// and keeps recent turns verbatim.
+func (c *Compression) AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Message {
 	origCount := len(msgs)
-	origTokens := estimateTokens(msgs)
-	tDir := filepath.Join(App.SessionManager.Active().Dir(), session.SessionTranscriptsDir)
+	origTokens := llm.EstimateRequestTokens(msgs, nil)
+
+	// Save full transcript
+	tDir := filepath.Join(c.dataDir, "transcripts")
 	os.MkdirAll(tDir, 0o755)
 	tPath := filepath.Join(tDir, fmt.Sprintf("transcript_%d.jsonl", time.Now().Unix()))
 	if f, err := os.Create(tPath); err == nil {
@@ -200,13 +190,12 @@ func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 		}
 		f.Close()
 	}
-	logging.PrintSystem(fmt.Sprintf("[transcript saved: %s]", tPath))
+	fmt.Printf("[transcript saved: %s]\n", tPath)
 
-	// Choose the prefix/tail split. prefix = msgs[:split] is summarized,
-	// tail = msgs[split:] is kept verbatim.
-	split := findCompactionSplit(msgs, infra.KeepRecentMessages)
+	// Choose the prefix/tail split
+	split := findCompactionSplit(msgs, c.keepRecent)
 
-	// Summarize the prefix, skipping leading system messages (re-injected below).
+	// Summarize the prefix
 	prefix := msgs[:split]
 	var toSummarize []llm.Message
 	for _, m := range prefix {
@@ -217,9 +206,10 @@ func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 	}
 
 	convText := buildCompressInput(toSummarize)
+	summary := "(summary failed)"
 
-	resp, err := llm.NewClient(nil).CallWithRetry(ctx, "compress", llm.CallParams{
-		Model:     App.Model,
+	resp, err := c.gateway.Call(ctx, "compress", llm.CallParams{
+		Model:     c.modelID,
 		MaxTokens: 4096,
 		Messages: []llm.Message{llm.UserMessage(
 			"Summarize the following EARLIER part of a coding session for continuity. " +
@@ -227,28 +217,24 @@ func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 				"so focus on durable context: the user's goals, decisions made, files/functions touched, and open threads.\n\n" +
 				convText)},
 	})
-	summary := "(summary failed)"
 	if err == nil && resp != nil && strings.TrimSpace(resp.Content) != "" {
 		summary = resp.Content
 	}
 
-	// Persist the compaction as a checkpoint (supersedes prior history for replay).
-	if App != nil && App.History() != nil {
-		covered := App.History().WrittenCount()
-		if err := App.History().AppendCheckpoint(summary, covered); err != nil {
-			logging.PrintSystem(fmt.Sprintf("[history] checkpoint write failed: %v", err))
-		} else {
-			logging.PrintSystem(fmt.Sprintf("[history] checkpoint saved (covered %d entries)", covered))
+	// Persist checkpoint
+	if c.histStore != nil {
+		covered := c.histStore.WrittenCount()
+		if err := c.histStore.AppendCheckpoint(summary, covered); err == nil {
+			fmt.Printf("[history] checkpoint saved (covered %d entries)\n", covered)
 		}
 	}
 
 	tail := msgs[split:]
-	logging.PrintDecision(DecisionContext, fmt.Sprintf(
-		"compacted %d/%d messages (~%d tokens) into a %d-char summary; kept %d recent messages verbatim; full transcript at %s",
-		len(prefix), origCount, origTokens, len(summary), len(tail), tPath))
+	fmt.Printf("[compacted %d/%d messages (~%d tokens) into %d-char summary; kept %d recent]\n",
+		len(prefix), origCount, origTokens, len(summary), len(tail))
 
-	// Remap any caller-tracked persisted-boundary in place (see
-	// WithPersistedBoundary) now that msgs has shrunk.
+	// Remap caller-tracked persisted-boundary in place after the slice
+	// is rebuilt, matching original.
 	if boundary := persistedBoundaryFromCtx(ctx); boundary != nil {
 		*boundary = remapPersistedBoundary(*boundary, split)
 	}
@@ -263,30 +249,19 @@ func AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Mess
 	return out
 }
 
-// findCompactionSplit picks the index that separates the summarized
-// prefix (msgs[:split]) from the verbatim tail (msgs[split:]) for
-// AutoCompact. It targets keeping ~keepRecent trailing messages but
-// snaps to a SAFE turn boundary so compaction never orphans a
-// tool_call from its tool_result.
-//
-// A split index s is safe when BOTH hold:
-//   - msgs[s] is not a tool result (else its originating assistant
-//     tool_call would be summarized into the prefix, orphaning it).
-//   - msgs[s-1] is not an assistant message carrying tool_calls (else
-//     its tool_result messages, which follow at s.., land in the tail,
-//     orphaning the call).
-//
-// Preference order:
-//  1. From the desired index, scan BACKWARD for a RoleUser boundary -
-//     the cleanest split, since a user turn always starts a fresh
-//     exchange - BUT only if it is within keepRecent of desired, so a
-//     distant past user turn can't force us to keep almost the whole
-//     conversation verbatim (bounded drift; tail stays <= ~2*keepRecent).
-//  2. Else the nearest safe boundary at/below desired (keeps the tail
-//     closest to keepRecent).
-//  3. Else scan FORWARD from desired for any safe boundary.
-//  4. Else 0 (summarize everything) - the safe fallback that can never
-//     produce an orphaned pair.
+// NeedsCompaction checks if context exceeds the budget threshold.
+// Matching original: uses EstimateRequestTokens (includes tool defs in
+// the estimate) and has no minimum-message guard.
+func NeedsCompaction(msgs []llm.Message, tools []llm.ToolDef, contextWindowTokens int) bool {
+	est := llm.EstimateRequestTokens(msgs, tools)
+	threshold := int(float64(contextWindowTokens) * config.CompactionThresholdFrac)
+	if threshold > config.TokenThreshold {
+		threshold = config.TokenThreshold
+	}
+	return est > threshold
+}
+
+// findCompactionSplit picks a safe split index.
 func findCompactionSplit(msgs []llm.Message, keepRecent int) int {
 	n := len(msgs)
 	if n <= keepRecent {
@@ -296,48 +271,33 @@ func findCompactionSplit(msgs []llm.Message, keepRecent int) int {
 	if desired < 1 {
 		return 0
 	}
-
-	// A user boundary is only "preferred" when it doesn't drift more
-	// than keepRecent below desired; past that, preferring it would keep
-	// far more than intended and this compaction would free too little
-	// context (possibly re-triggering next round). Below the window we
-	// fall back to bestSafe, the boundary closest to desired.
 	minPreferUser := desired - keepRecent
 	if minPreferUser < 1 {
 		minPreferUser = 1
 	}
-
-	// 1 + 2: scan backward from desired.
 	bestSafe := -1
 	for s := desired; s >= 1; s-- {
 		if !isSafeSplit(msgs, s) {
 			continue
 		}
 		if bestSafe == -1 {
-			bestSafe = s // nearest safe boundary at/below desired
+			bestSafe = s
 		}
 		if msgs[s].Role == llm.RoleUser && s >= minPreferUser {
-			return s // preferred clean boundary, within the drift window
+			return s
 		}
 	}
 	if bestSafe != -1 {
 		return bestSafe
 	}
-
-	// 3: nothing safe at/below desired; look forward (keep fewer).
 	for s := desired + 1; s < n; s++ {
 		if isSafeSplit(msgs, s) {
 			return s
 		}
 	}
-
-	// 4: give up on progressive keep; summarize everything.
 	return 0
 }
 
-// isSafeSplit reports whether splitting at index s keeps every
-// tool_call paired with its tool_result on the same side of the cut.
-// See findCompactionSplit for the rule.
 func isSafeSplit(msgs []llm.Message, s int) bool {
 	if s <= 0 || s >= len(msgs) {
 		return false

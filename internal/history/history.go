@@ -1,10 +1,11 @@
+// Package history provides append-only conversation persistence.
 package history
 
 import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"go-code-agent/internal/llm"
+	"go-code-agent-refactor/internal/llm"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,76 +13,63 @@ import (
 	"time"
 )
 
-// HistoryStore - append-only conversation persistence + checkpoint.
-//
-// Persists the REPL conversation to {session}/history/history.jsonl so
-// the next boot can resume. Each line is one JSON record with a stable
-// schema. Checkpoints record compaction summaries; LoadRuntime replays
-// only entries after the last checkpoint.
-
 const (
-	HistoryFileName = "history.jsonl"
-
-	kindSystem     = "system"
-	kindUser       = "user"
-	kindAssistant  = "assistant"
-	kindTool       = "tool"
-	kindCheckpoint = "checkpoint"
+	FileName = "history.jsonl"
 )
 
-// historyEntry is the on-disk record. Unused fields are omitted via json
-// tags so the jsonl stays readable.
-type historyEntry struct {
-	TS         string                `json:"ts"`
-	Kind       string                `json:"kind"`
-	Content    string                `json:"content,omitempty"`
-	ToolCalls  []historyToolCallRec  `json:"tool_calls,omitempty"`
-	ToolCallID string                `json:"tool_call_id,omitempty"`
-	Summary    string                `json:"summary,omitempty"`
-	Covers     *historyCoverageRange `json:"covers,omitempty"`
+type entryKind string
+
+const (
+	kindSystem     entryKind = "system"
+	kindUser       entryKind = "user"
+	kindAssistant  entryKind = "assistant"
+	kindTool       entryKind = "tool"
+	kindCheckpoint entryKind = "checkpoint"
+)
+
+type Entry struct {
+	TS         string         `json:"ts"`
+	Kind       entryKind      `json:"kind"`
+	Content    string         `json:"content,omitempty"`
+	ToolCalls  []toolCallRec  `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Summary    string         `json:"summary,omitempty"`
+	Covers     *coverageRange `json:"covers,omitempty"`
 }
 
-type historyToolCallRec struct {
+type toolCallRec struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
 }
 
-type historyCoverageRange struct {
+type coverageRange struct {
 	From int `json:"from"`
 	To   int `json:"to"`
 }
 
-// HistoryStore is the persistence gateway for a single conversation log.
-type HistoryStore struct {
-	path string
-	mu   sync.Mutex
-
-	// written counts the entries appended during this process (plus
-	// entries observed on load). Used to generate checkpoint `covers`.
+// Store is an append-only conversation log backed by a JSONL file.
+type Store struct {
+	path    string
+	mu      sync.Mutex
 	written int
 }
 
-// NewHistoryStoreAt opens (or creates) a history file at an explicit
-// path. Missing parent directories are created.
-func NewHistoryStoreAt(path string) (*HistoryStore, error) {
+func New(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create history parent: %w", err)
+		return nil, err
 	}
-	hs := &HistoryStore{path: path}
+	hs := &Store{path: path}
 	if n, err := hs.countEntries(); err == nil {
 		hs.written = n
 	}
 	return hs, nil
 }
 
-// Path returns the on-disk jsonl path (useful for log messages).
-func (hs *HistoryStore) Path() string { return hs.path }
+func (s *Store) Path() string { return s.path }
 
-// countEntries tallies non-blank lines in the history file. Returns 0
-// when the file doesn't exist yet.
-func (hs *HistoryStore) countEntries() (int, error) {
-	f, err := os.Open(hs.path)
+func (s *Store) countEntries() (int, error) {
+	f, err := os.Open(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
@@ -100,94 +88,73 @@ func (hs *HistoryStore) countEntries() (int, error) {
 	return n, sc.Err()
 }
 
-// ---- Writes ----
-
-func (hs *HistoryStore) appendEntry(e historyEntry) error {
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
-
+func (s *Store) appendEntry(e Entry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if e.TS == "" {
 		e.TS = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 	data, err := json.Marshal(e)
 	if err != nil {
-		return fmt.Errorf("marshal history entry: %w", err)
+		return err
 	}
-	f, err := os.OpenFile(hs.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		return fmt.Errorf("open history file: %w", err)
+		return err
 	}
 	defer f.Close()
 	if _, err := f.Write(append(data, '\n')); err != nil {
 		return err
 	}
-	// Durability: fsync the appended record so a crash within seconds
-	// of writing won't lose the last turn. Cost is one syscall (~1ms
-	// on SSD); acceptable because history writes are infrequent
-	// (one per LLM turn, not per token).
-	_ = f.Sync()
-	hs.written++
+	s.written++
 	return nil
 }
 
-// AppendSystem records the system prompt. Callers should only do this
-// once per session boot; the system prompt is rebuilt per-turn in
-// main.go but we do not re-log it.
-func (hs *HistoryStore) AppendSystem(content string) error {
-	return hs.appendEntry(historyEntry{Kind: kindSystem, Content: content})
-}
-
-// AppendUser records a user turn.
-func (hs *HistoryStore) AppendUser(content string) error {
-	return hs.appendEntry(historyEntry{Kind: kindUser, Content: content})
-}
-
-// AppendAssistant records an assistant turn (possibly with tool calls).
-// Accepts neutral ToolCall values so the history layer stays decoupled
-// from any vendor SDK.
-func (hs *HistoryStore) AppendAssistant(content string, toolCalls []llm.ToolCall) error {
-	var recs []historyToolCallRec
-	for _, tc := range toolCalls {
-		recs = append(recs, historyToolCallRec{
-			ID:        tc.ID,
-			Name:      tc.Name,
-			Arguments: tc.Arguments,
-		})
+// Sync flushes all buffered history to disk. Call after batch writes.
+func (s *Store) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := os.OpenFile(s.path, os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
-	return hs.appendEntry(historyEntry{
-		Kind:      kindAssistant,
-		Content:   content,
-		ToolCalls: recs,
-	})
+	defer f.Close()
+	return f.Sync()
 }
 
-// AppendTool records a tool result.
-func (hs *HistoryStore) AppendTool(toolCallID, content string) error {
-	return hs.appendEntry(historyEntry{
-		Kind:       kindTool,
-		ToolCallID: toolCallID,
-		Content:    content,
-	})
+func (s *Store) AppendSystem(content string) error {
+	return s.appendEntry(Entry{Kind: kindSystem, Content: content})
 }
 
-// AppendCheckpoint records a compaction summary that supersedes all
-// entries up to (but not including) the checkpoint itself. `coveredTo`
-// is the 1-indexed count of entries covered by the summary (typically
-// the value of hs.written at the moment of compaction).
-func (hs *HistoryStore) AppendCheckpoint(summary string, coveredTo int) error {
-	return hs.appendEntry(historyEntry{
+func (s *Store) AppendUser(content string) error {
+	return s.appendEntry(Entry{Kind: kindUser, Content: content})
+}
+
+func (s *Store) AppendAssistant(content string, toolCalls []llm.ToolCall) error {
+	var recs []toolCallRec
+	for _, tc := range toolCalls {
+		recs = append(recs, toolCallRec{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments})
+	}
+	return s.appendEntry(Entry{Kind: kindAssistant, Content: content, ToolCalls: recs})
+}
+
+func (s *Store) AppendTool(toolCallID, content string) error {
+	return s.appendEntry(Entry{Kind: kindTool, ToolCallID: toolCallID, Content: content})
+}
+
+func (s *Store) AppendCheckpoint(summary string, coveredTo int) error {
+	return s.appendEntry(Entry{
 		Kind:    kindCheckpoint,
 		Summary: summary,
-		Covers:  &historyCoverageRange{From: 1, To: coveredTo},
+		Covers:  &coverageRange{From: 1, To: coveredTo},
 	})
 }
 
-// ---- Reads ----
-
-// ReadAll returns every entry in file order. Used by LoadRuntime and by
-// tooling that wants the raw trail (audit, transcript export).
-func (hs *HistoryStore) ReadAll() ([]historyEntry, error) {
-	f, err := os.Open(hs.path)
+func (s *Store) ReadAll() ([]Entry, error) {
+	f, err := os.Open(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -195,8 +162,7 @@ func (hs *HistoryStore) ReadAll() ([]historyEntry, error) {
 		return nil, err
 	}
 	defer f.Close()
-
-	var out []historyEntry
+	var out []Entry
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for sc.Scan() {
@@ -204,10 +170,8 @@ func (hs *HistoryStore) ReadAll() ([]historyEntry, error) {
 		if line == "" {
 			continue
 		}
-		var e historyEntry
+		var e Entry
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
-			// Skip corrupt lines rather than fail the whole load -
-			// the conversation is too valuable to drop.
 			continue
 		}
 		out = append(out, e)
@@ -215,16 +179,12 @@ func (hs *HistoryStore) ReadAll() ([]historyEntry, error) {
 	return out, sc.Err()
 }
 
-// LoadRuntime reconstructs an in-memory message slice from history.
-// Uses the freshly-built system prompt (ignores on-disk system entries).
-// Only materializes entries after the last checkpoint.
-func (hs *HistoryStore) LoadRuntime(systemPrompt string) ([]llm.Message, int, error) {
-	entries, err := hs.ReadAll()
+// LoadRuntime reconstructs messages from history, using systemPrompt and respecting checkpoints.
+func (s *Store) LoadRuntime(systemPrompt string) ([]llm.Message, int, error) {
+	entries, err := s.ReadAll()
 	if err != nil {
 		return nil, 0, err
 	}
-
-	// Find the last checkpoint, if any.
 	lastCheckpoint := -1
 	for i := len(entries) - 1; i >= 0; i-- {
 		if entries[i].Kind == kindCheckpoint {
@@ -232,11 +192,7 @@ func (hs *HistoryStore) LoadRuntime(systemPrompt string) ([]llm.Message, int, er
 			break
 		}
 	}
-
 	msgs := []llm.Message{llm.SystemMessage(systemPrompt)}
-
-	// Replay the checkpoint summary as a synthetic user/assistant pair
-	// so the LLM has the pre-compaction context.
 	if lastCheckpoint >= 0 {
 		cp := entries[lastCheckpoint]
 		if strings.TrimSpace(cp.Summary) != "" {
@@ -246,17 +202,14 @@ func (hs *HistoryStore) LoadRuntime(systemPrompt string) ([]llm.Message, int, er
 			)
 		}
 	}
-
 	start := 0
 	if lastCheckpoint >= 0 {
 		start = lastCheckpoint + 1
 	}
-
 	restored := 0
 	for _, e := range entries[start:] {
 		switch e.Kind {
 		case kindSystem:
-			// Ignored - we already injected the caller-supplied prompt.
 			continue
 		case kindUser:
 			if e.Content != "" {
@@ -268,11 +221,7 @@ func (hs *HistoryStore) LoadRuntime(systemPrompt string) ([]llm.Message, int, er
 			if len(e.ToolCalls) > 0 {
 				calls := make([]llm.ToolCall, 0, len(e.ToolCalls))
 				for _, tc := range e.ToolCalls {
-					calls = append(calls, llm.ToolCall{
-						ID:        tc.ID,
-						Name:      tc.Name,
-						Arguments: tc.Arguments,
-					})
+					calls = append(calls, llm.ToolCall{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments})
 				}
 				m.ToolCalls = calls
 			}
@@ -283,50 +232,72 @@ func (hs *HistoryStore) LoadRuntime(systemPrompt string) ([]llm.Message, int, er
 				msgs = append(msgs, llm.ToolMessage(e.Content, e.ToolCallID))
 				restored++
 			}
-		case kindCheckpoint:
-			// Intermediate checkpoints (shouldn't happen - we only walked
-			// past the *last* one) are safe to skip.
-			continue
 		}
 	}
-
-	// Trim orphaned tool_calls left after a crash mid-turn.
+	beforeTrim := len(msgs)
 	msgs = trimDanglingToolCalls(msgs)
-
+	// Adjust restored count for entries stripped by trimming (orphaned
+	// tool results, incomplete assistant blocks, trailing user messages).
+	if dropped := beforeTrim - len(msgs); dropped > 0 && restored > dropped {
+		restored -= dropped
+	} else if dropped >= restored {
+		restored = 0
+	}
 	return msgs, restored, nil
 }
 
-// WrittenCount is the number of entries ever written by this process
-// instance plus those observed on disk at boot. Used when creating a
-// checkpoint to label its coverage range.
-func (hs *HistoryStore) WrittenCount() int {
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
-	return hs.written
+func (s *Store) WrittenCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.written
 }
 
-// trimDanglingToolCalls drops assistant tool_calls turns not followed
-// by matching tool results (prevents API 400 after crash mid-turn).
+// Close flushes any pending writes and releases resources.
+func (s *Store) Close() error {
+	// Flush by re-opening and syncing the file
+	f, err := os.OpenFile(s.path, os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 func trimDanglingToolCalls(msgs []llm.Message) []llm.Message {
-	// out/flushed stay nil/0 until an orphan is actually found - the
-	// overwhelmingly common case is a cleanly-ended session with
-	// nothing to drop, which then costs no allocation or copy.
+	// Pass 1: remove orphan tool messages that appear BEFORE any assistant
+	// with tool_calls (or after the last assistant). Such messages cause
+	// API errors because they lack a preceding tool_calls message.
+	var cleaned []llm.Message
+	hasToolCalls := false
+	for i, m := range msgs {
+		if m.Role == llm.RoleAssistant && len(m.ToolCalls) > 0 {
+			hasToolCalls = true
+		}
+		if m.Role == llm.RoleTool && !hasToolCalls {
+			continue // orphan tool before any assistant with tool_calls
+		}
+		cleaned = append(cleaned, msgs[i])
+	}
+
+	// Pass 2: if an assistant has N tool_calls but fewer than N matching
+	// tool results follow, strip the assistant + its partial results.
 	var out []llm.Message
-	flushed := 0 // msgs[:flushed] already copied into out
+	flushed := 0
 	i := 0
-	for i < len(msgs) {
-		m := msgs[i]
+	for i < len(cleaned) {
+		m := cleaned[i]
 		if m.Role != llm.RoleAssistant || len(m.ToolCalls) == 0 {
 			i++
 			continue
 		}
-		// Does an immediately-following run of tool messages answer
-		// every one of this call's ids?
 		j := i + 1
 		unanswered := len(m.ToolCalls)
-		for j < len(msgs) && msgs[j].Role == llm.RoleTool && unanswered > 0 {
+		for j < len(cleaned) && cleaned[j].Role == llm.RoleTool && unanswered > 0 {
 			for _, tc := range m.ToolCalls {
-				if tc.ID == msgs[j].ToolCallID {
+				if tc.ID == cleaned[j].ToolCallID {
 					unanswered--
 					break
 				}
@@ -337,15 +308,20 @@ func trimDanglingToolCalls(msgs []llm.Message) []llm.Message {
 			i = j
 			continue
 		}
-		// Orphan found: copy everything kept so far (since the last
-		// flush point), then drop msgs[i:j] (the orphan assistant +
-		// its partial tool results).
-		out = append(out, msgs[flushed:i]...)
+		out = append(out, cleaned[flushed:i]...)
 		i = j
 		flushed = j
 	}
-	if out == nil {
-		return msgs // nothing dropped, no copy needed
+	if out != nil {
+		cleaned = append(out, cleaned[flushed:]...)
 	}
-	return append(out, msgs[flushed:]...)
+
+	// Pass 3: strip trailing orphaned user messages. When the user sends a
+	// prompt and Ctrl-C's before the agent responds, the user message is
+	// already persisted but has no matching assistant/tool reply. Replaying
+	// it on the next session would cause the stale prompt to be re-executed.
+	for len(cleaned) > 0 && cleaned[len(cleaned)-1].Role == llm.RoleUser {
+		cleaned = cleaned[:len(cleaned)-1]
+	}
+	return cleaned
 }
