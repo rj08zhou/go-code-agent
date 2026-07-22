@@ -3,7 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
-	"go-code-agent-refactor/internal/tool"
+	"go-code-agent/internal/tool"
 	"os/exec"
 	"strings"
 	"sync"

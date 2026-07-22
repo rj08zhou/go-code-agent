@@ -1,10 +1,17 @@
 package mcp
 
 import (
+	"bufio"
 	"context"
-	"go-code-agent-refactor/internal/config"
-	"go-code-agent-refactor/internal/tool"
+	"encoding/json"
+	"fmt"
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/tool"
+	"io"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func init() { config.SetConfig(config.Load()) }
@@ -74,6 +81,9 @@ func TestToolCatalogAdapter_RegisterMCPTools(t *testing.T) {
 	if def, ok := snap.Definitions[fullName2]; ok {
 		if !def.Effects.Has(tool.EffectWriteFile) {
 			t.Error("delete_user should have EffectWriteFile")
+		}
+		if def.Timeout != 30*time.Second {
+			t.Errorf("MCP tool timeout = %s, want 30s", def.Timeout)
 		}
 	}
 }
@@ -149,5 +159,85 @@ func TestManager_CallTool_InvalidName(t *testing.T) {
 	_, err := mgr.CallTool(context.Background(), "not-an-mcp-tool", nil)
 	if err == nil {
 		t.Error("expected error for invalid MCP tool name")
+	}
+}
+
+func newPipeClient(t *testing.T) (*Client, *bufio.Reader, io.WriteCloser) {
+	t.Helper()
+	serverRead, clientWrite := io.Pipe()
+	clientRead, serverWrite := io.Pipe()
+	c := NewClient(ServerConfig{Name: "test"})
+	c.stdin = clientWrite
+	c.stdout = clientRead
+	c.reader = bufio.NewReader(clientRead)
+	c.running = true
+	t.Cleanup(func() {
+		_ = c.Stop()
+		_ = serverRead.Close()
+		_ = serverWrite.Close()
+	})
+	return c, bufio.NewReader(serverRead), serverWrite
+}
+
+func TestClientCallToolHonorsContextCancellation(t *testing.T) {
+	c, requests, _ := newPipeClient(t)
+	go func() {
+		_, _ = requests.ReadBytes('\n') // consume request but never respond
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := c.CallTool(ctx, "slow", nil)
+	if err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("CallTool error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("CallTool cancellation took %s", elapsed)
+	}
+}
+
+func TestClientConcurrentCallsRemainFramed(t *testing.T) {
+	c, requests, responses := newPipeClient(t)
+	go func() {
+		for i := 0; i < 2; i++ {
+			line, err := requests.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var req rpcRequest
+			if json.Unmarshal(line, &req) != nil {
+				return
+			}
+			params, _ := req.Params.(map[string]any)
+			name, _ := params["name"].(string)
+			resp := fmt.Sprintf(
+				`{"jsonrpc":"2.0","id":%d,"result":{"content":[{"type":"text","text":%q}]}}`+"\n",
+				req.ID, name,
+			)
+			_, _ = io.WriteString(responses, resp)
+		}
+	}()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, name := range []string{"one", "two"} {
+		name := name
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := c.CallTool(context.Background(), name, nil)
+			if err == nil && got != "["+name+"]" {
+				err = fmt.Errorf("result = %q, want [%s]", got, name)
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

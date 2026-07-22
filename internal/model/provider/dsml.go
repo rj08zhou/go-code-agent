@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"go-code-agent-refactor/internal/llm"
+	"go-code-agent/internal/llm"
 )
 
 const (

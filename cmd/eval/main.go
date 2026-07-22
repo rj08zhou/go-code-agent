@@ -5,7 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"go-code-agent-refactor/internal/eval"
+	"go-code-agent/internal/eval"
 	"os"
 	"time"
 )

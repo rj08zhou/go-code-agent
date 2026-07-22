@@ -4,7 +4,7 @@ package session
 import (
 	"encoding/json"
 	"fmt"
-	"go-code-agent-refactor/internal/store"
+	"go-code-agent/internal/store"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,6 +115,12 @@ func (r *Repository) CreateSession(st *State) error {
 	}
 	data, _ := json.MarshalIndent(st, "", "  ")
 	return store.AtomicWrite(filepath.Join(dir, "meta.json"), data)
+}
+
+// EnsureSessionDir creates the session directory (and sessions root) if missing.
+// Safe to call for both new and resumed sessions.
+func (r *Repository) EnsureSessionDir(id string) error {
+	return os.MkdirAll(r.sessionDir(id), 0o755)
 }
 
 // LoadSessionMeta reads meta.json for a session.

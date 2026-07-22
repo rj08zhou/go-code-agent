@@ -165,7 +165,7 @@ func TestTaskUpdate_StringID(t *testing.T) {
 // --- write / edit file paths ---
 
 func TestWriteFile_Path(t *testing.T) {
-	defs := BuiltinTools(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	defs := BuiltinTools(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	dir := t.TempDir()
 	scope := &ToolScope{Workdir: dir}
 
@@ -191,7 +191,7 @@ func TestWriteFile_Path(t *testing.T) {
 }
 
 func TestEditFile_Basic(t *testing.T) {
-	defs := BuiltinTools(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	defs := BuiltinTools(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	dir := t.TempDir()
 	scope := &ToolScope{Workdir: dir}
 

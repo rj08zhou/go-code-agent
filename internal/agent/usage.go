@@ -3,7 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"go-code-agent-refactor/internal/llm"
+	"go-code-agent/internal/llm"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,11 +19,26 @@ type UsageTracker struct {
 
 func NewUsageTracker(sessionDir string) (*UsageTracker, error) {
 	path := filepath.Join(sessionDir, "usage.jsonl")
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
+	u := &UsageTracker{path: path}
+	if err := u.reopen(); err != nil {
 		return nil, err
 	}
-	return &UsageTracker{path: path, file: f}, nil
+	return u, nil
+}
+
+func (u *UsageTracker) reopen() error {
+	if err := os.MkdirAll(filepath.Dir(u.path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(u.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if u.file != nil {
+		_ = u.file.Close()
+	}
+	u.file = f
+	return nil
 }
 
 func (u *UsageTracker) Record(source, role, model, traceID string, usage llm.Usage, durationSec float64) {
@@ -43,10 +58,34 @@ func (u *UsageTracker) Record(source, role, model, traceID string, usage llm.Usa
 		"duration_s":          fmt.Sprintf("%.2f", durationSec),
 	}
 	data, _ := json.Marshal(entry)
-	u.file.Write(append(data, '\n'))
+	line := append(data, '\n')
+	if u.file == nil {
+		if err := u.reopen(); err != nil {
+			return
+		}
+	} else if _, err := os.Stat(u.path); err != nil {
+		if err := u.reopen(); err != nil {
+			return
+		}
+	}
+	if _, err := u.file.Write(line); err != nil {
+		if err := u.reopen(); err != nil {
+			return
+		}
+		_, _ = u.file.Write(line)
+	}
 }
 
-func (u *UsageTracker) Close() error { return u.file.Close() }
+func (u *UsageTracker) Close() error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.file == nil {
+		return nil
+	}
+	err := u.file.Close()
+	u.file = nil
+	return err
+}
 
 // Render reads and returns a summary of recorded usage.
 func (u *UsageTracker) Render() string {

@@ -4,26 +4,26 @@ package application
 import (
 	"context"
 	"fmt"
-	"go-code-agent-refactor/internal/agent"
-	"go-code-agent-refactor/internal/background"
-	"go-code-agent-refactor/internal/config"
-	"go-code-agent-refactor/internal/event"
-	"go-code-agent-refactor/internal/history"
-	"go-code-agent-refactor/internal/hitlaudit"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/mcp"
-	"go-code-agent-refactor/internal/memory"
-	"go-code-agent-refactor/internal/model"
-	"go-code-agent-refactor/internal/model/provider"
-	"go-code-agent-refactor/internal/prompt"
-	"go-code-agent-refactor/internal/security"
-	"go-code-agent-refactor/internal/session"
-	"go-code-agent-refactor/internal/skill"
-	"go-code-agent-refactor/internal/task"
-	"go-code-agent-refactor/internal/team"
-	"go-code-agent-refactor/internal/tool"
-	"go-code-agent-refactor/internal/web"
-	"go-code-agent-refactor/internal/worktree"
+	"go-code-agent/internal/agent"
+	"go-code-agent/internal/background"
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/event"
+	"go-code-agent/internal/history"
+	"go-code-agent/internal/hitlaudit"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/mcp"
+	"go-code-agent/internal/memory"
+	"go-code-agent/internal/model"
+	"go-code-agent/internal/model/provider"
+	"go-code-agent/internal/prompt"
+	"go-code-agent/internal/security"
+	"go-code-agent/internal/session"
+	"go-code-agent/internal/skill"
+	"go-code-agent/internal/task"
+	"go-code-agent/internal/team"
+	"go-code-agent/internal/tool"
+	"go-code-agent/internal/web"
+	"go-code-agent/internal/worktree"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,7 +40,6 @@ type Application struct {
 
 	// Project-level services (process lifetime)
 	gateway     *model.Gateway
-	catalog     *tool.ToolCatalog
 	registry    *provider.Registry
 	sessionRepo *session.Repository
 
@@ -91,7 +90,6 @@ func New(cfgDir, workdir string) (*Application, error) {
 		workdir:     workdir,
 		dataDir:     dataDir,
 		gateway:     gw,
-		catalog:     tool.NewToolCatalog(),
 		registry:    reg,
 		sessionRepo: sessionRepo,
 	}
@@ -102,8 +100,13 @@ func New(cfgDir, workdir string) (*Application, error) {
 // Gateway returns the model gateway.
 func (a *Application) Gateway() *model.Gateway { return a.gateway }
 
-// Catalog returns the tool catalog.
-func (a *Application) Catalog() *tool.ToolCatalog { return a.catalog }
+// Catalog returns the active session's tool catalog, or nil if no session.
+func (a *Application) Catalog() *tool.ToolCatalog {
+	if a.runtime == nil {
+		return nil
+	}
+	return a.runtime.catalog
+}
 
 // SessionRepo returns the session repository.
 func (a *Application) SessionRepo() *session.Repository { return a.sessionRepo }
@@ -200,6 +203,7 @@ type RunnerParams struct {
 	WorktreeSvc  *worktree.Service
 	Protocols    *team.ProtocolStore
 	PromptLoader *prompt.Loader
+	Permissions  *security.Permissions
 }
 
 // BuiltRunner holds a fully-wired Runner together with all session services
@@ -219,6 +223,7 @@ type BuiltRunner struct {
 	TodoSvc           *task.TodoManager
 	MemoryStore       *memory.Store
 	HitlMgr           *hitlaudit.HITLManager
+	Approval          *security.ApprovalState
 	Judge             *agent.Judge
 	Permissions       *security.Permissions
 	DiffPreview       *security.DiffPreview
@@ -263,6 +268,7 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 	// --- Subagent & team ---
 	subagentRunner := agent.NewSubagentRunner(rt.gateway, catalog, cfg.ModelID)
 	subagentRunner.SetCompression(agent.NewCompression(rt.gateway, nil, sessionDir, cfg.ModelID))
+	subagentRunner.SetApproval(hitlApproval)
 	teamMgr := agent.NewTeammateManager(
 		filepath.Join(sessionDir, "team"), rt.gateway,
 		params.Bus, params.TaskSvc, params.Protocols, params.WorktreeSvc,
@@ -270,6 +276,7 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 	)
 	teamMgr.SetSessionCtx(rt.Ctx)
 	teamMgr.SetDiffPreview(params.DiffPreview)
+	teamMgr.SetApproval(hitlApproval)
 
 	// --- Register builtin tools FIRST (establishes base snapshot + order) ---
 	builtinDefs := tool.BuiltinTools(
@@ -278,6 +285,7 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 		teamMgr,
 		params.Protocols,
 		params.WebService,
+		params.Permissions,
 	)
 	catalog.RegisterAll(builtinDefs)
 
@@ -337,7 +345,10 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 	}
 
 	// --- Wire runner modules ---
-	histStore, _ := history.New(filepath.Join(sessionDir, "history", history.FileName))
+	histStore, histErr := history.New(filepath.Join(sessionDir, "history", history.FileName))
+	if histErr != nil {
+		fmt.Fprintf(os.Stderr, "[warn] history store: %v\n", histErr)
+	}
 	runner.SetCompression(agent.NewCompression(rt.gateway, histStore, sessionDir, cfg.ModelID))
 	runner.SetReflection(agent.NewReflection(params.PromptLoader))
 	runner.SetSnapshot(agent.NewSnapshotManager(cfg.SnapshotEnabled, rt.workdir))
@@ -346,7 +357,9 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 
 	// --- Event sinks ---
 	sinks := []event.Sink{event.NewConsoleSink(), event.NewAuditSink(), event.NewUsageSink()}
-	if sessionLog, logErr := event.NewSessionLogSink(filepath.Join(sessionDir, "session.log")); logErr == nil {
+	if sessionLog, logErr := event.NewSessionLogSink(filepath.Join(sessionDir, "session.log")); logErr != nil {
+		fmt.Fprintf(os.Stderr, "[warn] session.log: %v\n", logErr)
+	} else {
 		sinks = append(sinks, sessionLog)
 		rt.AddHook("session-log", sessionLog.Close)
 	}
@@ -360,7 +373,9 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 	rt.AddHook("mcp", func() error { params.MCPMgr.Shutdown(); return nil })
 	rt.AddHook("background", func() error { params.BGSvc.StopAll(); return nil })
 	rt.AddHook("worktree", func() error { params.WorktreeSvc.RemoveAll(); return nil })
-	rt.AddHook("history", func() error { return histStore.Close() })
+	if histStore != nil {
+		rt.AddHook("history", func() error { return histStore.Close() })
+	}
 
 	judgeInst := agent.NewJudge(cfg.JudgeEnabled, cfg.JudgeModel,
 		cfg.JudgeMinScore, params.PromptLoader, rt.gateway)
@@ -444,13 +459,25 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime)
 			Title:  "Session " + sid[:10],
 			Status: session.StatusActive,
 		}
-		_ = repo.CreateSession(st)
+		if err := repo.CreateSession(st); err != nil {
+			fmt.Fprintf(os.Stderr, "[warn] create session: %v\n", err)
+		}
 		idx.ActiveID = st.ID
 		idx.Sessions = append(idx.Sessions, *st)
-		_ = repo.SaveIndex(idx)
+		if err := repo.SaveIndex(idx); err != nil {
+			fmt.Fprintf(os.Stderr, "[warn] save sessions index: %v\n", err)
+		}
+	}
+	// Resumed sessions (and create failures) must still have an on-disk dir
+	// before usage/session.log/history open files under it.
+	if err := repo.EnsureSessionDir(st.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "[warn] ensure session dir: %v\n", err)
 	}
 
-	rt := NewSessionRuntime(app.gateway, app.workdir, app.catalog, repo, st)
+	// Each session gets its own ToolCatalog so MCP/builtin registration
+	// cannot leak across session switches.
+	catalog := tool.NewToolCatalog()
+	rt := NewSessionRuntime(app.gateway, app.workdir, catalog, repo, st)
 	app.SetRuntime(rt)
 
 	workdir := app.workdir
@@ -459,29 +486,35 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime)
 	cfg := config.CurrentConfig()
 
 	hitlMgr := hitlaudit.NewHITLManager(promptLoader)
-	// Default: HITL enabled in safe-only mode (auto-approve safe tools,
-	// prompt for dangerous ones). --human escalates to interactive for
-	// every tool; --human-mode overrides the mode entirely.
+	approval := security.NewApprovalState()
+	// Default: HITL on + safe-only. --human alone escalates to interactive.
+	// --human-mode overrides only when explicitly set (empty = keep default).
 	hitlMgr.SetEnabled(true)
 	hitlMgr.SetMode(hitlaudit.HITLModeSafeOnly)
-	if opts.Human {
+	approval.ApplyPreset("safe")
+	if opts.Human && opts.HumanMode == "" {
 		hitlMgr.SetMode(hitlaudit.HITLModeInteractive)
+		approval.ApplyPreset("off")
 	}
 	if opts.HumanMode != "" {
 		if mode, modeErr := hitlaudit.ParseMode(opts.HumanMode); modeErr == nil {
 			hitlMgr.SetMode(mode)
+			syncApprovalWithHITLMode(approval, mode)
 		} else {
 			fmt.Fprintf(os.Stderr, "[warn] %v\n", modeErr)
 		}
 	}
+	security.SetActiveApproval(approval)
 
 	// Permissions + DiffPreview + Usage tracker
 	perms := security.NewPermissions()
 	_ = perms.Load(app.dataDir)
-	security.GlobalPermissions = perms
 
 	diffPreview := security.NewDiffPreview(workdir)
-	usageTracker, _ := agent.NewUsageTracker(sessionDir)
+	usageTracker, usageErr := agent.NewUsageTracker(sessionDir)
+	if usageErr != nil {
+		fmt.Fprintf(os.Stderr, "[warn] usage tracker: %v\n", usageErr)
+	}
 	decisionLog, _ := agent.NewDecisionLog(sessionDir)
 	if usageTracker != nil {
 		app.gateway.SetUsageRecorder(func(role, providerName, modelID, traceID string, usage llm.Usage, duration float64) {
@@ -510,6 +543,7 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime)
 		WorktreeSvc:  worktree.New(workdir, sessionDir),
 		Protocols:    team.NewProtocolStore(msgBus),
 		PromptLoader: promptLoader,
+		Permissions:  perms,
 	}
 
 	built := rt.BuildRunner(params)
@@ -519,6 +553,7 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime)
 	built.ModelID = cfg.ModelID
 	built.JudgeEnabled = cfg.JudgeEnabled
 	built.Permissions = perms
+	built.Approval = approval
 	built.DiffPreview = diffPreview
 	built.UsageTracker = usageTracker
 	built.AgentID = "lead"
@@ -527,12 +562,26 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime)
 	built.DecisionLog = decisionLog
 	built.WebService = params.WebService
 	built.ReloadPermissions = func() error {
-		if err := perms.Load(app.dataDir); err != nil {
-			return err
-		}
-		security.GlobalPermissions = perms
-		return nil
+		// In-place reload: bash handler closes over this same pointer.
+		return perms.Load(app.dataDir)
 	}
 
 	return built, rt
+}
+
+// syncApprovalWithHITLMode keeps ApprovalState (diff-preview skip) aligned
+// with an explicit --human-mode / /hitl selection.
+func syncApprovalWithHITLMode(approval *security.ApprovalState, mode hitlaudit.HITLMode) {
+	if approval == nil {
+		return
+	}
+	switch mode {
+	case hitlaudit.HITLModeAutoApprove:
+		approval.ApplyPreset("danger")
+	case hitlaudit.HITLModeSafeOnly:
+		approval.ApplyPreset("safe")
+	default:
+		// interactive / auto-reject / notify-only → keep manual posture for preview
+		approval.ApplyPreset("off")
+	}
 }

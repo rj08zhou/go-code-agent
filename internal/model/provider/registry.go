@@ -3,9 +3,9 @@ package provider
 
 import (
 	"fmt"
-	"go-code-agent-refactor/internal/config"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/model"
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/model"
 	"strings"
 	"sync"
 )

@@ -1,7 +1,7 @@
 package agent
 
 import (
-	"go-code-agent-refactor/internal/prompt"
+	"go-code-agent/internal/prompt"
 	"testing"
 )
 

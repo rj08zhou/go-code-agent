@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent-refactor/internal/config"
-	"go-code-agent-refactor/internal/event"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/model"
-	"go-code-agent-refactor/internal/tool"
-	"go-code-agent-refactor/internal/utils"
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/event"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/model"
+	"go-code-agent/internal/tool"
+	"go-code-agent/internal/utils"
 	"strings"
 	"time"
 )
@@ -75,6 +75,7 @@ type Runner struct {
 	cachedTokens          int
 	cachedTokensAt        int
 	readCounts            map[string]int
+	budgetWarnInjected    bool
 }
 
 func NewRunner(
@@ -208,6 +209,7 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 	r.cachedTokens = 0
 	r.cachedTokensAt = 0
 	r.readCounts = make(map[string]int)
+	r.budgetWarnInjected = false
 	if r.todoState != nil {
 		r.hasOpenItems, _ = r.todoState()
 	}
@@ -253,41 +255,49 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 			out.Messages = messages
 			return out
 		}
-		if r.rounds >= maxRounds {
+
+		// Soft deadline (master pattern): explore/web_fetch subagents stop a
+		// buffer before the hard ctx deadline and turn in a no-tools summary
+		// instead of being cancelled mid-tool.
+		if r.profile.Role == "explore" {
+			if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl.Add(-config.SubagentSoftDeadlineBuffer)) {
+				return r.finalizeWithoutTools(ctx, messages, modelID, traceID, &out,
+					"soft_deadline",
+					"<limit>Time budget almost exhausted. Do NOT call any tools. "+
+						"Synthesize a concise summary from what you have already observed. "+
+						"Mark anything unverified explicitly.</limit>")
+			}
+		}
+
+		// Drop one-time procedural nudges (reflection / judge / plan-gate /
+		// convergence) that the model has already responded to. They carry no
+		// durable context, so re-sending them every round just re-bills the
+		// same tokens until compaction. Nudges not yet consumed (injected after
+		// the last assistant message) are preserved so the model still sees
+		// them on the upcoming call. Nudges are RoleUser messages that are not
+		// persisted by the REPL, so removing them is transparent to history.
+		if trimmed, removed := dropConsumedNudges(messages); removed > 0 {
+			messages = trimmed
+			r.cachedTokens = 0
 			if r.eventSink != nil {
 				r.eventSink.Emit(event.Event{
-					Type:      event.TurnComplete,
+					Type:      event.ContextDecision,
 					TraceID:   traceID,
 					SessionID: r.scope.SessionID,
 					AgentID:   r.scope.AgentID,
-					Payload:   map[string]string{"note": "max_rounds", "rounds": fmt.Sprintf("%d", r.rounds)},
-					Usage:     &r.turnUsage,
+					Payload: map[string]string{
+						"action":  "drop_nudges",
+						"removed": fmt.Sprintf("%d", removed),
+						"rounds":  fmt.Sprintf("%d", r.rounds),
+					},
 				})
 			}
-			// Final wrap-up: give the model one last chance to respond
-			// without tools, matching original finalizeMaxRounds.
-			messages = append(messages, llm.UserMessage(
-				"<limit>Maximum tool rounds reached. Wrap up and respond now in plain text.</limit>"))
-			sr, err := r.gateway.Stream(ctx, r.profile.Role, llm.CallParams{
-				Model:    modelID,
-				Messages: messages,
-				Tools:    nil,
-			}, newPrefixedSink(r.profile.Role))
-			r.rounds++
-			if err != nil || sr == nil {
-				messages = append(messages, llm.AssistantMessage(
-					"[interrupted] Hit max-rounds and the wrap-up call failed; please retry."))
-				out.Error = fmt.Errorf("max rounds (%d) wrap-up failed", maxRounds)
-				out.StoppedReason = "max_rounds"
-			} else {
-				messages = append(messages, sr.ToAssistantMessage())
-				out.Completed = true
-				out.StoppedReason = "max_rounds"
-			}
-			out.Rounds = r.rounds
-			out.ToolFailures = r.failures
-			out.Messages = messages
-			return out
+		}
+
+		if r.rounds >= maxRounds {
+			return r.finalizeWithoutTools(ctx, messages, modelID, traceID, &out,
+				"max_rounds",
+				"<limit>Maximum tool rounds reached. Wrap up and respond now in plain text.</limit>")
 		}
 
 		// --- Auto-compaction check ---
@@ -326,22 +336,42 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 			}
 		}
 
-		// --- MicroCompact every 6 rounds (matching original) ---
+		// --- MicroCompact: light-weight clearing of old tool results ---
+		// Gated on actual context pressure (not a fixed cadence): only once
+		// estimated usage crosses MicroCompactThresholdFrac of the window, and
+		// only when it frees at least MicroCompactMinClearBytes. This mirrors
+		// the trigger + clear_at_least design of Anthropic's server-side
+		// context editing, so short/medium sessions keep their cache prefix
+		// intact and we stop busting the cache while there's ample headroom.
 		const microCompactInterval = 6
 		if r.rounds > 0 && r.rounds%microCompactInterval == 0 {
-			if cleared := MicroCompact(messages); cleared > 0 {
-				if r.eventSink != nil {
-					r.eventSink.Emit(event.Event{
-						Type:      event.ContextDecision,
-						TraceID:   traceID,
-						SessionID: r.scope.SessionID,
-						AgentID:   r.scope.AgentID,
-						Payload: map[string]string{
-							"action":  "micro_compact",
-							"cleared": fmt.Sprintf("%d", cleared),
-							"rounds":  fmt.Sprintf("%d", r.rounds),
-						},
-					})
+			// Refresh the token estimate if the auto-compaction block above
+			// didn't already do it this round (e.g. when compression is off).
+			if r.cachedTokens == 0 || r.rounds-r.cachedTokensAt >= config.TokenCheckInterval {
+				r.cachedTokens = llm.EstimateRequestTokens(messages, toolDefs)
+				r.cachedTokensAt = r.rounds
+			}
+			microThreshold := int(float64(ctxWindowTokens) * config.MicroCompactThresholdFrac)
+			if r.cachedTokens > microThreshold {
+				cleared, reclaimed := MicroCompact(messages, config.MicroCompactMinClearBytes)
+				if cleared > 0 {
+					// Reclaimed bytes changed the message list; force a
+					// re-estimate on the next token check.
+					r.cachedTokens = 0
+					if r.eventSink != nil {
+						r.eventSink.Emit(event.Event{
+							Type:      event.ContextDecision,
+							TraceID:   traceID,
+							SessionID: r.scope.SessionID,
+							AgentID:   r.scope.AgentID,
+							Payload: map[string]string{
+								"action":    "micro_compact",
+								"cleared":   fmt.Sprintf("%d", cleared),
+								"reclaimed": fmt.Sprintf("%d", reclaimed),
+								"rounds":    fmt.Sprintf("%d", r.rounds),
+							},
+						})
+					}
 				}
 			}
 		}
@@ -427,14 +457,47 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 		}
 
 		// --- LLM call ---
+		// Repair any broken tool_call / tool_result pairing before the
+		// request leaves the process. OpenAI-compatible providers (DeepSeek
+		// included) hard-fail with 400 when a non-tool message interrupts
+		// the response block.
+		if repaired, n := ensureToolCallPairing(messages); n > 0 {
+			messages = repaired
+			if r.eventSink != nil {
+				r.eventSink.Emit(event.Event{
+					Type:      event.ContextDecision,
+					TraceID:   traceID,
+					SessionID: r.scope.SessionID,
+					AgentID:   r.scope.AgentID,
+					Payload: map[string]string{
+						"action": "repair_tool_pairing",
+						"filled": fmt.Sprintf("%d", n),
+						"rounds": fmt.Sprintf("%d", r.rounds),
+					},
+				})
+			}
+		}
 		if r.profile.Role == "explore" {
 			estimatedPrompt := int64(llm.EstimateRequestTokens(messages, toolDefs))
+			if r.promptTokensUsed > 0 {
+				frac := float64(r.promptTokensUsed) / float64(config.SubagentPromptTokenBudget)
+				if !r.budgetWarnInjected && frac >= config.ExploreBudgetWarnFrac {
+					messages = append(messages, llm.UserMessage(
+						"<budget-warn>You have used most of your prompt budget. "+
+							"Prefer synthesizing a summary now. At most one more targeted "+
+							"read/search if a critical fact is still missing — then stop.</budget-warn>"))
+					r.budgetWarnInjected = true
+				}
+			}
 			if r.promptTokensUsed > 0 && r.promptTokensUsed+estimatedPrompt > config.SubagentPromptTokenBudget {
-				out.Rounds = r.rounds
-				out.ToolFailures = r.failures
-				out.StoppedReason = "prompt_budget"
-				out.Messages = messages
-				return out
+				// Turn in a summary instead of tearing the investigation
+				// (master soft-deadline spirit applied to prompt budget).
+				return r.finalizeWithoutTools(ctx, messages, modelID, traceID, &out,
+					"prompt_budget",
+					"<limit>Prompt budget exhausted. Do NOT call any tools. "+
+						"Synthesize a concise, well-structured summary from the files and "+
+						"search results already in this conversation. Mark anything not "+
+						"verified explicitly. Partial answers beat an incomplete stub.</limit>")
 			}
 			r.promptTokensUsed += estimatedPrompt
 		}
@@ -475,6 +538,11 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 		// Truncation detection: injected early so incomplete tool calls
 		// are never executed (matching original). If the LLM hit its
 		// output limit, ask it to continue from where it left off.
+		//
+		// OpenAI/DeepSeek require every tool_call_id to have a following
+		// tool message. If the truncated assistant message already lists
+		// tool_calls, synthesize error tool results before the user nudge
+		// so the next request stays protocol-valid.
 		if sr.FinishReason == "length" {
 			if r.eventSink != nil {
 				r.eventSink.Emit(event.Event{
@@ -484,6 +552,11 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 					AgentID:   r.scope.AgentID,
 					Payload:   map[string]string{"kind": "truncated"},
 				})
+			}
+			for _, tc := range sr.ToolCalls {
+				result := tool.Failed(fmt.Sprintf(
+					"tool call '%s' was truncated before execution; please re-issue if still needed", tc.Name))
+				messages = append(messages, llm.ToolMessage(result.ToToolMessage(), tc.ID))
 			}
 			messages = append(messages, llm.UserMessage(
 				"<system>Your previous response was truncated due to output length limits. "+
@@ -587,6 +660,7 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 		// --- Execute tools with snapshot ---
 		var turnToolCount, turnFailCount int
 		var manualCompress bool
+		var pendingNudges []string
 		results := make([]tool.Result, 0, len(sr.ToolCalls))
 		for _, tc := range sr.ToolCalls {
 			if tc.Arguments != "" && !strings.HasPrefix(tc.Arguments, "{") {
@@ -602,18 +676,31 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 			key := tc.Name + "\x00" + tc.Arguments
 			r.toolCallCounts[key]++
 			// Track per-file reads to detect convergence failures.
+			// Defer the nudge until AFTER every tool result for this turn is
+			// appended: OpenAI/DeepSeek reject any non-tool message between an
+			// assistant(tool_calls) and its tool responses.
 			switch tc.Name {
 			case "read_file", "list_dir":
 				filePath := extractFilePath(tc.Arguments)
 				if filePath != "" {
 					r.readCounts[filePath]++
-					if r.readCounts[filePath] == 3 {
-						messages = append(messages, llm.UserMessage(
+					// Explore: nudge on the 2nd hit and hard-fail the 3rd so
+					// re-reads cannot burn the prompt budget (lead keeps the
+					// softer 3rd-hit nudge).
+					if r.profile.Role == "explore" {
+						if r.readCounts[filePath] == 2 {
+							pendingNudges = append(pendingNudges,
+								"<convergence-nudge>You already read/list-dir '"+filePath+
+									"'. Do NOT re-read it — use the prior result, or "+
+									"search_content for a specific fact.</convergence-nudge>")
+						}
+					} else if r.readCounts[filePath] == 3 {
+						pendingNudges = append(pendingNudges,
 							"<convergence-nudge>You have read/list-dir '"+filePath+
 								"' 3 times. STOP re-reading it. "+
 								"Either you have enough information already, or "+
 								"you need a different approach (grep/search_content for specifics, "+
-								"or delegate to explore).</convergence-nudge>"))
+								"or delegate to explore).</convergence-nudge>")
 					}
 				}
 			}
@@ -629,6 +716,28 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 				})
 			}
 			var result tool.Result
+			if r.profile.Role == "explore" && (tc.Name == "read_file" || tc.Name == "list_dir") {
+				if filePath := extractFilePath(tc.Arguments); filePath != "" && r.readCounts[filePath] >= 3 {
+					result = tool.Failed(fmt.Sprintf(
+						"repeated %s of %q blocked; use the earlier result or search_content", tc.Name, filePath))
+					results = append(results, result)
+					out.ToolResults = append(out.ToolResults, ToolResultRecord{
+						Name: tc.Name, Args: tc.Arguments, Status: result.Status, Output: result.Output,
+					})
+					messages = append(messages, llm.ToolMessage(result.ToToolMessage(), tc.ID))
+					r.failures++
+					turnFailCount++
+					turnToolCount++
+					if r.eventSink != nil {
+						r.eventSink.Emit(event.Event{
+							Type: event.ToolFinished, TraceID: traceID, SessionID: r.scope.SessionID,
+							AgentID: r.scope.AgentID, ToolCallID: tc.ID, ToolName: tc.Name,
+							Duration: time.Since(toolStart), Status: string(result.Status), Output: result.Output,
+						})
+					}
+					continue
+				}
+			}
 			switch {
 			case r.toolCallCounts[key] > config.MaxRepeatedToolCalls:
 				result = tool.Failed(fmt.Sprintf("repeated tool call blocked: %s. Use a different path, offset, limit, or query.", tc.Name))
@@ -717,6 +826,12 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 				r.roundsWithoutTodo++
 			}
 			turnToolCount++
+		}
+
+		// Inject deferred nudges only after the full tool_call → tool_result
+		// block is closed, preserving OpenAI/DeepSeek message ordering.
+		for _, nudge := range pendingNudges {
+			messages = append(messages, llm.UserMessage(nudge))
 		}
 
 		r.rounds++
@@ -844,6 +959,205 @@ func parseArgsItems(rawArgs string) []map[string]string {
 }
 
 var _ = utils.Truncate
+
+// ephemeralNudgePrefixes marks one-time procedural instructions injected by
+// the reflection / judge / plan-gate / convergence machinery. Once the model
+// has produced an assistant turn in response to them they carry no durable
+// context, so they are stripped from the running message list to avoid
+// re-billing them on every subsequent round.
+var ephemeralNudgePrefixes = []string{
+	"<mini-reflect>",
+	"<strategy-change>",
+	"<investigation-stuck>",
+	"<stuck>",
+	"<reflect>",
+	"<task-nag>",
+	"<convergence-nudge>",
+	"<budget-warn>",
+	"<limit>",
+	"<judge-critical>",
+	"<verification-failed>",
+	"<auto-lesson>",
+	"<think-first>",
+	"<planning-required>",
+	"<system>",
+}
+
+// finalizeWithoutTools asks the model for one last plain-text response with
+// tools disabled (max-rounds / prompt-budget / soft-deadline wrap-up).
+// Mirrors master's subagent soft-deadline "turn in what you have" pattern.
+func (r *Runner) finalizeWithoutTools(
+	ctx context.Context,
+	messages []llm.Message,
+	modelID, traceID string,
+	out *TurnOutcome,
+	reason, limitMsg string,
+) TurnOutcome {
+	messages = append(messages, llm.UserMessage(limitMsg))
+	sr, err := r.gateway.Stream(ctx, r.profile.Role, llm.CallParams{
+		Model:    modelID,
+		Messages: messages,
+		Tools:    nil,
+	}, newPrefixedSink(r.profile.Role))
+	r.rounds++
+	if err != nil || sr == nil {
+		messages = append(messages, llm.AssistantMessage(
+			fmt.Sprintf("[interrupted] Hit %s and the wrap-up call failed; please retry.", reason)))
+		out.Error = fmt.Errorf("%s wrap-up failed", reason)
+		out.StoppedReason = reason
+	} else {
+		if !sr.Usage.IsZero() {
+			r.turnUsage.PromptTokens += sr.Usage.PromptTokens
+			r.turnUsage.CompletionTokens += sr.Usage.CompletionTokens
+			r.turnUsage.TotalTokens += sr.Usage.TotalTokens
+			r.turnUsage.CachedReadTokens += sr.Usage.CachedReadTokens
+			r.turnUsage.CacheMissTokens += sr.Usage.CacheMissTokens
+			r.turnUsage.CacheCreateTokens += sr.Usage.CacheCreateTokens
+		}
+		messages = append(messages, sr.ToAssistantMessage())
+		out.Completed = true
+		out.StoppedReason = reason
+	}
+	out.Rounds = r.rounds
+	out.ToolFailures = r.failures
+	out.Messages = messages
+	if r.eventSink != nil {
+		r.eventSink.Emit(event.Event{
+			Type:      event.TurnComplete,
+			TraceID:   traceID,
+			SessionID: r.scope.SessionID,
+			AgentID:   r.scope.AgentID,
+			Payload:   map[string]string{"note": reason, "rounds": fmt.Sprintf("%d", r.rounds)},
+			Usage:     &r.turnUsage,
+		})
+	}
+	return *out
+}
+
+func isEphemeralNudge(m llm.Message) bool {
+	if m.Role != llm.RoleUser {
+		return false
+	}
+	c := strings.TrimSpace(m.Content)
+	for _, p := range ephemeralNudgePrefixes {
+		if strings.HasPrefix(c, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureToolCallPairing walks the message list and, for every assistant
+// message that declares tool_calls, makes sure each tool_call_id has a
+// matching RoleTool response immediately afterwards (OpenAI/DeepSeek
+// protocol). If a non-tool message previously interrupted the response
+// block, matching tool results are pulled forward and the interrupter is
+// deferred until after the complete tool block. Missing responses are
+// filled with synthetic error tool messages. Returns the (possibly rebuilt)
+// slice and the number of synthetic tool messages inserted.
+func ensureToolCallPairing(msgs []llm.Message) ([]llm.Message, int) {
+	if len(msgs) == 0 {
+		return msgs, 0
+	}
+	out := make([]llm.Message, 0, len(msgs)+4)
+	filled := 0
+	changed := false
+	for i := 0; i < len(msgs); {
+		m := msgs[i]
+		i++
+		if m.Role != llm.RoleAssistant || len(m.ToolCalls) == 0 {
+			out = append(out, m)
+			continue
+		}
+		out = append(out, m)
+
+		needed := make(map[string]struct{}, len(m.ToolCalls))
+		for _, tc := range m.ToolCalls {
+			if tc.ID != "" {
+				needed[tc.ID] = struct{}{}
+			}
+		}
+		found := make(map[string]llm.Message, len(needed))
+		var deferred []llm.Message
+		// Pull matching tool results forward even if a nudge interrupted
+		// them; stop at the next assistant turn.
+		for i < len(msgs) && len(found) < len(needed) {
+			cur := msgs[i]
+			if cur.Role == llm.RoleAssistant {
+				break
+			}
+			i++
+			if cur.Role == llm.RoleTool {
+				if _, ok := needed[cur.ToolCallID]; ok {
+					if _, seen := found[cur.ToolCallID]; !seen {
+						found[cur.ToolCallID] = cur
+						continue
+					}
+				}
+			}
+			deferred = append(deferred, cur)
+			changed = true
+		}
+		for _, tc := range m.ToolCalls {
+			if tc.ID == "" {
+				continue
+			}
+			if tm, ok := found[tc.ID]; ok {
+				out = append(out, tm)
+				continue
+			}
+			name := tc.Name
+			if name == "" {
+				name = "unknown"
+			}
+			out = append(out, llm.ToolMessage(
+				fmt.Sprintf("Error: missing tool result for '%s' (auto-repaired)", name), tc.ID))
+			filled++
+			changed = true
+		}
+		out = append(out, deferred...)
+	}
+	if !changed {
+		return msgs, 0
+	}
+	return out, filled
+}
+
+// dropConsumedNudges removes ephemeral nudge messages that appear before the
+// last assistant message (i.e. the model has already seen and responded to
+// them). Nudges positioned after the last assistant message are kept so the
+// model still sees not-yet-consumed instructions on the upcoming call. Returns
+// the filtered slice (a fresh backing array when anything changed) and the
+// number of messages removed.
+func dropConsumedNudges(msgs []llm.Message) ([]llm.Message, int) {
+	lastAsst := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == llm.RoleAssistant {
+			lastAsst = i
+			break
+		}
+	}
+	if lastAsst <= 0 {
+		return msgs, 0
+	}
+	removed := 0
+	for i := 0; i < lastAsst; i++ {
+		if isEphemeralNudge(msgs[i]) {
+			removed++
+		}
+	}
+	if removed == 0 {
+		return msgs, 0
+	}
+	out := make([]llm.Message, 0, len(msgs)-removed)
+	for i, m := range msgs {
+		if i < lastAsst && isEphemeralNudge(m) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out, removed
+}
 
 func extractFilePath(rawArgs string) string {
 	if rawArgs == "" {

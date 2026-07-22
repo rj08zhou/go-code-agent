@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent-refactor/internal/tool"
+	"go-code-agent/internal/tool"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Manager manages MCP server subprocesses and their tool registrations.
@@ -329,9 +330,12 @@ func (a *ToolCatalogAdapter) RegisterMCPTools(serverName string, tools []ToolInf
 			RiskLevel:   tool.RiskDanger, // MCP tools default to dangerous; override via config
 			Effects:     effects,
 			Schema:      schema,
-			Timeout:     30, // 30s default for MCP tools
+			Timeout:     30 * time.Second,
 			Handler: func(scope *tool.ToolScope, args json.RawMessage) tool.Result {
 				ctx := context.Background()
+				if scope != nil && scope.Context != nil {
+					ctx = scope.Context
+				}
 				var argMap map[string]any
 				json.Unmarshal(args, &argMap)
 				result, err := a.mcpMgr.CallTool(ctx, fullName, argMap)

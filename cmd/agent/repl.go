@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent-refactor/internal/agent"
-	"go-code-agent-refactor/internal/application"
-	"go-code-agent-refactor/internal/hitlaudit"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/model"
-	"go-code-agent-refactor/internal/security"
-	"go-code-agent-refactor/internal/utils"
+	"go-code-agent/internal/agent"
+	"go-code-agent/internal/application"
+	"go-code-agent/internal/hitlaudit"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/model"
+	"go-code-agent/internal/security"
+	"go-code-agent/internal/utils"
 	"os"
 	"os/signal"
 	"strings"
@@ -123,10 +123,10 @@ func (r *repl) run() {
 }
 
 func (r *repl) printBanner() {
-	fmt.Printf("go-code-agent-refactor | session: %s\n", r.built.SessionID)
-	fmt.Printf("workdir: %s | model: %s", r.built.Workdir, r.built.ModelID)
+	fmt.Printf("go-code-agent | session: %s\n", r.built.SessionID)
+	fmt.Printf("workdir: %s | model: %s | HITL: %s", r.built.Workdir, r.built.ModelID, hitlStatus(r.built))
 	if r.built.JudgeEnabled {
-		fmt.Print(" | judge: enabled")
+		fmt.Print(" | judge: on")
 	}
 	perms := r.built.Permissions
 	if perms != nil && perms.Count() > 0 {
@@ -183,16 +183,23 @@ func (r *repl) handleCommand(ctx context.Context, cmd string, messages *[]llm.Me
 	case "/help":
 		fmt.Println(strings.TrimSpace(`
 Commands:
-  /tasks     - List tasks
-  /dag       - Show DAG topology
-  /memory    - Memory stats
-  /mcp       - MCP server list
-  /team      - List teammates
-  /session   - Session info
-  /judge     - Toggle judge
-  /hitl      - Toggle HITL approval
-  /compact   - Trigger manual compaction
-  /exit/quit - Exit
+  /tasks           - List tasks
+  /dag             - Show DAG topology
+  /memory          - Memory stats
+  /mcp             - MCP server list
+  /team            - List teammates
+  /session         - Session info
+  /judge           - Toggle judge
+  /approve [mode]  - off|safe|danger (default startup: safe)
+  /hitl [mode]     - off|on|safe-only|interactive|auto-approve|...
+  /compact         - Trigger manual compaction
+  /exit /quit      - Exit
+
+HITL defaults to on (safe-only): safe tools auto-approved, danger tools prompt.
+  /approve off|safe|danger  — quick presets (also syncs HITL mode)
+  /hitl off                 — disable approval prompts entirely
+  /hitl on                  — re-enable HITL at the current mode
+Bash deny-list and permissions.json still apply when HITL is off.
 `))
 	case "/task":
 		if len(parts) < 2 {
@@ -321,16 +328,31 @@ Commands:
 		fmt.Printf("Judge: %v\n", r.built.Judge.IsEnabled())
 	case "/hitl":
 		if len(parts) > 1 {
-			if mode, err := hitlaudit.ParseMode(parts[1]); err == nil {
-				r.built.HitlMgr.SetMode(mode)
+			switch strings.ToLower(parts[1]) {
+			case "off":
+				r.built.HitlMgr.SetEnabled(false)
+				fmt.Println("HITL disabled — no approval prompts (bash deny / permissions still apply).")
+			case "on":
 				r.built.HitlMgr.SetEnabled(true)
-				fmt.Printf("HITL mode: %s\n", parts[1])
-			} else {
-				fmt.Println(err)
+				fmt.Printf("HITL enabled (mode=%s).\n", r.built.HitlMgr.Mode())
+			default:
+				if mode, err := hitlaudit.ParseMode(parts[1]); err == nil {
+					r.built.HitlMgr.SetMode(mode)
+					r.built.HitlMgr.SetEnabled(true)
+					r.syncApprovalWithHITL(mode)
+					fmt.Printf("HITL mode: %s\n", parts[1])
+				} else {
+					fmt.Println(err)
+					fmt.Println("Usage: /hitl [off|on|interactive|safe-only|auto-approve|auto-reject|notify-only]")
+				}
 			}
 		} else {
 			r.built.HitlMgr.SetEnabled(!r.built.HitlMgr.IsEnabled())
-			fmt.Printf("HITL: %v\n", r.built.HitlMgr.IsEnabled())
+			if r.built.HitlMgr.IsEnabled() {
+				fmt.Printf("HITL enabled (mode=%s).\n", r.built.HitlMgr.Mode())
+			} else {
+				fmt.Println("HITL disabled.")
+			}
 		}
 	case "/inbox":
 		data, _ := json.Marshal(r.built.Bus.ReadInbox(r.built.AgentID))
@@ -373,26 +395,17 @@ Commands:
 		}
 	case "/approve":
 		if len(parts) < 2 {
-			mode := r.built.HitlMgr.Mode()
-			fmt.Printf("Approval: %s (default)\n", mode)
-			fmt.Println("Usage: /approve off|safe|danger")
-			fmt.Println("  off    — manual confirmation for every tool")
-			fmt.Println("  safe   — auto-approve safe tools (read, search, task); prompt for danger (write, edit, delete, bash) [default]")
-			fmt.Println("  danger — auto-approve ALL tools including dangerous ones")
+			r.printApproveStatus()
 		} else {
 			switch parts[1] {
-			case "off":
-				r.built.HitlMgr.SetEnabled(true)
-				r.built.HitlMgr.SetMode(hitlaudit.HITLModeInteractive)
-				fmt.Println("All tools require manual confirmation.")
+			case "off", "reset":
+				r.applyApprovePreset("off", hitlaudit.HITLModeInteractive)
+				fmt.Println("All tools require manual confirmation. Diff preview enabled.")
 			case "safe":
-				r.built.HitlMgr.SetEnabled(true)
-				r.built.HitlMgr.SetMode(hitlaudit.HITLModeSafeOnly)
-				fmt.Println("Safe tools auto-approved; dangerous tools require confirmation.")
-			case "danger":
-				r.built.HitlMgr.SetEnabled(true)
-				r.built.HitlMgr.SetMode(hitlaudit.HITLModeAutoApprove)
-				security.SetAutoApproveAll(true)
+				r.applyApprovePreset("safe", hitlaudit.HITLModeSafeOnly)
+				fmt.Println("Safe tools auto-approved; dangerous tools require confirmation. Diff preview enabled.")
+			case "danger", "all":
+				r.applyApprovePreset("danger", hitlaudit.HITLModeAutoApprove)
 				fmt.Println("ALL tools auto-approved, diff preview skipped — use with caution.")
 			default:
 				fmt.Printf("Unknown level: %s\n", parts[1])
@@ -421,6 +434,45 @@ Commands:
 }
 
 func (r *repl) nextBuild() *application.BuildOptions { return r.next }
+
+func (r *repl) approvalState() *security.ApprovalState {
+	if r.built != nil && r.built.Approval != nil {
+		return r.built.Approval
+	}
+	return security.ActiveApproval()
+}
+
+func (r *repl) applyApprovePreset(preset string, mode hitlaudit.HITLMode) {
+	r.built.HitlMgr.SetEnabled(true)
+	r.built.HitlMgr.SetMode(mode)
+	r.approvalState().ApplyPreset(preset)
+}
+
+func (r *repl) syncApprovalWithHITL(mode hitlaudit.HITLMode) {
+	switch mode {
+	case hitlaudit.HITLModeAutoApprove:
+		r.approvalState().ApplyPreset("danger")
+	case hitlaudit.HITLModeSafeOnly:
+		r.approvalState().ApplyPreset("safe")
+	default:
+		r.approvalState().ApplyPreset("off")
+	}
+}
+
+func (r *repl) printApproveStatus() {
+	state := r.approvalState()
+	mode := r.built.HitlMgr.Mode()
+	fmt.Println("Approval status:")
+	fmt.Printf("  HITL mode:           %s\n", mode)
+	fmt.Printf("  Auto-approve safe:   %v\n", state.IsAutoApproveSafe())
+	fmt.Printf("  Auto-approve all:    %v\n", state.IsAutoApproveAll())
+	fmt.Printf("  Diff preview:        %v\n", state.ShouldPreviewDiff())
+	fmt.Println()
+	fmt.Println("Usage: /approve off|safe|danger")
+	fmt.Println("  off    — manual confirmation for every tool; diff preview on")
+	fmt.Println("  safe   — auto-approve safe tools; prompt for danger; diff preview on [default]")
+	fmt.Println("  danger — auto-approve ALL tools; skip diff preview")
+}
 
 func summarizeMessages(messages []llm.Message) string {
 	var parts []string

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +24,7 @@ type decisionEntry struct {
 }
 
 func NewDecisionLog(dir string) (*DecisionLog, error) {
-	return &DecisionLog{path: dir + "/decisions.jsonl"}, nil
+	return &DecisionLog{path: filepath.Join(dir, "decisions.jsonl")}, nil
 }
 
 func (d *DecisionLog) Record(tool, action, reason string, round int) {
@@ -34,6 +35,9 @@ func (d *DecisionLog) Record(tool, action, reason string, round int) {
 		Action: action, Reason: reason, Round: round,
 	}
 	data, _ := json.Marshal(e)
+	if err := os.MkdirAll(filepath.Dir(d.path), 0o755); err != nil {
+		return
+	}
 	f, err := os.OpenFile(d.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return

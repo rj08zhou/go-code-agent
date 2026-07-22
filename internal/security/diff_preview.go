@@ -3,7 +3,7 @@ package security
 import (
 	"bytes"
 	"fmt"
-	"go-code-agent-refactor/internal/utils"
+	"go-code-agent/internal/utils"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -310,11 +310,14 @@ func applyAcceptedHunks(oldContent, filename string, hunks []diffHunk, accepted 
 }
 
 // --------------------------------------------------------------------------
-// Global toggle
+// Diff-preview toggle (backed by the session ApprovalState)
 // --------------------------------------------------------------------------
 
-var autoApproveAll bool
+// SetAutoApproveAll updates the active session ApprovalState.
+// Prefer ApprovalState.ApplyPreset via /approve; this remains for callers
+// that only need to flip the danger auto-approve / preview skip flag.
+func SetAutoApproveAll(v bool) { ActiveApproval().SetAutoApproveAll(v) }
 
-func SetAutoApproveAll(v bool) { autoApproveAll = v }
-
-func ShouldPreviewDiff() bool { return !autoApproveAll }
+// ShouldPreviewDiff reports whether mutation diffs should be shown.
+// False only when the active session has /approve danger (auto-approve all).
+func ShouldPreviewDiff() bool { return ActiveApproval().ShouldPreviewDiff() }

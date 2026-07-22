@@ -2,8 +2,8 @@ package agent
 
 import (
 	"context"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/model"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/model"
 	"testing"
 )
 

@@ -5,7 +5,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"go-code-agent-refactor/internal/llm"
+	"go-code-agent/internal/llm"
 	"os"
 	"path/filepath"
 	"strings"

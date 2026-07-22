@@ -34,7 +34,6 @@ type Client struct {
 
 	// Health
 	lastPing  time.Time
-	healthMu  sync.Mutex
 	healthCtx context.CancelFunc
 }
 
@@ -105,7 +104,12 @@ func (c *Client) Start(ctx context.Context) error {
 	c.running = true
 
 	// Handshake: initialize
-	return c.initialize(ctx)
+	if err := c.initialize(ctx); err != nil {
+		c.abortRPC()
+		return err
+	}
+	c.lastPing = time.Now()
+	return nil
 }
 
 // Stop terminates the MCP server and health loop.
@@ -121,6 +125,9 @@ func (c *Client) Stop() error {
 	}
 	if c.stdin != nil {
 		c.stdin.Close()
+	}
+	if c.stdout != nil {
+		c.stdout.Close()
 	}
 	if c.cmd != nil && c.cmd.Process != nil {
 		c.cmd.Process.Kill()
@@ -178,12 +185,23 @@ func (c *Client) checkBreaker() bool {
 }
 
 // BreakerState returns the current circuit breaker state.
-func (c *Client) BreakerState() string { return c.breakerState }
+func (c *Client) BreakerState() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.breakerState
+}
 
 // startHealthLoop begins periodic health pings. Must be called after Start.
 func (c *Client) startHealthLoop(parent context.Context) {
 	ctx, cancel := context.WithCancel(parent)
+	c.mu.Lock()
+	if !c.running {
+		c.mu.Unlock()
+		cancel()
+		return
+	}
 	c.healthCtx = cancel
+	c.mu.Unlock()
 	go func() {
 		ticker := time.NewTicker(healthPingInterval)
 		defer ticker.Stop()
@@ -192,13 +210,19 @@ func (c *Client) startHealthLoop(parent context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_, err := c.listToolsRaw()
+				c.mu.Lock()
+				if !c.running {
+					c.mu.Unlock()
+					return
+				}
+				_, err := c.listToolsRaw(ctx)
 				if err != nil {
 					c.recordFailure()
 				} else {
 					c.recordSuccess()
 				}
 				c.lastPing = time.Now()
+				c.mu.Unlock()
 			}
 		}
 	}()
@@ -222,6 +246,9 @@ func (c *Client) DiscoverTools(ctx context.Context) ([]ToolInfo, error) {
 
 // CallTool invokes an MCP tool and returns the result.
 func (c *Client) CallTool(ctx context.Context, name string, args map[string]any) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.running {
@@ -239,9 +266,9 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 	return result, err
 }
 
-// listToolsRaw is the lock-free version for health check.
-func (c *Client) listToolsRaw() ([]ToolInfo, error) {
-	result, err := c.sendRequest("tools/list", nil)
+// listToolsRaw performs a health-check tools/list call. The caller must hold c.mu.
+func (c *Client) listToolsRaw(ctx context.Context) ([]ToolInfo, error) {
+	result, err := c.sendRequest(ctx, "tools/list", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +302,38 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
-func (c *Client) sendRequest(method string, params interface{}) (json.RawMessage, error) {
+type rpcResult struct {
+	result json.RawMessage
+	err    error
+}
+
+// sendRequest performs one serialized stdio JSON-RPC exchange.
+// The caller must hold c.mu. On cancellation the subprocess and pipes are
+// closed to unblock any in-flight read/write; the client is then stopped.
+func (c *Client) sendRequest(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	done := make(chan rpcResult, 1)
+	go func() {
+		result, err := c.sendRequestSync(method, params)
+		done <- rpcResult{result: result, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		return res.result, res.err
+	case <-ctx.Done():
+		c.abortRPC()
+		// Wait for the serialized exchange to observe the closed pipe so no
+		// reader remains behind to consume a future response.
+		<-done
+		return nil, ctx.Err()
+	}
+}
+
+func (c *Client) sendRequestSync(method string, params interface{}) (json.RawMessage, error) {
 	c.rpcMu.Lock()
 	defer c.rpcMu.Unlock()
 	c.reqID++
@@ -307,8 +365,23 @@ func (c *Client) sendRequest(method string, params interface{}) (json.RawMessage
 	return resp.Result, nil
 }
 
+// abortRPC stops the client after a cancelled stdio exchange.
+// The caller must hold c.mu.
+func (c *Client) abortRPC() {
+	c.running = false
+	if c.stdin != nil {
+		_ = c.stdin.Close()
+	}
+	if c.stdout != nil {
+		_ = c.stdout.Close()
+	}
+	if c.cmd != nil && c.cmd.Process != nil {
+		_ = c.cmd.Process.Kill()
+	}
+}
+
 func (c *Client) initialize(ctx context.Context) error {
-	result, err := c.sendRequest("initialize", map[string]any{
+	result, err := c.sendRequest(ctx, "initialize", map[string]any{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]any{},
 		"clientInfo": map[string]any{
@@ -342,7 +415,7 @@ func (c *Client) initialize(ctx context.Context) error {
 }
 
 func (c *Client) listTools(ctx context.Context) ([]ToolInfo, error) {
-	result, err := c.sendRequest("tools/list", nil)
+	result, err := c.sendRequest(ctx, "tools/list", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +430,7 @@ func (c *Client) listTools(ctx context.Context) ([]ToolInfo, error) {
 }
 
 func (c *Client) callTool(ctx context.Context, name string, args map[string]any) (string, error) {
-	result, err := c.sendRequest("tools/call", map[string]any{
+	result, err := c.sendRequest(ctx, "tools/call", map[string]any{
 		"name":      name,
 		"arguments": args,
 	})

@@ -4,8 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"go-code-agent-refactor/internal/application"
-	"go-code-agent-refactor/internal/utils"
+	"go-code-agent/internal/application"
+	"go-code-agent/internal/utils"
 	"os"
 	"strings"
 
@@ -17,8 +17,8 @@ func main() {
 	dataDir := flag.String("data-dir", "", "State directory (default: ~/.config/go-code-agent)")
 	sessionID := flag.String("session", "", "Resume a specific session ID")
 	newSession := flag.Bool("new-session", false, "Start a fresh session")
-	human := flag.Bool("human", false, "Enable HITL approval")
-	humanMode := flag.String("human-mode", "interactive", "HITL mode: interactive/auto-approve/auto-reject")
+	human := flag.Bool("human", false, "Escalate HITL to interactive (all tools require confirmation)")
+	humanMode := flag.String("human-mode", "", "Override HITL mode: interactive|safe-only|auto-approve|auto-reject|notify-only (default: safe-only)")
 	flag.Parse()
 
 	wd := *workdir
@@ -60,10 +60,6 @@ func main() {
 }
 
 func printBanner(b *application.BuiltRunner) {
-	hitlStatus := "safe-only (default)"
-	if b.HitlMgr != nil && b.HitlMgr.IsEnabled() {
-		hitlStatus = fmt.Sprintf("%v", b.HitlMgr.Mode())
-	}
 	judgeStatus := "off"
 	if b.JudgeEnabled {
 		judgeStatus = "on"
@@ -74,7 +70,14 @@ func printBanner(b *application.BuiltRunner) {
 	fmt.Printf("%s  go-code-agent%s\n", utils.Bold+utils.Cyan, utils.Reset)
 	fmt.Printf("  Model: %s  |  Workspace: %s\n", b.ModelID, b.Workdir)
 	fmt.Printf("  Session: %s - %s\n", b.SessionID[:13], b.SessionTitle)
-	fmt.Printf("  HITL: %s  |  Judge: %s\n", hitlStatus, judgeStatus)
+	fmt.Printf("  HITL: %s  |  Judge: %s\n", hitlStatus(b), judgeStatus)
 	fmt.Println(utils.Bold + utils.Cyan + divider + utils.Reset)
 	fmt.Println()
+}
+
+func hitlStatus(b *application.BuiltRunner) string {
+	if b.HitlMgr == nil || !b.HitlMgr.IsEnabled() {
+		return "off"
+	}
+	return fmt.Sprintf("on (%s)", b.HitlMgr.Mode())
 }

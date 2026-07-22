@@ -2,7 +2,7 @@ package model
 
 import (
 	"context"
-	"go-code-agent-refactor/internal/config"
+	"go-code-agent/internal/config"
 	"testing"
 )
 

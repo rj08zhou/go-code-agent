@@ -2,7 +2,7 @@ package agent
 
 import (
 	"fmt"
-	"go-code-agent-refactor/internal/prompt"
+	"go-code-agent/internal/prompt"
 	"strings"
 )
 

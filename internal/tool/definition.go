@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"go-code-agent-refactor/internal/llm"
+	"go-code-agent/internal/llm"
 )
 
 // Status is the machine-readable result of one tool invocation.
@@ -306,6 +306,35 @@ func (c *ToolCatalog) Register(defs []ToolDefinition) {
 	}
 	c.snapshot = newSnap
 }
+
+// Subset returns a new catalog containing only the named tools that exist
+// in c, preserving their relative registration order. Unknown names are
+// skipped. Used to build read-oriented catalogs for explore subagents.
+func (c *ToolCatalog) Subset(names ...string) *ToolCatalog {
+	snap := c.Load()
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	defs := make([]ToolDefinition, 0, len(names))
+	for _, name := range snap.orderedNames() {
+		if !want[name] {
+			continue
+		}
+		d, ok := snap.Definitions[name]
+		if !ok {
+			continue
+		}
+		if d.Handler == nil {
+			d.Handler = snap.Handlers[name]
+		}
+		defs = append(defs, d)
+	}
+	out := NewToolCatalog()
+	out.RegisterAll(defs)
+	return out
+}
+
 func (c *ToolCatalog) Resolve(name string) (ToolHandler, bool) {
 	snap := c.Load()
 	h, ok := snap.Handlers[name]
