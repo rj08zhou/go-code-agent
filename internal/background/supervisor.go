@@ -4,7 +4,7 @@ package background
 import (
 	"context"
 	"fmt"
-	"go-code-agent-refactor/internal/config"
+	"go-code-agent/internal/config"
 	"os/exec"
 	"sync"
 	"time"

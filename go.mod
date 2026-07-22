@@ -1,4 +1,4 @@
-module go-code-agent-refactor
+module go-code-agent
 
 go 1.25.3
 

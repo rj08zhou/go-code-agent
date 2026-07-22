@@ -2,10 +2,11 @@ package event
 
 import (
 	"fmt"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/logging"
-	"go-code-agent-refactor/internal/utils"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/logging"
+	"go-code-agent/internal/utils"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -198,16 +199,32 @@ func (s *UsageSink) Emit(e Event) {
 
 // SessionLogSink appends structured events to a JSONL file for session replay.
 type SessionLogSink struct {
-	mu sync.Mutex
-	f  *os.File
+	mu   sync.Mutex
+	path string
+	f    *os.File
 }
 
 func NewSessionLogSink(path string) (*SessionLogSink, error) {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
+	s := &SessionLogSink{path: path}
+	if err := s.reopen(); err != nil {
 		return nil, err
 	}
-	return &SessionLogSink{f: f}, nil
+	return s, nil
+}
+
+func (s *SessionLogSink) reopen() error {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if s.f != nil {
+		_ = s.f.Close()
+	}
+	s.f = f
+	return nil
 }
 
 func (s *SessionLogSink) Emit(e Event) {
@@ -221,9 +238,32 @@ func (s *SessionLogSink) Emit(e Event) {
 	if err != nil {
 		return
 	}
-	s.f.Write(append(data, '\n'))
+	line := append(data, '\n')
+	// Dir wipe leaves an open FD writing to an unlinked inode — detect via Stat.
+	if s.f == nil {
+		if err := s.reopen(); err != nil {
+			return
+		}
+	} else if _, err := os.Stat(s.path); err != nil {
+		if err := s.reopen(); err != nil {
+			return
+		}
+	}
+	if _, err := s.f.Write(line); err != nil {
+		if err := s.reopen(); err != nil {
+			return
+		}
+		_, _ = s.f.Write(line)
+	}
 }
 
 func (s *SessionLogSink) Close() error {
-	return s.f.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.f == nil {
+		return nil
+	}
+	err := s.f.Close()
+	s.f = nil
+	return err
 }

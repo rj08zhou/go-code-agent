@@ -2,7 +2,7 @@ package tool
 
 import (
 	"context"
-	"go-code-agent-refactor/internal/llm"
+	"go-code-agent/internal/llm"
 	"testing"
 )
 
@@ -28,7 +28,7 @@ func (p *protocolToolFake) ReviewPlan(id string, approve bool, feedback string) 
 
 func TestProtocolTools_DelegateToProtocolService(t *testing.T) {
 	fake := &protocolToolFake{}
-	defs := BuiltinTools(nil, nil, nil, nil, nil, nil, nil, nil, fake, nil)
+	defs := BuiltinTools(nil, nil, nil, nil, nil, nil, nil, nil, fake, nil, nil)
 	catalog := NewToolCatalog()
 	catalog.RegisterAll(defs)
 	exec := NewExecutor(catalog, nil, nil)
@@ -47,7 +47,7 @@ func TestProtocolTools_DelegateToProtocolService(t *testing.T) {
 
 func TestProtocolTools_ApprovalRequiresLead(t *testing.T) {
 	fake := &protocolToolFake{}
-	defs := BuiltinTools(nil, nil, nil, nil, nil, nil, nil, nil, fake, nil)
+	defs := BuiltinTools(nil, nil, nil, nil, nil, nil, nil, nil, fake, nil, nil)
 	catalog := NewToolCatalog()
 	catalog.RegisterAll(defs)
 	exec := NewExecutor(catalog, nil, nil)

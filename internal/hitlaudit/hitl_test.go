@@ -3,9 +3,9 @@ package hitlaudit
 import (
 	"context"
 	"encoding/json"
-	"go-code-agent-refactor/internal/config"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/tool"
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/tool"
 	"os"
 	"testing"
 )

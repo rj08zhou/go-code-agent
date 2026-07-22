@@ -1,7 +1,7 @@
 package background
 
 import (
-	"go-code-agent-refactor/internal/config"
+	"go-code-agent/internal/config"
 	"testing"
 	"time"
 )

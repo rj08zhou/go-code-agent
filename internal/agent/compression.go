@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent-refactor/internal/config"
-	"go-code-agent-refactor/internal/history"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/model"
-	"go-code-agent-refactor/internal/utils"
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/history"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/model"
+	"go-code-agent/internal/utils"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,8 +75,18 @@ func NewCompression(gw *model.Gateway, hs *history.Store, dataDir, modelID strin
 	}
 }
 
-// MicroCompact replaces old tool-result content with short placeholders.
-func MicroCompact(msgs []llm.Message) int {
+// MicroCompact replaces old tool-result content with short placeholders,
+// keeping the most recent config.KeepRecent tool results verbatim.
+//
+// minClearBytes is a clear_at_least guard: if the total bytes reclaimable from
+// the clearable (old, >100-char) tool results is below minClearBytes, nothing
+// is cleared and the message slice is left untouched. This avoids invalidating
+// the provider prompt-cache prefix for a negligible saving. Pass 0 to disable
+// the guard and always clear.
+//
+// It returns the number of tool results cleared and the number of bytes
+// reclaimed.
+func MicroCompact(msgs []llm.Message, minClearBytes int) (cleared int, reclaimed int) {
 	nameMap := map[string]string{}
 	for _, m := range msgs {
 		if m.Role == llm.RoleAssistant {
@@ -85,31 +95,54 @@ func MicroCompact(msgs []llm.Message) int {
 			}
 		}
 	}
-	type tmInfo struct {
-		index  int
-		callID string
-	}
-	var toolMsgs []tmInfo
+	var toolIdx []int
 	for i, m := range msgs {
 		if m.Role == llm.RoleTool {
-			toolMsgs = append(toolMsgs, tmInfo{i, m.ToolCallID})
+			toolIdx = append(toolIdx, i)
 		}
 	}
-	if len(toolMsgs) <= config.KeepRecent {
-		return 0
+	if len(toolIdx) <= config.KeepRecent {
+		return 0, 0
 	}
-	cleared := 0
-	for _, ti := range toolMsgs[:len(toolMsgs)-config.KeepRecent] {
-		if len(msgs[ti.index].Content) > 100 {
-			name := nameMap[ti.callID]
-			if name == "" {
-				name = "unknown"
-			}
-			msgs[ti.index] = llm.ToolMessage(fmt.Sprintf("[cleared: %s]", name), ti.callID)
-			cleared++
+
+	// First pass: identify old, large tool results and how many bytes clearing
+	// each one would free (original length minus the placeholder length).
+	type target struct {
+		index int
+		name  string
+	}
+	var targets []target
+	reclaimable := 0
+	for _, idx := range toolIdx[:len(toolIdx)-config.KeepRecent] {
+		content := msgs[idx].Content
+		if len(content) <= 100 {
+			continue
 		}
+		name := nameMap[msgs[idx].ToolCallID]
+		if name == "" {
+			name = "unknown"
+		}
+		gain := len(content) - len("[cleared: ]") - len(name)
+		if gain <= 0 {
+			continue
+		}
+		targets = append(targets, target{index: idx, name: name})
+		reclaimable += gain
 	}
-	return cleared
+
+	// clear_at_least guard: skip entirely if the saving isn't worth breaking
+	// the prompt-cache prefix.
+	if minClearBytes > 0 && reclaimable < minClearBytes {
+		return 0, 0
+	}
+
+	// Second pass: apply. Same-length in-place rewrite (only Content changes),
+	// so message indices and the persisted boundary stay valid.
+	for _, t := range targets {
+		msgs[t.index] = llm.ToolMessage(fmt.Sprintf("[cleared: %s]", t.name), msgs[t.index].ToolCallID)
+		cleared++
+	}
+	return cleared, reclaimable
 }
 
 // buildCompressInput renders a message prefix into compact structured text.

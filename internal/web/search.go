@@ -10,11 +10,16 @@ import (
 	"slices"
 	"strings"
 
+	"go-code-agent/internal/config"
+
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
 
-const SearchTimeout = 8 * 1000000000 // 8s in nanoseconds
+// SearchTimeout caps a single backend HTTP attempt. Kept aligned with the
+// per-backend context timeout so a hung backend cannot consume the whole
+// web_search budget and starve the fallback chain.
+const SearchTimeout = config.WebSearchPerBackendTimeout
 
 type SearchResult struct {
 	Title   string
@@ -36,7 +41,16 @@ func (c *chainSearchProvider) Name() string { return "chain" }
 func (c *chainSearchProvider) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
 	var errs []string
 	for _, b := range c.backends {
-		results, err := b.Search(ctx, query, limit)
+		// Stop early if the overall budget is already spent; otherwise give
+		// each backend its own bounded attempt so one slow/hung backend
+		// cannot starve the remaining fallbacks.
+		if ctx.Err() != nil {
+			errs = append(errs, fmt.Sprintf("%s: skipped (%v)", b.Name(), ctx.Err()))
+			break
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, config.WebSearchPerBackendTimeout)
+		results, err := b.Search(attemptCtx, query, limit)
+		cancel()
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", b.Name(), err))
 			continue

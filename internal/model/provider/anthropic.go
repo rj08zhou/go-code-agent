@@ -3,8 +3,8 @@ package provider
 import (
 	"context"
 	"encoding/json"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/model"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/model"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"

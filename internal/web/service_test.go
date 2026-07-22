@@ -39,3 +39,23 @@ func TestServiceFetchReturnsValidationError(t *testing.T) {
 		t.Fatal("Fetch() expected unsupported scheme error")
 	}
 }
+
+func TestFormatFetchResultUntrustedWrapper(t *testing.T) {
+	out := formatFetchResult(&FetchResult{
+		URL:        "https://example.test/page",
+		StatusCode: 200,
+		Text:       "Hello article body",
+	}, nil)
+	if !strings.Contains(out, "URL: https://example.test/page") {
+		t.Fatalf("missing URL: %q", out)
+	}
+	if !strings.Contains(out, "Status: 200") {
+		t.Fatalf("missing Status: %q", out)
+	}
+	if !strings.Contains(out, "BEGIN UNTRUSTED PAGE CONTENT") || !strings.Contains(out, "END UNTRUSTED PAGE CONTENT") {
+		t.Fatalf("missing untrusted markers: %q", out)
+	}
+	if !strings.Contains(out, "Hello article body") {
+		t.Fatalf("missing body: %q", out)
+	}
+}

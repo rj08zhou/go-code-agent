@@ -3,7 +3,7 @@ package event
 
 import (
 	"encoding/json"
-	"go-code-agent-refactor/internal/llm"
+	"go-code-agent/internal/llm"
 	"time"
 )
 

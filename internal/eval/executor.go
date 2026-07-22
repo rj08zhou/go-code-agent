@@ -9,7 +9,7 @@ import (
 )
 
 // Executor runs a Task in a temp workdir using the real agent binary.
-// This is a CLI wrapper — it calls `go-code-agent-refactor` in a subprocess.
+// This is a CLI wrapper — it calls `go-code-agent` in a subprocess.
 type Executor struct {
 	BinaryPath string
 	Workdir    string
@@ -65,9 +65,9 @@ func (e *Executor) RunTask(task Task) (bool, string, string, error) {
 // FindBinary locates the agent binary in common places.
 func FindBinary() string {
 	candidates := []string{
-		"./go-code-agent-refactor",
-		filepath.Join(os.Getenv("GOPATH"), "bin", "go-code-agent-refactor"),
-		"/usr/local/bin/go-code-agent-refactor",
+		"./go-code-agent",
+		filepath.Join(os.Getenv("GOPATH"), "bin", "go-code-agent"),
+		"/usr/local/bin/go-code-agent",
 	}
 	for _, p := range candidates {
 		if _, err := os.Stat(p); err == nil {

@@ -3,7 +3,7 @@ package model
 
 import (
 	"context"
-	"go-code-agent-refactor/internal/llm"
+	"go-code-agent/internal/llm"
 )
 
 // Provider is the interface every LLM backend implements.

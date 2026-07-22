@@ -3,7 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
-	"go-code-agent-refactor/internal/llm"
+	"go-code-agent/internal/llm"
 	"testing"
 )
 

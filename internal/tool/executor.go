@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent-refactor/internal/config"
-	"go-code-agent-refactor/internal/llm"
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/llm"
 	"path/filepath"
 	"strings"
 	"time"
@@ -276,7 +276,15 @@ func pathAllowed(scope *ToolScope, raw string) bool {
 	if scope.Workdir == "" {
 		return false
 	}
-	abs, err := filepath.Abs(filepath.Join(scope.Workdir, raw))
+	// Match SecurePath: absolute inputs must not be Join'd onto workdir
+	// (Go 1.25+ Join keeps both sides: Join("/wd", "/Users/x") → "/wd/Users/x").
+	var candidate string
+	if filepath.IsAbs(raw) {
+		candidate = filepath.Clean(raw)
+	} else {
+		candidate = filepath.Join(scope.Workdir, raw)
+	}
+	abs, err := filepath.Abs(candidate)
 	if err != nil {
 		return false
 	}

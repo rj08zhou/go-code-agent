@@ -1,488 +1,196 @@
-# go-code-agent-refactor
+# go-code-agent
 
-一个使用 Go 编写的终端交互式自主编程 Agent。它通过 LLM 多轮决策和工具调用，帮助用户阅读代码、分析项目、修改文件、执行测试、管理任务，并支持子 Agent、团队协作、MCP、长期记忆、会话恢复和人工审批。
+一个使用 Go 编写的终端自主编程 Agent。它通过 LLM 多轮推理与工具调用完成代码阅读、项目分析、文件修改、命令执行、测试、任务管理和团队协作，并提供会话恢复、长期记忆、MCP、HITL 审批和多层安全控制。
 
-> 当前项目是一个 CLI/REPL 应用，不是 HTTP 服务，也不是 IDE 插件。
+> 当前项目是 CLI/REPL 应用，不是 HTTP 服务，也不是 IDE 插件。
 
 ## 目录
 
-- [项目定位](#项目定位)
-- [核心能力](#核心能力)
-- [架构概览](#架构概览)
-- [运行流程](#运行流程)
+- [主要能力](#主要能力)
 - [快速开始](#快速开始)
+- [日常使用](#日常使用)
 - [命令行参数](#命令行参数)
-- [环境变量](#环境变量)
-- [交互命令](#交互命令)
-- [工具清单](#工具清单)
-- [审批与安全](#审批与安全)
-- [会话、历史和持久化数据](#会话历史和持久化数据)
+- [REPL 命令](#repl-命令)
+- [配置参考](#配置参考)
+- [架构设计](#架构设计)
+- [工具系统](#工具系统)
+- [安全与审批](#安全与审批)
+- [多 Agent 设计](#多-agent-设计)
 - [MCP 集成](#mcp-集成)
-- [多 Agent 与团队协作](#多-agent-与团队协作)
-- [技能和提示词](#技能和提示词)
-- [长期记忆](#长期记忆)
-- [网络访问](#网络访问)
-- [Judge 质量验证](#judge-质量验证)
-- [离线评估](#离线评估)
-- [项目结构](#项目结构)
-- [开发指南](#开发指南)
+- [会话、历史与持久化](#会话历史与持久化)
+- [目录设计](#目录设计)
+- [开发与扩展](#开发与扩展)
+- [测试与评估](#测试与评估)
 - [故障排查](#故障排查)
-- [已知限制](#已知限制)
-- [安全建议](#安全建议)
+- [当前限制](#当前限制)
 
-## 项目定位
 
-项目的核心思想是将 Agent 拆分为三个部分：
+## 主要能力
 
-1. **模型**：负责理解用户意图、规划下一步、决定是否调用工具。
-2. **能力**：通过统一的 Tool Catalog 暴露文件、Shell、任务、记忆、网络和协作能力。
-3. **运行时约束**：通过上下文、权限、HITL 审批、超时、快照、限流和历史机制控制执行边界。
+### 代码与终端
 
-一次用户请求通常会经历以下循环：
+- 读取文件、列出目录；
+- 按文件名或文件内容搜索；
+- 创建、编辑、插入、删除文件；
+- 执行前台和后台 Shell 命令；
+- 文件变更 diff preview；
+- 可选的 git snapshot 和失败回滚；
+- 工具输出截断和敏感信息脱敏。
 
-```text
-用户输入
-   ↓
-追加到会话历史
-   ↓
-LLM 推理
-   ├─ 直接返回文本 → 输出给用户
-   └─ 返回工具调用 → 权限/审批检查 → 执行工具
-                              ↓
-                         工具结果写回上下文
-                              ↓
-                         继续 LLM 推理
-```
+### Agent 运行时
 
-项目中的 Agent Loop 尽量保持通用，复杂能力通过模块化服务和工具注入，而不是在 REPL 中写死具体工作流。
+- Lead Agent 多轮工具调用；
+- Explore Subagent 隔离只读探索；
+- Teammate 持久协作和独立 git worktree；
+- 规划门控、失败反思和重复调用检测；
+- 自动和手动上下文压缩；
+- 可选 LLM-as-Judge；
+- 短期 Todo 和持久化任务 DAG；
+- 跨会话长期记忆。
 
-## 核心能力
+### 模型与扩展
 
-### 代码操作
-
-- 读取文件和目录；
-- 按文件名或内容搜索；
-- 创建、编辑、插入和删除文件；
-- 执行 Shell 命令；
-- 生成和查看文件变更预览；
-- 可选的 git snapshot 和失败回滚。
-
-### Agent 编排
-
-- Lead Agent：处理用户主请求；
-- Explore Subagent：隔离上下文执行只读探索；
-- Teammate：拥有独立角色和工作目录的长期协作 Agent；
-- 后台任务：异步执行耗时命令；
-- 任务 CRUD 和 DAG 依赖调度；
-- Todo 状态跟踪；
-- 连续失败、重复工具调用和卡住检测；
-- 上下文压缩和会话 checkpoint。
-
-### 模型和服务
-
-- OpenAI API 及 OpenAI-compatible API；
+- OpenAI API；
 - Anthropic API；
-- Provider Registry 和统一 Gateway；
-- 流式输出；
-- 角色级并发限流；
-- LLM 调用重试、超时和 Usage 记录；
-- 可选 Judge 模型进行二次质量检查。
-
-### 扩展能力
-
-- MCP stdio 子进程集成；
-- 项目级 `skills/` 技能加载；
-- 长期记忆和每日 JSONL 记忆；
-- `web_fetch` 和 `web_search`；
-- 外部网络 SSRF 防护；
-- 权限规则和工具决策审计。
-
-## 架构概览
-
-### 总体架构图
-
-```text
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              用户 / 终端 REPL                                 │
-│                         cmd/agent/repl.go                                     │
-└──────────────────────────────────┬───────────────────────────────────────────┘
-                                   │ 用户输入 / 斜杠命令 / Ctrl-C
-                                   ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         Application 组合根                                    │
-│                    internal/application/application.go                      │
-│                                                                              │
-│  配置 · Session Repository · Provider Registry · Tool Catalog · 生命周期管理   │
-└───────────────────────────┬──────────────────────────────┬───────────────────┘
-                            │                              │
-                            ▼                              ▼
-┌──────────────────────────────────────┐  ┌───────────────────────────────────┐
-│          SessionRuntime               │  │          Agent Runner             │
-│  历史 / 任务 / 记忆 / MCP / 团队       │  │   Lead · Explore · Teammate       │
-│  HITL / worktree / 后台任务           │  │   Loop · Compression · Judge      │
-└──────────────────┬───────────────────┘  └──────────────────┬────────────────┘
-                   │                                         │
-                   │ 上下文、状态和资源                       │ LLM 请求 / 工具调用决策
-                   │                                         ▼
-                   │                          ┌────────────────────────────────┐
-                   │                          │       Model Gateway            │
-                   │                          │ 重试 · 超时 · 限流 · Usage       │
-                   │                          └───────────────┬────────────────┘
-                   │                                          │
-                   │                                          ▼
-                   │                          ┌────────────────────────────────┐
-                   │                          │       Provider Registry         │
-                   │                          │ OpenAI · Anthropic · Compatible │
-                   │                          └───────────────┬────────────────┘
-                   │                                          │ API / Streaming
-                   │                                          ▼
-                   │                          ┌────────────────────────────────┐
-                   │                          │           LLM 服务              │
-                   │                          └────────────────────────────────┘
-                   │
-                   ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                            Tool Executor                                       │
-│ 参数解析 · 权限检查 · HITL 审批 · 超时 · Snapshot · 审计 · 输出脱敏            │
-└──────────────┬─────────────────────┬─────────────────────┬───────────────────┘
-               │                     │                     │
-               ▼                     ▼                     ▼
-      ┌────────────────┐    ┌────────────────┐    ┌─────────────────────────┐
-      │ 文件 / Shell   │    │ 任务 / 记忆     │    │ Web / MCP / Team         │
-      │ read/edit/bash │    │ Todo / DAG     │    │ fetch/search/协作         │
-      └────────────────┘    └────────────────┘    └─────────────────────────┘
-               │                     │                     │
-               └─────────────────────┴─────────────────────┘
-                                     │ 工具结果写回上下文
-                                     └──────────────────────► Agent Runner
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ 横切能力：SecurePath · BashPolicy · Permissions · SSRF · SecretsSanitizer     │
-│ 持久化：History · Session · Memory · Task · Usage · Decision · Event Logs      │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-架构图中的核心闭环是：`REPL → Runner → Gateway/Provider → LLM → Tool Executor → 工具结果 → Runner`。其中 `SessionRuntime` 提供会话级上下文和资源，安全模块横向约束工具执行，持久化模块负责跨请求和跨进程保存状态。
-
-### 分层结构
-
-```text
-cmd/agent
-  ├─ main.go              CLI 参数、应用生命周期、REPL 创建
-  └─ repl.go              输入循环、斜杠命令、历史持久化
-
-internal/application
-  ├─ Application           进程级组合根
-  ├─ SessionRuntime        单会话运行时和资源生命周期
-  └─ BuildRunner           组装所有 session-scoped 服务
-
-internal/agent
-  ├─ Runner                Lead/Explore/Teammate Agent Loop
-  ├─ SubagentRunner        隔离上下文的子 Agent
-  ├─ TeammateManager       团队 Agent 生命周期
-  ├─ Compression           上下文压缩
-  ├─ Reflection            卡住/失败反思
-  ├─ Judge                 LLM-as-Judge
-  └─ Snapshot/Usage/Lesson 辅助模块
-
-internal/model
-  ├─ Gateway               Provider 统一入口、重试、限流、统计
-  ├─ Provider              LLM 后端适配器
-  └─ StreamSink            流式输出接口
-
-internal/tool
-  ├─ ToolDefinition        工具定义、Schema、风险和副作用
-  ├─ ToolCatalog            原子化工具注册表
-  ├─ ToolExecutor           统一执行管线
-  └─ handlers.go            内置工具实现
-
-internal/security
-  ├─ SecurePath            工作目录和路径约束
-  ├─ BashPolicy             Shell 命令策略
-  ├─ Permissions            permissions.json 规则
-  ├─ DiffPreview            文件变更预览
-  ├─ SSRF 防护              出站网络限制
-  └─ SecretsSanitizer       输出中的敏感信息清理
-```
-
-### 组合根
-
-`internal/application/application.go` 是应用的组合根，负责把进程级和会话级对象连接起来：
-
-- 加载 `internal/config` 配置；
-- 创建 Provider Registry 和 `model.Gateway`；
-- 创建全局 Tool Catalog；
-- 创建 Session Repository；
-- 为每个会话创建任务、记忆、MCP、团队、后台任务、worktree、HITL 和历史服务；
-- 注册内置工具和动态 MCP 工具；
-- 构造系统提示词；
-- 创建 `agent.Runner` 和事件 Sink；
-- 在关闭时逆序释放资源。
-
-`Application` 保存项目级服务，`SessionRuntime` 保存单个会话的上下文、取消函数和关闭钩子，避免把每次调用的状态放到全局变量中。
-
-### Provider 和模型选择
-
-Provider 的选择顺序如下：
-
-1. 如果设置了 `LLM_PROVIDER`，优先使用指定 Provider；
-2. 否则根据模型名前缀推断：
-   - `claude-*` 或 `claude.*` → `anthropic`；
-   - `gpt-*`、`o1*`、`o3*` → `openai`；
-   - `gemini-*` 或 `gemini.*` → `gemini`；
-3. 如果仍无法推断，则回退到已注册的 `openai` Provider。
-
-当前 `Application.New` 默认注册 OpenAI 和 Anthropic Provider。项目中虽然保留了 `gemini.go`，但当前应用组装流程没有注册 Gemini Provider，因此 Gemini 目前不应视为开箱即用的后端。
-
-## 运行流程
-
-### 启动阶段
-
-`cmd/agent/main.go` 执行以下操作：
-
-1. 解析命令行参数；
-2. 确定工作目录和配置根目录；
-3. 创建 `application.Application`；
-4. 创建 readline 输入器；
-5. 根据活动会话、指定会话或 `--new-session` 构造 `BuiltRunner`；
-6. 打印模型、工作区、会话和 HITL 状态；
-7. 进入 REPL。
-
-### 一次普通请求
-
-`cmd/agent/repl.go` 中的一次普通消息处理流程：
-
-1. 从 `history.Store` 加载当前会话消息；
-2. 读取用户输入；
-3. 将用户消息追加到内存历史和磁盘历史；
-4. 调用 `agent.Runner.Run`；
-5. Runner 调用 Gateway 发起 LLM 请求；
-6. 如果模型返回工具调用，交给 `tool.Executor`；
-7. Executor 执行权限检查、审批、参数解析、超时、脱敏和审计；
-8. 把 Assistant 消息和 Tool 消息追加到历史；
-9. 必要时写入 checkpoint；
-10. 输出错误并同步历史。
-
-### Ctrl-C 行为
-
-第一次 `Ctrl-C` 会取消当前运行上下文，给正在进行的 LLM 调用、工具调用和子 Agent 发送取消信号；第二次 `Ctrl-C` 强制退出。
-
-用户消息是在请求开始前写入历史的。启动时加载历史会清理尾部没有对应 Agent 响应的孤儿 user 消息，避免上一次被中断的 prompt 在下次启动时自动重放。
+- OpenAI-compatible API；
+- 流式文本输出；
+- LLM 重试、调用超时、角色级并发限制和 Usage 记录；
+- MCP stdio server 动态工具注册；
+- 工作区 `skills/**/SKILL.md` 技能加载；
+- `web_fetch` 和多后端 `web_search`。
 
 ## 快速开始
 
-### 环境要求
+### 1. 环境要求
 
-- Go `1.25.3` 或兼容的较新版本；
-- 一个可用的 LLM API Key；
-- macOS、Linux 或其他支持 Go 和 Shell 的环境；
-- 如果使用 MCP，需要额外安装对应的 MCP server 命令。
+- Go `1.25.3`，版本要求以 `go.mod` 为准；
+- 一个可用的 OpenAI 或 Anthropic API Key；
+- macOS、Linux 或其他支持 Go 和 `sh` 的系统；
+- 建议安装 Git；Teammate worktree 和 snapshot 功能依赖 Git；
+- 使用 MCP 时，需要额外安装对应 MCP server 命令，例如 Node.js、Python 或自定义二进制。
 
-### 编译
-
-当前仓库没有根目录 `Makefile`，使用 Go 命令直接编译：
+### 2. 获取和编译
 
 ```bash
-git clone <repository-url>
-cd go-code-agent-refactor
+git clone https://github.com/rj08zhou/go-code-agent.git
+cd go-code-agent
 
 go mod download
-go build -o bin/go-code-agent ./cmd/agent
-go build -o bin/go-code-agent-eval ./cmd/eval
+go build -o go-code-agent ./cmd/agent
 ```
 
-也可以直接运行：
+也可以不生成二进制，直接运行：
 
 ```bash
 go run ./cmd/agent
 ```
 
-### OpenAI 或 OpenAI-compatible API
+### 3. 配置模型
 
-```bash
-export OPENAI_API_KEY="your-api-key"
-export MODEL_ID="gpt-4o"
+#### Anthropic
 
-go run ./cmd/agent
-```
-
-DeepSeek 等 OpenAI-compatible 服务可以显式指定 Provider 和 Base URL：
-
-```bash
-export LLM_PROVIDER="openai"
-export OPENAI_API_KEY="your-api-key"
-export OPENAI_BASE_URL="https://api.deepseek.com"
-export MODEL_ID="deepseek-v4-flash"
-
-go run ./cmd/agent
-```
-
-Base URL 应按照对应服务商的 OpenAI-compatible API 要求填写。不要把 API Key 写进代码、提交到 Git 或放入 `.mcp.json` 示例文件中。
-
-### Anthropic API
+默认 `MODEL_ID` 是 `claude-opus-4.7`。使用 Anthropic 时：
 
 ```bash
 export ANTHROPIC_API_KEY="your-api-key"
 export MODEL_ID="claude-opus-4.7"
 
-go run ./cmd/agent
+./go-code-agent
 ```
 
-### 指定工作区和状态目录
+#### OpenAI
+
+使用 OpenAI 时应显式设置与 Provider 匹配的模型名：
 
 ```bash
-go run ./cmd/agent \
-  --workdir /path/to/project \
-  --data-dir /path/to/config
+export OPENAI_API_KEY="your-api-key"
+export MODEL_ID="gpt-4o"
+
+./go-code-agent
 ```
 
-`--data-dir` 是配置根目录，项目状态实际保存到：
-
-```text
-<data-dir>/go-code-agent/<工作目录basename>/
-```
-
-默认配置根目录为 `$XDG_CONFIG_HOME`；如果未设置，则使用 `$HOME/.config`。
-
-## 命令行参数
-
-`cmd/agent` 支持以下参数：
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `--workdir` | 当前目录 | Agent 工作目录，也是文件工具的主要允许根目录 |
-| `--data-dir` | `$XDG_CONFIG_HOME` 或 `$HOME/.config` | 持久化状态的配置根目录 |
-| `--session` | 空 | 启动时恢复指定会话 ID |
-| `--new-session` | `false` | 忽略当前活动会话，创建新会话 |
-| `--human` | `false` | 启用人工审批，并以 interactive 模式启动 |
-| `--human-mode` | `interactive` | 启动时设置 HITL 模式 |
-
-示例：
+#### OpenAI-compatible API
 
 ```bash
-# 使用指定会话
-go run ./cmd/agent --session 20260721T102833-1230001
+export LLM_PROVIDER="openai"
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_BASE_URL="https://your-provider.example/v1"
+export MODEL_ID="your-model-id"
 
-# 创建新会话并在安全模式启动
-go run ./cmd/agent --new-session --human-mode safe-only
-
-# 所有工具都要求人工确认
-go run ./cmd/agent --human --human-mode interactive
+./go-code-agent
 ```
 
-注意：启动参数中的 `--human-mode` 使用 `interactive`、`auto-approve`、`auto-reject`、`notify-only` 或 `safe-only` 等模式名称；交互过程中也可以使用 `/approve` 命令切换常用的 `off`、`safe`、`danger` 模式。
+`OPENAI_BASE_URL` 会直接传给 OpenAI Go SDK。它是否需要 `/v1` 后缀取决于兼容服务商的接口约定。
 
-## 环境变量
+> 启动时必须至少有一个可注册的 Provider。仅设置 `MODEL_ID` 而没有 API Key，应用会在初始化 Gateway 时失败。模型名也应与实际 Provider 匹配。
 
-### 主 LLM
+### 4. 指定目标项目
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `MODEL_ID` | `claude-opus-4.7` | 主模型 ID |
-| `LLM_PROVIDER` | 自动推断 | 强制 Provider，例如 `openai`、`anthropic` |
-| `OPENAI_API_KEY` | 空 | OpenAI 或 OpenAI-compatible API Key |
-| `OPENAI_BASE_URL` | SDK 默认值 | OpenAI API Base URL |
-| `ANTHROPIC_API_KEY` | 空 | Anthropic API Key |
-| `ANTHROPIC_BASE_URL` | SDK 默认值 | Anthropic API Base URL |
-| `CONTEXT_WINDOW_TOKENS` | 自动推断 | 覆盖模型上下文窗口大小 |
-| `SNAPSHOT_ENABLED` | `false` | 设置为 `1` 时启用工具执行前的 git snapshot 策略 |
-
-如果没有检测到 `OPENAI_API_KEY` 或 `ANTHROPIC_API_KEY`，启动时会打印警告；后续调用仍可能因没有可用 Provider 而失败。
-
-### LLM 限流
-
-| 变量 | 默认值 | 说明 |
-|---|---:|---|
-| `LLM_MAX_QPS` | `4.0` | LLM 请求速率限制 |
-| `LLM_MAX_BURST` | `8` | 突发容量配置 |
-| `LLM_MAX_CONCURRENCY` | `4` | 角色限流器的并发容量 |
-
-### Judge
-
-| 变量 | 默认值 | 说明 |
-|---|---:|---|
-| `JUDGE_ENABLED` | `false` | 是否启用 LLM 二次评估 |
-| `JUDGE_MODEL` | 空 | Judge 模型；为空时使用主模型回退逻辑 |
-| `JUDGE_MIN_SCORE` | `7` | 低于该分数时要求 Agent 重试 |
-| `JUDGE_PROVIDER` | 自动推断 | Judge 使用的 Provider |
-| `JUDGE_API_KEY` | 空 | Judge 专用 API Key |
-| `JUDGE_BASE_URL` | 空 | Judge 专用 Base URL |
-
-示例：
+如果当前目录不是要操作的项目：
 
 ```bash
-export JUDGE_ENABLED=1
-export JUDGE_MODEL="claude-haiku-4.5"
-export JUDGE_MIN_SCORE=7
+./go-code-agent --workdir /path/to/your/project
 ```
 
-Judge 的内部错误采用宽松回退策略，通常不会因为 Judge 本身异常而阻塞主 Agent。
-
-### Web 搜索
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `WEB_SEARCH_PROVIDER` | fallback chain | `tavily` 或 `brave`；未配置时使用 SearXNG → DuckDuckGo |
-| `WEB_SEARCH_API_KEY` | 空 | Tavily 或 Brave API Key |
-| `SEARXNG_URL` | 空 | 指定一个 SearXNG 实例 |
-| `SEARXNG_INSTANCES` | 内置公共实例 | 逗号分隔的 SearXNG 实例列表 |
-| `WEB_ALLOW_PRIVATE_IPS` | `false` | 是否允许访问解析到私有/内部 IP 的主机 |
-
-推荐生产环境显式配置可信的 SearXNG 实例，不要依赖公共实例。
-
-### MCP
-
-| 变量 | 说明 |
-|---|---|
-| `MCP_SERVERS` | JSON 数组，启动时自动启动其中的 MCP server |
-
-示例：
+指定独立状态目录：
 
 ```bash
-export MCP_SERVERS='[
-  {"name":"filesystem","command":"npx","args":["-y","@anthropic-ai/mcp-server-filesystem","."]}
-]'
+./go-code-agent \
+  --workdir /path/to/your/project \
+  --data-dir /path/to/config-root
 ```
 
-### 配置文件
-
-以下文件位于项目状态目录或工作区目录：
-
-- `<data-dir>/go-code-agent/<project>/permissions.json`：工具权限规则；
-- `<workdir>/.mcp.json`：工作区 MCP server 配置，默认进入待审批列表；
-- `<workdir>/skills/**/SKILL.md`：项目技能文件；
-- `<workdir>`：Agent 的主要代码工作区。
-
-## 交互命令
-
-在 REPL 中输入 `/help` 可以查看基础命令。完整命令如下：
-
-### 帮助和退出
+实际项目状态会写入：
 
 ```text
-/help
-/exit
-/quit
+<data-dir>/go-code-agent/<workdir 的 basename>/
 ```
 
-### 任务和 Todo
+默认配置根目录是 `$XDG_CONFIG_HOME`；未设置时使用 `$HOME/.config`。
+
+### 5. 第一次会话
+
+启动后可以直接输入自然语言任务，例如：
 
 ```text
-/tasks
-/dag
-/task clear
-/task reset
+分析这个项目的架构，先不要修改代码
 ```
 
-- `/tasks`：显示 Todo 列表；
-- `/dag`：显示持久化任务 DAG 和进度；
-- `/task clear`：隐藏已完成任务；
-- `/task reset`：删除当前任务数据并重新开始。
+```text
+修复登录模块中的空指针问题，修改前先说明原因，完成后运行测试
+```
 
-### 会话
+建议先检查当前安全状态：
 
 ```text
+/approve
+/permissions
 /session
+/help
+```
+
+默认启动姿态是 HITL 开启、`safe-only` 模式：常规安全操作自动继续，高风险 Shell 和文件变更会经过审查或 diff preview。
+
+## 日常使用
+
+### 恢复和创建会话
+
+默认会恢复项目的 active session；没有 active session 时自动创建：
+
+```bash
+# 恢复默认 active session
+./go-code-agent --workdir /path/to/project
+
+# 恢复指定 session
+./go-code-agent --workdir /path/to/project --session <session-id>
+
+# 强制创建新 session
+./go-code-agent --workdir /path/to/project --new-session
+```
+
+REPL 内可以使用：
+
+```text
 /session list
 /session new
 /session switch <session-id>
@@ -490,604 +198,1040 @@ export MCP_SERVERS='[
 /session archive
 ```
 
-切换或创建会话会退出当前 REPL，并由顶层程序重新构造对应的 SessionRuntime。
+切换、创建或归档会话时，当前 `SessionRuntime` 会先关闭，再为目标会话重新组装工具、MCP、后台任务、团队和历史服务。
 
-### 审批和安全
+### 取消和退出
+
+- `Ctrl-D`：退出 REPL；
+- `/exit` 或 `/quit`：正常退出；
+- 第一次 `Ctrl-C`：取消运行时上下文并开始关闭当前 CLI；
+- 第二次 `Ctrl-C`：强制退出进程。
+
+当前实现的第一次 `Ctrl-C` 不只是暂停当前模型调用，而是结束当前 REPL。历史在每轮后同步，启动恢复时还会清理不完整的消息尾部。
+
+### 推荐审批姿态
 
 ```text
-/approve
-/approve off
 /approve safe
-/approve danger
-/hitl
-/hitl interactive
-/hitl auto-approve
-/hitl auto-reject
-/hitl notify-only
-/hitl safe-only
-/permissions
-/permissions reload
-/security
-/security test-bash <command>
-/decisions
 ```
 
-`/approve danger` 会自动批准包括危险工具在内的所有工具，并跳过 diff preview，只建议在完全信任工作区和模型行为时使用。
+这是默认模式。仅在完全可信的工作区和环境中临时使用：
+
+```text
+/approve danger
+```
+
+恢复严格人工审查：
+
+```text
+/approve off
+```
+
+注意：`/approve off` 表示关闭自动批准，不是关闭 HITL。真正关闭审批提示的命令是 `/hitl off`。
+
+## 命令行参数
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--workdir` | 当前目录 | Agent 的项目工作目录和文件沙箱根目录 |
+| `--data-dir` | `$XDG_CONFIG_HOME` 或 `$HOME/.config` | 状态存储的配置根目录 |
+| `--session` | 空 | 恢复指定 session ID |
+| `--new-session` | `false` | 忽略 active session 并创建新会话 |
+| `--human` | `false` | 将启动 HITL 模式切换为 `interactive` |
+| `--human-mode` | 空，即默认 `safe-only` | 显式设置 `interactive`、`safe-only`、`auto-approve`、`auto-reject` 或 `notify-only` |
+
+示例：
+
+```bash
+./go-code-agent --workdir "$PWD" --human
+./go-code-agent --human-mode auto-reject
+./go-code-agent --new-session --human-mode safe-only
+```
+
+无效的 `--human-mode` 会打印警告并保留默认模式。
+
+## REPL 命令
+
+### 帮助与退出
+
+| 命令 | 说明 |
+|---|---|
+| `/help` | 显示基础帮助 |
+| `/exit`、`/quit` | 退出 |
+
+### 会话
+
+| 命令 | 说明 |
+|---|---|
+| `/session` | 显示当前 session |
+| `/session list` | 列出项目下全部 session |
+| `/session new` | 创建新 session |
+| `/session switch <id>` | 切换 active session |
+| `/session rename <title>` | 重命名当前 session |
+| `/session archive` | 保存会话摘要到记忆、归档并创建新 session |
+
+### 任务
+
+| 命令 | 说明 |
+|---|---|
+| `/tasks` | 显示当前进程内的 Todo 列表 |
+| `/dag` | 显示持久化任务 DAG 和进度 |
+| `/task clear` | 隐藏已经完成的持久化任务 |
+| `/task reset` | 删除当前 session 的持久化任务数据 |
+
+`TodoWrite` 管理短期 Todo；`task_*` 工具管理磁盘上的任务和依赖图。两者不是同一套存储。
+
+### 审批、安全与审计
+
+| 命令 | 说明 |
+|---|---|
+| `/approve` | 显示审批姿态 |
+| `/approve off` | 关闭自动批准，启用交互审查和 diff preview |
+| `/approve safe` | 安全操作自动继续，高风险操作审查；默认 |
+| `/approve danger` | 自动批准所有 HITL review，跳过 diff preview |
+| `/hitl` | 切换 HITL 开关 |
+| `/hitl off`、`/hitl on` | 关闭或重新开启 HITL |
+| `/hitl <mode>` | 设置完整 HITL 模式 |
+| `/permissions` | 显示已加载权限规则 |
+| `/permissions reload` | 从磁盘重新加载权限规则 |
+| `/decisions` | 显示最近的工具执行决策 |
+| `/security` | 显示安全能力摘要 |
+| `/security test-bash <cmd>` | 当前仍是占位命令，尚未执行真实校验 |
 
 ### MCP
 
-```text
-/mcp
-/mcp pending
-/mcp approve <name>
-/mcp connect <name> <command> [args...]
-/mcp disconnect <name>
-```
+| 命令 | 说明 |
+|---|---|
+| `/mcp` | 列出活动 MCP server |
+| `/mcp pending` | 列出工作区待审批 server |
+| `/mcp approve <name>` | 启动待审批 server |
+| `/mcp connect <name> <command> [args...]` | 连接临时 stdio server |
+| `/mcp disconnect <name>` | 停止并移除活动 server |
 
-### 团队和收件箱
+### 团队
 
-```text
-/team
-/team spawn <name> <role> <prompt>
-/team shutdown <name>
-/team message <name> <content>
-/team inbox
-/inbox
-```
+| 命令 | 说明 |
+|---|---|
+| `/team` | 列出 teammate |
+| `/team spawn <name> <role> <prompt>` | 创建 teammate 和独立 worktree |
+| `/team shutdown <name>` | 请求 teammate 关闭 |
+| `/team message <name> <content>` | 向 teammate 发消息 |
+| `/team inbox`、`/inbox` | 读取 Lead 收件箱 |
 
-### 网络、Judge 和运行状态
+### 运行状态
 
-```text
-/search <query>
-/judge
-/usage
-/compact
-/memory
-```
+| 命令 | 说明 |
+|---|---|
+| `/search <query>` | 直接调用 Web Search |
+| `/judge` | 切换当前 session 的 Judge 开关 |
+| `/usage` | 显示当前 session 的 LLM Usage |
+| `/compact` | 手动压缩当前对话 |
+| `/memory` | 显示长期记忆统计 |
 
-- `/search`：直接调用 Web Search 服务；
-- `/judge`：切换当前 Judge 开关；
-- `/usage`：查看 LLM Usage；
-- `/compact`：手动压缩当前对话；
-- `/memory`：查看长期记忆统计。
+## 配置参考
 
-## 工具清单
+配置在进程启动时从环境变量读取。除 `/permissions reload` 和部分 REPL 开关外，修改环境变量后需要重启程序。
 
-内置工具在 `internal/tool/handlers.go` 和 `internal/tool/handlers_helpers.go` 中注册。工具定义包含名称、描述、JSON Schema、风险等级、影响类型、超时、快照策略和 Handler。
+### LLM
 
-### 文件和 Shell
-
-| 工具 | 作用 | 默认风险 |
+| 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `read_file` | 读取文件内容，可指定行偏移和行数 | Auto |
-| `list_dir` | 列出目录 | Auto |
-| `search_file` | 按文件名模式搜索 | Auto |
-| `search_content` | 按内容或正则搜索 | Auto |
-| `write_file` | 创建或覆盖文件 | Safe/Danger 取决于策略 |
-| `edit_file` | 精确字符串替换编辑文件 | Safe/Danger 取决于策略 |
-| `insert_file` | 在文件中插入内容 | Safe/Danger 取决于策略 |
-| `delete_file` | 删除文件 | Danger |
-| `bash` | 在工作目录执行 Shell 命令，硬超时 120 秒 | Danger |
+| `MODEL_ID` | `claude-opus-4.7` | Lead、Subagent 和 Teammate 默认模型 |
+| `LLM_PROVIDER` | 按模型名推断 | 强制使用 `openai` 或 `anthropic` |
+| `OPENAI_API_KEY` | 空 | OpenAI/OpenAI-compatible 凭据 |
+| `OPENAI_BASE_URL` | SDK 默认值 | OpenAI-compatible Base URL |
+| `ANTHROPIC_API_KEY` | 空 | Anthropic 凭据 |
+| `ANTHROPIC_BASE_URL` | SDK 默认值 | Anthropic Base URL |
+| `CONTEXT_WINDOW_TOKENS` | 按模型推断 | 覆盖上下文窗口估算 |
+| `LLM_MAX_CONCURRENCY` | `4` | 角色级 LLM 并发容量 |
+| `LLM_MAX_QPS` | `4.0` | 当前会被解析，但尚未接入 Gateway 限流 |
+| `LLM_MAX_BURST` | `8` | 当前会被解析，但尚未接入 Gateway 限流 |
 
-`bash` 使用 `sh -c` 执行命令，因此必须把它视为高风险能力。命令会先经过 Bash Policy 检查，并受 HITL、权限和工具超时约束。
+Provider 推断规则：
 
-### 任务、记忆和技能
+- `claude-*`、`claude.*` → `anthropic`；
+- `gpt-*`、`o1*`、`o3*` → `openai`；
+- `gemini-*`、`gemini.*` → `gemini`；
+- 无法推断时尝试回退到已注册的 OpenAI Provider。
+
+应用组合根目前只根据 API Key 注册 OpenAI 和 Anthropic。虽然源码中有 Gemini Provider 文件，但当前启动流程没有注册它。
+
+### Judge
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `JUDGE_ENABLED` | `false` | 启动时启用 Judge |
+| `JUDGE_MODEL` | 空 | Judge 模型；空值时使用 Lead 模型 |
+| `JUDGE_MIN_SCORE` | `7` | 低于该分数时要求 Runner 重试 |
+| `JUDGE_PROVIDER` | 按 Judge 模型推断 | 选择已注册 Provider |
+| `JUDGE_API_KEY` | 空 | 已解析的预留字段 |
+| `JUDGE_BASE_URL` | 空 | 已解析的预留字段 |
+
+Judge 错误采用宽松回退：模型调用失败或响应无法解析时，不会永久阻塞主任务。
+
+### Web
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `WEB_SEARCH_PROVIDER` | fallback chain | 可选 `tavily` 或 `brave` |
+| `WEB_SEARCH_API_KEY` | 空 | Tavily/Brave API Key |
+| `SEARXNG_URL` | 空 | 指定一个 SearXNG 实例 |
+| `SEARXNG_INSTANCES` | 内置实例列表 | 逗号分隔的 SearXNG 实例 |
+| `WEB_ALLOW_PRIVATE_IPS` | `false` | 允许部分私有网络目标；link-local/metadata 仍然阻止 |
+
+搜索后端选择：
+
+1. 配置了 `tavily` 或 `brave` 且有 Key 时使用指定后端；
+2. 否则使用 `SEARXNG_URL`；
+3. 否则依次尝试配置或内置的公共 SearXNG；
+4. 最后回退 DuckDuckGo Lite。
+
+### 安全和运行时
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `SNAPSHOT_ENABLED` | `false` | 值为 `1` 时启用危险工具前的 git snapshot |
+| `HITL_NON_TTY_FALLBACK` | `reject` | 非 TTY 审批回退；设为 `approve` 可自动批准 |
+| `MCP_SERVERS` | 空 | 启动时自动连接的 MCP server JSON 数组 |
+| `XDG_CONFIG_HOME` | 空 | 默认状态根目录 |
+| `HOME` | 系统值 | `XDG_CONFIG_HOME` 未设置时使用 |
+
+## 架构设计
+
+### 总体分层
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ cmd/agent                                                   │
+│ CLI 参数、Readline、REPL、Session 切换                       │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│ internal/application                                       │
+│ Application 进程级组合根 + SessionRuntime 会话级组合根       │
+└──────────────┬──────────────────────────────┬───────────────┘
+               │                              │
+┌──────────────▼──────────────┐  ┌────────────▼──────────────┐
+│ internal/agent              │  │ internal/model            │
+│ Runner / Subagent / Team    │  │ Gateway / Provider        │
+│ Plan / Reflect / Compact    │  │ Retry / Stream / Throttle │
+│ Judge / Snapshot / Lesson   │  │ Usage                     │
+└──────────────┬──────────────┘  └────────────┬──────────────┘
+               │                              │
+               │ Tool Calls                   │ LLM API
+┌──────────────▼───────────────────────────────▼──────────────┐
+│ internal/tool                                               │
+│ ToolCatalog → Executor → domain handlers                    │
+└──────────────┬──────────────────────────────────────────────┘
+               │
+┌──────────────▼──────────────────────────────────────────────┐
+│ 文件 / Shell / Task / Memory / Team / Web / MCP / Skill     │
+└─────────────────────────────────────────────────────────────┘
+
+横切层：
+security · hitlaudit · event · history · session · store
+```
+
+### 生命周期边界
+
+项目把对象分成三种主要生命周期。
+
+#### 进程级
+
+由 `application.Application` 持有：
+
+- 不可变配置快照；
+- Provider Registry；
+- Model Gateway；
+- Session Repository；
+- 当前活动 `SessionRuntime` 引用。
+
+`Application` 不保存每次 LLM 调用的可变状态。
+
+#### 会话级
+
+每次 `Application.Build` 都重新创建：
+
+- 独立 `ToolCatalog`；
+- `SessionRuntime` 上下文和取消函数；
+- HITL Manager 和审批姿态；
+- 权限实例和 diff preview；
+- History Store、Usage Tracker、Decision Log；
+- Task Service 和 Todo Manager；
+- MCP Manager；
+- Background Supervisor；
+- Message Bus、Protocol Store 和 Teammate Manager；
+- Worktree Service；
+- Web Service；
+- Runner、Subagent Runner 和 Judge。
+
+会话切换时，MCP 工具和其他动态注册不会泄漏到新 session。
+
+#### 调用级
+
+每次用户请求或工具调用创建：
+
+- trace ID；
+- Runner 轮次状态；
+- tool timeout context；
+- 带 `Context` 的 `ToolScope` 副本；
+- 结构化 `Result` 和事件。
+
+这使 Ctrl-C、工具超时和 Session 关闭可以沿 `context.Context` 向下传播。
+
+### Application 组合根
+
+`internal/application/application.go` 是最重要的装配入口：
+
+1. `Application.New` 加载配置、注册 Provider、创建 Gateway 和 Session Repository；
+2. `Application.Build` 选择或创建 session；
+3. 为 session 创建专属 Tool Catalog；
+4. 创建任务、记忆、权限、MCP、Web、团队和后台服务；
+5. `SessionRuntime.BuildRunner` 注册 39 个内置工具；
+6. MCP 工具在内置工具之后增量注册；
+7. 组合系统提示词；
+8. 创建 Lead Runner、Explore Subagent 和 Teammate Manager；
+9. 注册 history、worktree、background、MCP、team 和日志关闭钩子。
+
+`SessionRuntime.Close` 先取消上下文，再按逆序执行关闭钩子。
+
+### Runner
+
+`internal/agent/runner.go` 是统一 Agent Loop。Lead、Explore 和 Teammate 使用相同的基础执行模型，但通过 `Profile` 和 `ToolScope` 获得不同能力。
+
+Runner 每个用户回合会：
+
+1. 重置轮次、失败、重复调用和 token 统计；
+2. 根据用户请求召回相关长期记忆；
+3. 评估规划门控；
+4. 根据上下文预算执行 micro-compaction 或 LLM summary；
+5. 通过 Gateway 流式调用模型；
+6. 顺序执行模型返回的 tool calls；
+7. 记录结构化工具结果、事件和 Usage；
+8. 在失败、重复或卡住时注入反思；
+9. 必要时触发 lesson 或 Judge；
+10. 返回 `TurnOutcome` 给 REPL。
+
+### Model Gateway
+
+`internal/model.Gateway` 为所有角色提供统一模型入口：
+
+- `Call`：非流式调用；
+- `Stream`：流式调用；
+- 按 Lead、Subagent、Teammate、Judge 选择 Provider；
+- 统一重试、超时、限流和 Usage 回调；
+- Provider SDK 类型转换成 `internal/llm` 中立类型。
+
+当前应用默认使用一个主 Provider；Judge 可以选择已注册的另一个 Provider。角色级并发由 `RoleThrottle` 控制。
+
+### Tool Catalog
+
+`ToolCatalog` 使用不可变 snapshot 加读写锁：
+
+- `RegisterAll` 原子替换整个目录；
+- `Register` 增量加入 MCP 工具；
+- `Subset` 为 Explore 构造只读工具子集；
+- `Order` 保存稳定注册顺序。
+
+工具 schema 位于每次 LLM 请求的前部。稳定顺序可以避免 Go map 随机迭代破坏 OpenAI/Anthropic 的 prompt-prefix cache。`builtin_order_test.go` 用 golden test 锁定内置工具顺序。
+
+### 事件与可观测性
+
+Runner、Subagent 和 Teammate 共享 `event.MultiSink`：
+
+- `ConsoleSink`：终端事件；
+- `AuditSink`：审批和工具审计；
+- `UsageSink`：token 使用信息；
+- `SessionLogSink`：写入 session 级 JSONL 日志。
+
+工具执行结果还会写入 `decisions.jsonl`，模型 Usage 写入 `usage.jsonl`。
+
+## 工具系统
+
+### ToolDefinition
+
+每个工具由完整的 `ToolDefinition` 描述：
+
+- `Name`、`Description`；
+- JSON Schema；
+- `RiskLevel`；
+- `Effects`；
+- Handler；
+- 可选 mutation preview；
+- 可选专属 timeout；
+- snapshot policy 元数据。
+
+工具返回结构化 `Result`，状态包括：
+
+```text
+succeeded
+failed
+denied
+rejected
+modified
+timeout
+cancelled
+invalid_arguments
+unavailable
+```
+
+### 39 个内置工具
+
+#### 文件与 Shell
 
 | 工具 | 作用 |
 |---|---|
-| `TodoWrite` | 更新短期 Todo 状态 |
-| `task_create` | 创建持久化任务 |
-| `task_get` | 获取任务详情 |
-| `task_update` | 更新任务状态或内容 |
-| `task_list` | 列出任务 |
-| `task_add_dep` | 添加 DAG 依赖 |
-| `task_remove_dep` | 移除 DAG 依赖 |
-| `task_ready` | 查询当前可执行任务 |
-| `task_dag` | 查看 DAG 拓扑 |
-| `claim_task` | Teammate 领取任务 |
-| `memory_write` | 写入长期记忆 |
-| `memory_search` | 搜索长期记忆 |
-| `memory_delete` | 删除匹配的记忆 |
-| `memory_stats` | 查看记忆统计 |
-| `session_save_memory` | 将当前会话摘要保存到长期记忆 |
-| `load_skill` | 按名称加载一个技能文件 |
-
-### 后台任务和协作
-
-| 工具 | 作用 |
-|---|---|
-| `background_run` | 启动后台命令 |
+| `bash` | 在工作目录运行前台命令，固定 120 秒超时 |
+| `read_file` | 按偏移和行数读取文件 |
+| `write_file` | 创建或覆盖文件 |
+| `edit_file` | 精确字符串替换 |
+| `delete_file` | 删除文件 |
+| `insert_file` | 在指定位置插入内容 |
+| `list_dir` | 列出目录 |
+| `search_file` | 按名称模式搜索文件 |
+| `search_content` | 按文本或正则搜索内容 |
+| `background_run` | 启动后台 Shell；未指定正数超时时使用 120 秒 |
 | `check_background` | 查询后台任务 |
-| `spawn_teammate` | 创建持久化 teammate |
-| `list_teammates` | 列出 teammate |
-| `send_message` | 向 teammate 发送消息 |
-| `read_inbox` | 读取 Agent 收件箱 |
-| `broadcast` | 广播消息 |
-| `shutdown_request` | 请求关闭 teammate |
-| `plan_approval` | 审批 teammate 计划 |
-| `submit_plan` | 提交计划 |
 
-### Web、MCP 和上下文
+`write_file`、`edit_file`、`insert_file` 和 `delete_file` 提供变更预览。`bash` 与 `background_run` 都经过相同的 `BashPolicy`。
 
-| 工具 | 作用 |
+#### Todo 与任务 DAG
+
+```text
+TodoWrite
+task_create
+task_list
+task_update
+task_get
+task_add_dep
+task_remove_dep
+task_ready
+task_dag
+claim_task
+```
+
+#### 长期记忆
+
+```text
+memory_write
+memory_search
+memory_delete
+memory_stats
+session_save_memory
+```
+
+#### 团队与协议
+
+```text
+spawn_teammate
+list_teammates
+send_message
+read_inbox
+broadcast
+shutdown_request
+plan_approval
+submit_plan
+```
+
+#### 上下文、技能和网络
+
+```text
+compress
+load_skill
+web_fetch
+web_search
+explore
+```
+
+MCP 工具不是固定内置工具。发现后使用以下名称动态追加：
+
+```text
+mcp__<server-name>__<tool-name>
+```
+
+### Executor 执行管线
+
+所有 Lead 工具调用进入同一个 `tool.Executor`：
+
+1. 检查参数是否为完整 JSON；
+2. 从当前 Tool Catalog snapshot 解析定义和 Handler；
+3. 根据 `Effects` 检查 `ToolScope` 能力；
+4. 对显式 `AllowedRoots` 执行路径范围检查；
+5. 在 mutation 前生成 diff preview；
+6. 执行 HITL 审批；
+7. 执行 scope 级 approval/network policy；
+8. 设置工具专属或默认超时；
+9. 用带取消上下文的 `ToolScope` 调用 Handler；
+10. 捕获 panic 并转换成结构化失败；
+11. 对成功输出进行 secret sanitization；
+12. 记录 duration 和 decision。
+
+文件 Handler 还会调用 `SecurePath`；Shell Handler 还会调用 `BashPolicy`；Web Client 在真正 dial 前再次检查目标 IP。
+
+## 安全与审批
+
+### 能力模型
+
+`ToolScope` 为不同 Agent 声明：
+
+```text
+CanRead
+CanWrite
+CanExecute
+CanNetwork
+CanTeam
+CanMemory
+```
+
+工具通过 `Effects` 声明需要的能力。Explore 没有写、团队和记忆能力；Teammate 在计划获批前没有写能力。
+
+### HITL 模式
+
+| 模式 | 当前行为 |
 |---|---|
-| `web_fetch` | 获取并提取一个网页内容 |
-| `web_search` | 搜索网页 |
-| `explore` | 启动隔离上下文的只读探索子 Agent |
-| MCP 工具 | 以 `mcp__<server>__<tool>` 命名并动态注册 |
-| `compress` | 请求压缩当前上下文 |
+| `safe-only` | 自动通过低风险 review，对高风险 review 交互确认 |
+| `interactive` | 对被 `NeedsReview` 判定需要审查的操作交互确认 |
+| `auto-approve` | 自动通过所有 HITL review |
+| `auto-reject` | 自动拒绝所有 HITL review |
+| `notify-only` | 显示 review 信息后继续 |
 
-MCP 工具默认被标为高风险，并自动带有网络访问影响；实际工具效果会根据工具名和描述进行启发式推断。
+HITL 当前通过工具名、Shell 命令内容和关键路径判断是否需要 review。`interactive` 不代表每一个只读工具都会弹窗。
 
-## 审批与安全
+文件 mutation 在 HITL 开启、非 `auto-approve` 且 diff preview 开启时，会进入逐块预览确认。
 
-### 风险等级
+非 TTY 环境默认拒绝交互审批。确有需要时可以：
 
-工具定义中包含以下风险等级：
+```bash
+export HITL_NON_TTY_FALLBACK=approve
+```
 
-- `RiskAuto`：只读或低风险操作；
-- `RiskSafe`：通常可自动执行但会产生用户可见变更；
-- `RiskInteractive`：需要用户确认；
-- `RiskDanger`：可能破坏文件、执行命令、访问网络或修改外部状态。
+这会扩大自动执行范围，CI 或无人值守环境应谨慎使用。
 
-工具还会声明副作用类型：
+### `/approve` 与 `/hitl`
 
-- 读文件；
-- 写文件；
-- 删除文件；
-- 执行进程；
-- 网络访问；
-- 会话、记忆和团队状态修改。
+`/approve` 是常用预设，同时同步 HITL 模式与 diff preview 姿态：
 
-### 默认模式
+| 预设 | HITL 模式 | Diff preview |
+|---|---|---|
+| `off` | `interactive` | 开启 |
+| `safe` | `safe-only` | 开启 |
+| `danger` | `auto-approve` | 跳过 |
 
-应用默认启用 HITL，并使用 `safe-only` 策略：
-
-- 读取、搜索、任务等安全工具自动批准；
-- 写入、编辑、删除、Shell 等危险操作需要确认；
-- 文件写入可以先生成 diff preview；
-- 工具决策会写入 session decision log。
-
-### 三种常用模式
-
-| 命令 | 行为 |
-|---|---|
-| `/approve off` | 每个工具都需要手动确认 |
-| `/approve safe` | 安全工具自动批准，危险工具确认 |
-| `/approve danger` | 所有工具自动批准，跳过 diff preview |
-
-危险模式不是安全沙箱。启用前请确认当前工作区、API Key、Shell 环境和 MCP server 都是可信的。
-
-### 路径安全
-
-文件工具通过 `security.SecurePath` 解析路径，默认限制在工作目录及允许根目录内，并拒绝目录穿越和不符合权限的路径。
-
-### Shell 安全
-
-`bash` 工具使用以下机制：
-
-- 固定的 120 秒命令超时；
-- Bash Policy 白名单、拒绝规则和确认规则；
-- 工具风险等级和 HITL 审批；
-- 工具权限规则；
-- 输出截断和敏感信息清理。
-
-这不是完备的操作系统级沙箱。对于不可信模型或不可信项目，建议在容器、临时虚拟机或专用用户中运行。
+`/hitl off` 只关闭 HITL 提示，不会关闭 Bash hard deny、路径沙箱或 Web SSRF 防护。
 
 ### 权限文件
 
-权限文件位置：
+权限文件位于项目状态根目录：
 
 ```text
-<data-dir>/go-code-agent/<project>/permissions.json
+<project-state>/permissions.json
 ```
 
-格式：
+推荐格式：
+
+```json
+{
+  "rules": [
+    {"tool": "bash", "pattern": "git status*", "level": "allow"},
+    {"tool": "bash", "pattern": "git push*", "level": "confirm"},
+    {"tool": "bash", "pattern": "rm *", "level": "block"}
+  ]
+}
+```
+
+也兼容裸数组：
 
 ```json
 [
-  {"tool": "read_file", "level": "allow"},
-  {"tool": "bash", "level": "confirm"},
-  {"tool": "delete_file", "level": "block"},
-  {"tool": "mcp__*", "level": "block"}
+  {"tool": "bash", "pattern": "rm *", "level": "block"}
 ]
 ```
 
-其中 `level` 支持 `allow`、`confirm` 和 `block`。`pattern` 可用于匹配 MCP 工具或带参数的特定操作。修改后可使用 `/permissions reload` 重新加载。
+兼容字段：
 
-## 会话、历史和持久化数据
+- `level`: `allow`、`confirm`、`block`；
+- `action`: `allow`、`ask`、`deny`，加载时归一化；
+- `tool` 和 `pattern` 支持 `*`、`?`；
+- 规则按顺序匹配，第一条命中规则生效。
 
-默认状态目录如下：
+**当前权限执行范围需要特别注意：** `Permissions` 实例目前注入 `bash` 和 `background_run` 的 BashPolicy。其他工具规则可以被加载和显示，但通用 Executor 尚未根据 `permissions.json` 对所有工具做 allow/confirm/block。不要把 `mcp__*` 或文件工具规则误认为已经形成强制边界。
+
+在当前 Shell Handler 中，`block` 会直接拒绝命中的普通命令；`allow` 不会绕过 hard deny；`confirm` 返回的提示标记不会直接传入 HITL，HITL 会用自己的 Shell 分类再次判断。因此，自定义 `confirm` 目前不能单独保证弹出审批框。
+
+Bash hard deny 和内置 confirm pattern 在自定义权限之前执行，用户规则不能覆盖 hard deny。
+
+### 路径安全
+
+文件工具使用 `security.SecurePath`：
+
+- 路径相对 `ToolScope.Workdir` 解析；
+- 阻止 `..` 目录穿越；
+- 对已存在路径解析 symlink 后再次检查；
+- 读操作要求目标存在；
+- 写操作允许新文件，但仍限制在工作目录内。
+
+Explore 的工作目录是调用者工作区；Teammate 的工作目录是独立 worktree。
+
+### Shell 安全
+
+Shell 工具最终使用：
 
 ```text
-$XDG_CONFIG_HOME/go-code-agent/<project>/
-# 或
-$HOME/.config/go-code-agent/<project>/
+sh -c <command>
 ```
 
-典型结构：
+执行前经过：
+
+- 基础命令 allowlist；
+- 永久拒绝的危险正则；
+- 需要确认的命令模式；
+- session 级 Bash 权限规则；
+- HITL review；
+- 120 秒默认超时；
+- 输出脱敏。
+
+这些机制不是操作系统级沙箱。处理不可信仓库或模型时，应在容器、虚拟机或专用低权限用户中运行。
+
+### Web 与 SSRF
+
+安全 HTTP Client：
+
+- 只允许 HTTP/HTTPS；
+- 最多 5 次 redirect；
+- 限制响应大小；
+- DNS 解析后、真正连接前校验 IP；
+- 默认拒绝 loopback、RFC1918、IPv6 ULA 和额外内部网段；
+- link-local、云 metadata 网段和 `0.0.0.0/8` 始终拒绝。
+
+`WEB_ALLOW_PRIVATE_IPS=1` 只放开可配置的私有网段，不放开 link-local/metadata。
+
+### Snapshot
+
+设置：
+
+```bash
+export SNAPSHOT_ENABLED=1
+```
+
+Runner 会对文件写入、删除、Shell 和后台 Shell 等工具尝试 `git stash create --include-untracked`。工具失败时使用 `git read-tree -u --reset` 恢复 snapshot。
+
+Snapshot 只在 Git 仓库中生效，并且本身会操作工作树。重要修改仍应先提交或备份。
+
+### 安全边界
+
+请把以下内容视为不可信输入：
+
+- 工作区代码和文档；
+- Web 搜索结果；
+- MCP server 返回值；
+- Tool 输出；
+- Teammate 消息；
+- 工作区技能文件。
+
+不要把真实凭据写入仓库、`.mcp.json`、`permissions.json`、Prompt、Skill 或日志。
+
+## 多 Agent 设计
+
+### Lead Agent
+
+Lead 拥有完整工具目录，并由主 REPL 驱动。它负责理解用户目标、规划、执行工具、汇总结果和请求人工批准。
+
+### Explore Subagent
+
+`explore` 工具创建隔离上下文的只读 Agent。它只看到以下工具：
 
 ```text
-<project-state>/
-├── sessions.json                 # 会话索引和 active_id
-├── permissions.json              # 权限规则
-├── MEMORY.md                     # 长期 evergreen 记忆
-├── daily/                        # 每日 JSONL 记忆
-│   └── 2026-01-01.jsonl
-└── sessions/
-    └── <session-id>/
-        ├── meta.json             # 会话元数据
-        ├── session.log           # 事件日志
-        ├── usage.jsonl            # LLM 用量记录
-        ├── decisions.jsonl        # 工具决策审计
-        ├── history/
-        │   └── history.jsonl     # 会话消息历史
-        ├── tasks/
-        │   ├── task_<id>.json
-        │   └── dag_edges.json
-        ├── team/
-        │   └── inbox/
-        └── worktrees/
+bash
+read_file
+list_dir
+search_file
+search_content
 ```
 
-部分目录只在对应能力被使用后创建。
+`web_fetch` 类型的 Subagent 会额外获得 `web_fetch` 和网络能力。
 
-### 历史恢复规则
+Explore 的特点：
 
-历史存储的是中立的 LLM 消息结构，而不是终端显示文本。启动时会：
+- `CanWrite=false`；
+- `CanTeam=false`；
+- `CanMemory=false`；
+- 有独立轮次和压缩预算；
+- 工具输出会额外截断；
+- Shell 仍受 BashPolicy 和 HITL 约束。
 
-- 恢复系统消息和已完成的用户/助手/工具消息；
-- 清理孤立 Tool 消息；
-- 清理未完成的 Assistant Tool Call 块；
-- 删除尾部没有 Assistant 响应的 user 消息；
-- 继续使用清理后的历史向模型发起请求。
+### Teammate
 
-这可以避免网络中断或 `Ctrl-C` 后重复执行上一次未完成的 prompt。
+Teammate 是长期运行的协作 Agent：
 
-### 数据备份
+- 有独立名称、角色和消息上下文；
+- 可以领取任务并使用任务 DAG；
+- 可以收发消息；
+- 在 WORK/IDLE 阶段间切换；
+- 写操作前需要通过 `submit_plan` / `plan_approval`；
+- 必须成功获取独立 git worktree 才能启动。
 
-状态目录包含会话内容、工具输出、代码片段和可能的敏感信息。建议：
+创建：
 
-- 将状态目录加入个人备份，但不要无意中提交到公共仓库；
-- 对包含敏感代码的项目设置合适的文件权限；
-- API Key 只通过环境变量注入；
-- 在共享机器上使用独立的 `--data-dir`。
+```text
+/team spawn reviewer review 检查认证模块并汇报风险
+```
+
+Worktree 从当前仓库 `HEAD` 创建，因此主工作区未提交的修改不会自动出现在 teammate worktree 中。需要共享的基础修改应先提交。
+
+Worktree 获取失败时系统 fail closed：不会降级到与 Lead 共享主目录。
 
 ## MCP 集成
 
-MCP Manager 通过 stdio 启动外部子进程，发现其工具后将工具注册到统一 Tool Catalog 中。
+### 工作方式
 
-### 工作区配置
+MCP Manager 通过 stdio 启动外部子进程：
 
-在工作目录放置 `.mcp.json`：
+1. 启动 server；
+2. 发送 `initialize`；
+3. 调用 `tools/list`；
+4. 把工具转换为 `ToolDefinition`；
+5. 增量注册到当前 session 的 Tool Catalog；
+6. 用 `mcp__server__tool` 形式执行 `tools/call`。
+
+MCP stdio JSON-RPC 请求串行执行。动态工具默认超时 30 秒，并使用当前工具调用上下文。调用取消或超时时，Client 会关闭管道并停止对应 MCP 子进程，避免遗留阻塞读取。
+
+### `.mcp.json`
+
+在工作目录创建：
+
+```json
+{
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    }
+  }
+}
+```
+
+也支持数组格式：
 
 ```json
 [
   {
     "name": "filesystem",
     "command": "npx",
-    "args": ["-y", "@anthropic-ai/mcp-server-filesystem", "."],
-    "env": {}
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
   }
 ]
 ```
 
-工作区配置中的 server 默认进入 pending 列表，不会直接启动。启动 Agent 后查看并批准：
+工作区配置不会自动启动，而是进入 pending：
 
 ```text
 /mcp pending
 /mcp approve filesystem
 ```
 
-### 环境变量配置
+### `MCP_SERVERS`
 
-`MCP_SERVERS` 中的 server 会在启动时自动启动：
+环境变量中的配置在启动时自动连接：
 
-```json
-[
+```bash
+export MCP_SERVERS='[
   {
-    "name": "github",
+    "name": "filesystem",
     "command": "npx",
-    "args": ["-y", "@anthropic-ai/mcp-server-github"],
-    "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
   }
-]
+]'
 ```
 
-当前实现会把环境配置传给子进程。敏感值应通过外部环境或安全的进程注入机制提供，不要把真实 Token 写入仓库文件。
+每个 MCP 子进程继承父进程环境。配置内的 `env` 值按字面量传递，不执行 `${VAR}` 展开。敏感 Token 更适合预先导出到父进程环境，并让 server 自行读取。
 
-### 工具命名
+### MCP 安全提示
 
-MCP 工具使用以下全限定名：
+- `.mcp.json` 可以启动任意本地命令，应先审查；
+- MCP 工具定义会标记为 `RiskDanger` 和 `EffectNetworkAccess`；
+- 副作用还会根据工具名和描述启发式推断；
+- 当前 HITL 的 `NeedsReview` 主要按内置工具名判断，不能只依赖 MCP 的 `RiskDanger` 元数据形成审批边界；
+- 当前通用 `permissions.json` 也尚未强制覆盖 MCP 工具；
+- 对不可信 MCP server 应使用容器、最小权限环境或直接不连接。
+
+## 会话、历史与持久化
+
+### 状态根目录
 
 ```text
-mcp__<server-name>__<tool-name>
+$XDG_CONFIG_HOME/go-code-agent/<project-basename>/
 ```
 
-MCP 工具默认按照危险工具处理，并经过统一的 Tool Executor、权限、审批和审计管线。
-
-## 多 Agent 与团队协作
-
-### Explore Subagent
-
-`explore` 用于只读、隔离上下文的代码探索。它适合：
-
-- 跨多个文件查找实现；
-- 分析大型项目结构；
-- 查找某个功能的调用链；
-- 避免把大量探索细节污染 Lead Agent 的主上下文。
-
-Explore 子 Agent 有自己的角色、上下文和轮次限制，但共享受控的模型 Gateway 和工具目录。
-
-### Teammate
-
-Teammate 是持久化的协作 Agent，可以：
-
-- 领取任务；
-- 在独立角色和上下文中工作；
-- 发送和接收消息；
-- 使用任务 DAG；
-- 可选地绑定独立 git worktree；
-- 在完成或关闭时等待资源清理。
-
-常用命令：
+或：
 
 ```text
-/team spawn explorer explore 分析认证模块
-/team message explorer 请汇报当前进度
-/team inbox
-/team shutdown explorer
+$HOME/.config/go-code-agent/<project-basename>/
 ```
 
-Agent 也可以通过 `spawn_teammate`、`send_message`、`plan_approval` 等工具使用协作协议。
+项目标识当前只使用工作目录 basename。两个不同路径但同名的项目会共享默认状态目录；这种情况应通过 `--data-dir` 隔离。
 
-### Worktree
-
-`internal/worktree` 为 teammate 提供工作树服务。启用时，每个 Agent 可以在独立 worktree 中修改代码，减少并发编辑冲突。会话关闭时由 SessionRuntime 统一清理。
-
-## 技能和提示词
-
-### 项目技能
-
-`internal/skill/loader.go` 会递归扫描：
+### 典型数据结构
 
 ```text
-<workdir>/skills/**/SKILL.md
+<project-state>/
+├── sessions.json
+├── permissions.json
+├── MEMORY.md
+├── daily/
+│   └── YYYY-MM-DD.jsonl
+└── sessions/
+    └── <session-id>/
+        ├── meta.json
+        ├── history/
+        │   └── history.jsonl
+        ├── transcripts/
+        │   └── transcript_<unix>.jsonl
+        ├── tasks/
+        │   ├── task_<id>.json
+        │   └── dag_edges.json
+        ├── team/
+        │   ├── config.json
+        │   └── inbox/
+        │       └── <agent-id>.jsonl
+        ├── worktrees/
+        │   └── <teammate-name>/
+        ├── session.log
+        ├── usage.jsonl
+        └── decisions.jsonl
 ```
 
-当前仓库内包含以下技能目录：
+部分文件和目录只会在对应能力首次使用后创建。
 
-- `skills/agent-builder/`：Agent 设计与构建指导；
-- `skills/code-review/`：安全、正确性、性能和可维护性审查；
-- `skills/judge/`：Judge 方法和配置说明；
-- `skills/pdf/`：PDF 处理工作流；
-- `skills/skill_format.md`：技能文件格式说明。
+### 历史
 
-技能内容会被拼接到系统提示词中，也可以通过 `load_skill` 按名称加载。
+`history/history.jsonl` 是 append-only 消息日志，保存：
 
-### 内置提示词
+- user message；
+- assistant text 和 tool calls；
+- tool result；
+- compression checkpoint。
 
-`internal/prompt/loader.go` 使用 Go `embed` 嵌入以下模板：
+恢复时会重新构造系统消息，并清理：
 
-- `system.md`：主系统提示词；
-- `auto_lesson.md`：自动经验总结；
-- `session_to_memory.md`：会话转长期记忆；
-- `judge_system.md`：Judge 主提示词；
-- `judge_critical.md`：低分时的关键反馈；
-- `planning_required.md`：规划门控；
-- `strategy_change.md`：策略切换；
-- `teammate.md`：teammate 角色提示词；
-- `think_required.md`：思考要求；
-- `todo_nag.md`：Todo 提醒。
+- 没有对应 call 的孤立 tool result；
+- 没有完整 tool result 的 assistant tool-call 块；
+- 末尾没有 assistant 响应的 user message。
 
-工作区根目录的 `prompts/` 目前保存 HITL 反馈模板：
+这可以降低中断后重复执行未完成请求的风险。
 
-- `prompts/human_modify.md`：用户要求修改工具方案时的反馈；
-- `prompts/human_reject.md`：用户拒绝工具调用时的反馈。
+### 上下文压缩
 
-如果需要调整 Agent 行为，应优先确认模板是通过 `go:embed` 加载，还是由项目目录动态读取，避免修改了不会生效的文件。
+压缩分两层：
 
-## 长期记忆
+- **MicroCompact**：把较早的大型 Tool Result 替换为占位符；
+- **AutoCompact**：让 LLM 总结旧消息前缀，保留最近消息原文。
 
-`internal/memory.Store` 提供两种存储：
+执行 AutoCompact 前会把完整消息保存到 session 的 `transcripts/`，并向历史写入 checkpoint。
 
-### Evergreen 记忆
+### 长期记忆
+
+记忆是项目级、跨 session 的：
+
+- `MEMORY.md`：evergreen 记忆；
+- `daily/YYYY-MM-DD.jsonl`：结构化每日记忆。
+
+每日记忆默认保留 90 天，按分类和 token 集合 Jaccard 相似度去重。Runner 在每个用户回合开始时搜索相关记忆并注入上下文。
+
+### Task 与 Todo
+
+- `TodoManager`：当前 session runtime 内的短期 checklist，不写磁盘；
+- `task.Service`：持久化任务、状态和 DAG 依赖；
+- Teammate 可以通过 `claim_task` 领取 ready task。
+
+### Usage 与审计
+
+- `usage.jsonl`：Provider、角色、模型、trace 和 token 使用；
+- `decisions.jsonl`：工具名、结果状态和原因；
+- `session.log`：结构化 Agent 事件，长输出会截断。
+
+这些文件可能包含源代码、命令输出和外部响应，应按敏感数据保护。
+
+## 目录设计
 
 ```text
-MEMORY.md
-```
-
-内容按段落解析，可使用以下分类前缀：
-
-```text
-[preference] 用户偏好简洁输出
-[lesson] 该项目的测试命令是 go test ./...
-[fact] 项目使用 OpenAI-compatible API
-[context] 当前正在重构工具执行器
-```
-
-### 每日记忆
-
-```text
-daily/YYYY-MM-DD.jsonl
-```
-
-每条记录包含时间、分类和内容。系统会：
-
-- 默认保留最近 90 天；
-- 使用基于 token 集合的 Jaccard 相似度做去重/替换；
-- 限制单条记忆长度；
-- 将搜索结果按相关性返回。
-
-长期记忆会参与系统提示词构造，并可在 Agent 运行时由 `memory_search` 主动召回。
-
-## 网络访问
-
-### Web Fetch
-
-`web_fetch` 通过安全 HTTP Client 请求网页，并具备：
-
-- 请求超时；
-- 响应大小限制；
-- HTML 文本提取；
-- 私有 IP 和本地地址检查；
-- URL 和 Host 校验。
-
-### Web Search
-
-搜索 Provider 选择：
-
-1. 如果 `WEB_SEARCH_PROVIDER=tavily` 且存在 API Key，使用 Tavily；
-2. 如果 `WEB_SEARCH_PROVIDER=brave` 且存在 API Key，使用 Brave；
-3. 否则使用配置的 SearXNG；
-4. 如果没有指定 SearXNG，则尝试内置公共 SearXNG 实例；
-5. 最后回退 DuckDuckGo Lite。
-
-搜索结果只是外部不可信输入，不应被当作系统指令或权限来源。
-
-### SSRF 防护
-
-默认拒绝解析到以下地址的目标：
-
-- Loopback；
-- Link-local；
-- `10.0.0.0/8`；
-- `172.16.0.0/12`；
-- `192.168.0.0/16`；
-- `169.254.0.0/16`；
-- `0.0.0.0/8`。
-
-只有在明确需要访问内部资源时，才设置：
-
-```bash
-export WEB_ALLOW_PRIVATE_IPS=1
-```
-
-该设置会放宽出站网络限制，应仅在受控环境中使用。
-
-## Judge 质量验证
-
-Judge 是可选的 LLM-as-Judge 层。启用后，Agent 完成一个使用过工具的任务时，会把最近的对话尾部和工具结果交给独立 Judge 模型，要求其输出：
-
-- 是否通过；
-- 1–10 分；
-- 具体问题；
-- 改进建议；
-- 是否应该重试。
-
-如果分数低于 `JUDGE_MIN_SCORE`，Runner 会把验证失败反馈重新注入上下文，并要求 Agent 自我修正。Judge 内部错误会采用宽松回退，不应让主流程永久阻塞。
-
-Judge 主要代码：
-
-```text
-internal/agent/judge.go
-internal/prompt/templates/judge_system.md
-internal/prompt/templates/judge_critical.md
-```
-
-## 离线评估
-
-`cmd/eval` 提供回归评估入口，默认使用 Mock 模式，不需要真实 API Key：
-
-```bash
-go run ./cmd/eval
-```
-
-主要参数：
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `-live` | `false` | 使用真实 LLM，而不是 Mock |
-| `-model` | 空 | live 模式下的模型 ID |
-| `-v` / `-verbose` | `false` | 输出详细过程 |
-| `-timeout` | `5m` | 单任务超时 |
-| `-category` | 空 | 只运行指定类别 |
-| `-task` | 空 | 只运行指定名称的任务 |
-| `-output` | 空 | 输出 JSON 结果文件 |
-| `-baseline-out` | 空 | 输出 baseline JSON 文件 |
-
-示例：
-
-```bash
-# 只运行某一类任务
-go run ./cmd/eval -category tools -v
-
-# 只运行一个任务并保存 JSON
-go run ./cmd/eval -task file_edit -output /tmp/eval.json
-
-# 使用真实模型运行
-go run ./cmd/eval -live -model gpt-4o -timeout 10m
-```
-
-评估任务和 Harness 位于：
-
-```text
-internal/eval/tasks.go
-internal/eval/eval.go
-internal/eval/executor.go
-```
-
-## 项目结构
-
-```text
-go-code-agent-refactor/
+go-code-agent/
 ├── cmd/
 │   ├── agent/
-│   │   ├── main.go              # CLI 入口
-│   │   └── repl.go              # 终端 REPL 和斜杠命令
+│   │   ├── main.go                  # CLI 入口和 Application 生命周期
+│   │   └── repl.go                  # 交互循环和斜杠命令
 │   └── eval/
-│       └── main.go              # 离线评估入口
+│       └── main.go                  # 离线/在线评估入口
 ├── internal/
-│   ├── agent/                   # Agent Loop、子 Agent、团队、Judge、压缩
-│   ├── application/             # 应用组合根和会话运行时
-│   ├── background/              # 后台任务监督器
-│   ├── config/                  # 环境配置和运行常量
-│   ├── eval/                    # 评估任务和 Harness
-│   ├── event/                   # 事件模型和 Console/Audit/Usage Sink
-│   ├── history/                 # JSONL 会话历史和恢复清理
-│   ├── hitlaudit/               # HITL 审批适配器和模式
-│   ├── llm/                     # Provider 无关的消息和调用类型
-│   ├── mcp/                     # MCP client、manager 和工具注册
-│   ├── memory/                  # 长期记忆和相似度搜索
-│   ├── model/                   # Gateway、Throttle、Stream Sink
-│   ├── prompt/                  # go:embed 提示词模板加载器
-│   ├── security/                # 路径、Shell、SSRF、权限、脱敏
-│   ├── session/                 # 会话元数据和索引
-│   ├── skill/                   # SKILL.md 递归加载器
-│   ├── store/                   # 原子文件写入
-│   ├── task/                    # 任务 CRUD、Todo 和 DAG
-│   ├── team/                    # 消息总线和协作协议
-│   ├── tool/                    # 工具定义、Catalog、Executor、Handlers
-│   ├── utils/                   # 终端和进程辅助函数
-│   ├── web/                     # Web Fetch、Search 和安全 HTTP Client
-│   └── worktree/                 # git worktree 生命周期
+│   ├── agent/                       # Runner 和高级 Agent 行为
+│   │   ├── runner.go                # 统一多轮 Agent Loop
+│   │   ├── subagent.go              # Explore 隔离执行
+│   │   ├── teammate.go              # Teammate WORK/IDLE 生命周期
+│   │   ├── compression.go           # 上下文压缩与 checkpoint
+│   │   ├── reflection.go            # 失败和卡住反思
+│   │   ├── judge.go                 # LLM-as-Judge
+│   │   ├── plan.go                  # 规划门控
+│   │   ├── snapshot.go              # git snapshot/rollback
+│   │   ├── lesson.go                # 自动经验写入
+│   │   ├── system_prompt.go         # 系统提示词组装
+│   │   ├── decisions.go             # 工具决策日志
+│   │   └── usage.go                 # Usage 持久化
+│   ├── application/
+│   │   └── application.go           # 进程和 session 组合根
+│   ├── background/
+│   │   └── supervisor.go            # 后台命令管理
+│   ├── config/
+│   │   └── config.go                # 环境配置和运行常量
+│   ├── eval/                        # 回归任务、Harness 和 mock executor
+│   ├── event/                       # 事件模型与 Console/Audit/Usage/Log Sink
+│   ├── history/                     # JSONL 对话历史和恢复清理
+│   ├── hitlaudit/                   # HITL 模式、审批 UI 和 Executor Adapter
+│   ├── llm/                         # Provider 无关消息、ToolCall、Usage 类型
+│   ├── logging/                     # 进程日志辅助
+│   ├── mcp/
+│   │   ├── client.go                # stdio JSON-RPC Client
+│   │   └── manager.go               # server 生命周期和动态工具注册
+│   ├── memory/                      # Evergreen/Daily 记忆、搜索和 backfill
+│   ├── model/
+│   │   ├── gateway.go               # 统一模型调用入口
+│   │   ├── client.go                # 重试和超时
+│   │   ├── sink.go                  # 流式输出
+│   │   └── provider/                # OpenAI/Anthropic/Gemini adapters
+│   ├── prompt/
+│   │   ├── loader.go                # go:embed 模板注册
+│   │   └── templates/               # 系统、Judge、规划等模板文件
+│   ├── security/
+│   │   ├── security.go              # SecurePath、Approval、BashPolicy
+│   │   ├── permissions.go           # permissions.json
+│   │   ├── diff_preview.go          # 变更预览
+│   │   ├── ssrf.go                  # 出站 IP 策略
+│   │   └── audit.go                 # 输出脱敏
+│   ├── session/                     # Session 元数据和索引
+│   ├── skill/                       # SKILL.md 递归加载
+│   ├── store/                       # 原子文件写入
+│   ├── task/                        # Todo、任务 CRUD 和 DAG
+│   ├── team/                        # Message Bus 和协作协议
+│   ├── tool/
+│   │   ├── definition.go            # Result、Definition、Scope、Catalog
+│   │   ├── executor.go              # 统一执行管线
+│   │   ├── builtin.go               # 稳定顺序的工具组装
+│   │   ├── builtin_deps.go          # Handler session 依赖
+│   │   ├── handler_fs_read.go       # 只读文件工具
+│   │   ├── handler_fs_write.go      # 文件 mutation 工具
+│   │   ├── handler_shell.go         # Bash 和后台命令
+│   │   ├── handler_task.go          # Todo 和任务
+│   │   ├── handler_memory.go        # 长期记忆
+│   │   ├── handler_team.go          # Teammate 消息
+│   │   ├── handler_protocol.go      # 团队协议
+│   │   ├── handler_web.go           # Web 和 Explore
+│   │   └── handler_meta.go          # 压缩和 Skill
+│   ├── utils/                       # 终端、截断和进程平台差异
+│   ├── web/                         # Fetch、Search、HTML 和安全 Client
+│   └── worktree/                    # git worktree 创建和清理
 ├── prompts/
-│   ├── human_modify.md          # HITL 修改反馈模板
-│   └── human_reject.md          # HITL 拒绝反馈模板
+│   ├── human_modify.md              # 人工修改反馈模板文件
+│   └── human_reject.md              # 人工拒绝反馈模板文件
 ├── skills/
 │   ├── agent-builder/SKILL.md
 │   ├── code-review/SKILL.md
 │   ├── judge/SKILL.md
 │   ├── pdf/SKILL.md
 │   └── skill_format.md
-├── examples/
-│   └── mcp/                     # MCP 配置示例
 ├── go.mod
 └── go.sum
 ```
 
-`tmp/`、`workspace/` 和用户本地生成的状态目录可能出现在开发环境中，但它们不是核心源码，不应作为项目功能依赖。运行 Agent 时，工作目录由 `--workdir` 指定。
+### 目录职责原则
 
-## 开发指南
+- `cmd/` 只处理进程入口和用户交互，不承载工具业务逻辑；
+- `internal/application` 只负责装配和生命周期；
+- `internal/agent` 负责策略，不直接实现文件或网络细节；
+- `internal/tool` 负责能力描述和统一执行；
+- 具体业务服务放在独立 package，通过接口注入 Handler；
+- `internal/security` 与 `internal/hitlaudit` 是横切层；
+- session 数据不放进进程全局单例；
+- 新的动态工具必须注册到当前 session catalog，而不是共享 catalog。
 
-### 常用命令
+## 开发与扩展
+
+### 添加内置工具
+
+1. 选择合适的 `internal/tool/handler_*.go`；
+2. 定义完整 JSON Schema；
+3. 明确 `RiskLevel` 和 `Effects`；
+4. 为长操作设置 `Timeout`；
+5. 文件 mutation 提供 `Preview`；
+6. Handler 从 `ToolScope` 和 `builtinDeps` 获取上下文；
+7. 使用 `Succeeded`、`Failed`、`Denied` 等结构化结果；
+8. 把工具加入 `BuiltinTools`，不要随意改变已有顺序；
+9. 更新 `builtin_order_test.go`；
+10. 增加参数、能力、安全、取消和错误测试。
+
+Handler 内的外部调用应使用 `scope.Context`，以便工具 timeout 和 Ctrl-C 真正停止底层操作。
+
+### 添加 Provider
+
+1. 实现 `model.Provider`；
+2. 将 SDK 消息映射到 `internal/llm`；
+3. 支持普通调用和流式调用；
+4. 正确合并流式 tool-call delta；
+5. 映射 Usage 和 Provider 错误；
+6. 在 `application.New` 注册 Provider；
+7. 如有需要，更新 `provider.inferName`；
+8. 为文本、工具调用、流式、Usage、限流和错误响应增加测试。
+
+仅增加 `internal/model/provider/*.go` 文件并不会自动启用 Provider，组合根必须显式注册。
+
+### 添加 session 服务
+
+1. 在 `Application.Build` 创建服务；
+2. 通过 `RunnerParams` 注入；
+3. 避免保存 `Application` 的循环引用；
+4. 如果有 goroutine、文件或子进程，在 `SessionRuntime` 注册关闭钩子；
+5. 让长操作继承 `rt.Ctx`；
+6. 为 session 切换和重复关闭增加测试。
+
+### 添加 REPL 命令
+
+命令位于 `cmd/agent/repl.go` 的 `handleCommand`。新增命令时：
+
+- 更新 `/help`；
+- 明确命令是否修改 session；
+- 长操作使用传入的 `ctx`，不要无条件使用 `context.Background()`；
+- session 切换通过设置下一次 `BuildOptions` 完成；
+- 同步更新 README。
+
+### Skill
+
+工作区技能目录：
+
+```text
+<workdir>/skills/**/SKILL.md
+```
+
+技能名取 `SKILL.md` 的父目录名。Session 构建时会把所有技能拼入系统提示词，也可以由 `load_skill` 按名称读取。
+
+技能属于工作区输入，加载第三方项目时应审查其内容。
+
+### Prompt
+
+Prompt 文件位于 `internal/prompt/templates/`，使用 `go:embed` 编译进二进制。修改后需要重新编译。
+
+注意：模板文件存在不代表已经注册到 `prompt.Loader`。新增模板时必须同时：
+
+1. 添加 `//go:embed` 变量；
+2. 在 `NewLoader` 的 map 中注册名称；
+3. 为调用方增加非空模板测试。
+
+## 测试与评估
+
+### 常用开发命令
 
 ```bash
-# 下载依赖
-go mod download
-
 # 格式化
-gofmt -w ./cmd ./internal
+go fmt ./...
+
+# 静态检查
+go vet ./...
 
 # 编译
 go build ./...
@@ -1097,59 +1241,51 @@ go test ./...
 
 # 竞态检测
 go test -race ./...
-
-# 查看包列表
-go list ./...
 ```
 
-### 添加内置工具
+### 重点测试
 
-1. 在 `internal/tool/handlers.go` 或 `handlers_helpers.go` 中构造 `ToolDefinition`；
-2. 提供完整 JSON Schema；
-3. 明确 `RiskLevel`、`Effects`、`Timeout` 和 `SnapshotPolicy`；
-4. Handler 只通过 `ToolScope` 获取工作目录、权限和上下文；
-5. 使用 `Succeeded`、`Failed`、`Denied` 等结构化结果；
-6. 避免 Handler 直接访问全局 Application；
-7. 为路径、参数、网络和错误边界补充测试。
+- `internal/tool/*_test.go`：Catalog 顺序、Executor、安全管线、上下文取消；
+- `internal/security/*_test.go`：路径、Bash、Permissions、SSRF；
+- `internal/agent/*_test.go`：压缩、反思、Runner 控制、Subagent/Teammate 沙箱；
+- `internal/mcp/mcp_test.go`：动态注册、超时、取消和 RPC framing；
+- `internal/history/history_test.go`：中断历史恢复；
+- `internal/task/*_test.go`：Todo、任务和 DAG；
+- `internal/web/*_test.go`：搜索配置和 Fetch；
+- `internal/model/provider/*_test.go`：DSML、Usage 和 Provider 映射。
 
-### 添加 Provider
+### 离线评估
 
-1. 实现 `model.Provider` 接口；
-2. 将 SDK 类型转换为 `internal/llm` 中立类型；
-3. 正确处理文本 delta、工具调用 delta、Usage、finish reason 和 stream error；
-4. 在 Provider Registry 注册实例或 builder；
-5. 更新模型前缀推断逻辑（如需要）；
-6. 为普通请求、流式请求、工具调用和错误响应增加测试。
+默认使用 mock，不需要真实 API Key：
 
-### 修改 Agent 行为
+```bash
+go run ./cmd/eval
+```
 
-优先考虑以下扩展点：
+参数：
 
-- 增加工具，而不是在 Runner 中硬编码业务流程；
-- 增加 Prompt Template，而不是复制 Agent Loop；
-- 使用 Subagent 隔离探索上下文；
-- 使用 Task/DAG 表达多步骤工作；
-- 使用 Event Sink 增加日志或 UI 输出；
-- 使用 `ToolScope` 注入能力和权限；
-- 保持 SessionRuntime 的关闭顺序和资源边界。
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `-live` | `false` | 使用真实 LLM |
+| `-model` | 空 | live 模式模型 |
+| `-v`、`-verbose` | `false` | 详细输出 |
+| `-timeout` | `5m` | 单任务超时 |
+| `-category` | 空 | 过滤任务类别 |
+| `-task` | 空 | 过滤任务名 |
+| `-output` | 空 | 写 JSON 结果 |
+| `-baseline-out` | 空 | 写 baseline JSON |
 
-### 测试重点
+示例：
 
-核心测试文件分布在各包的 `*_test.go` 中，重点覆盖：
-
-- Agent compression、reflection、lesson 和 runner controls；
-- history 恢复和 dangling message 清理；
-- tool executor、JSON 参数解析和安全管线；
-- permissions、SSRF、security path；
-- MCP 协议；
-- task/Todo/DAG；
-- memory 和 web service；
-- provider DSML 和 Usage 映射；
-- background supervisor 和 team protocol。
+```bash
+go run ./cmd/eval -category tools -v
+go run ./cmd/eval -task file_edit -output /tmp/eval.json
+go run ./cmd/eval -live -model gpt-4o -timeout 10m
+```
 
 ## 故障排查
 
-### 启动时报没有可用 Provider
+### 启动时报 `no LLM provider available`
 
 检查：
 
@@ -1159,124 +1295,116 @@ env | grep -E 'MODEL_ID|LLM_PROVIDER|OPENAI|ANTHROPIC'
 
 确认：
 
-- 至少设置了一个受支持的 API Key；
-- `LLM_PROVIDER` 拼写正确；
+- 至少配置一个 API Key；
+- `LLM_PROVIDER` 是 `openai` 或 `anthropic`；
 - 模型 ID 与 Provider 匹配；
-- OpenAI-compatible 服务设置了正确的 `OPENAI_BASE_URL`；
-- Base URL 没有被错误地重复拼接路径。
+- OpenAI-compatible 服务的 Base URL 正确。
 
 ### 输入后长时间没有文本
 
-Agent 可能正在：
+可能正在：
 
-- 等待 LLM 首个响应；
-- 生成大量工具调用参数；
-- 访问网络；
-- 执行 Shell 或 MCP 工具；
-- 等待安全审批；
-- 进行上下文压缩或 Judge 评估。
+- 等待 LLM 首个 stream event；
+- 生成 tool-call 参数；
+- 等待 HITL；
+- 执行 Shell、Web 或 MCP；
+- 压缩上下文；
+- 执行 Judge。
 
-当前 Provider 会尽量转发流式文本 delta。工具调用本身可能只有结构化参数，没有可显示的自然语言文本，因此终端可能在工具开始前看起来没有输出。可以观察事件日志和 `session.log`，也可以按 `Ctrl-C` 取消当前请求。
-
-### Ctrl-C 后旧 prompt 再次执行
-
-确认使用的是最新构建，并检查当前会话的：
+查看终端事件和：
 
 ```text
-<state>/sessions/<session-id>/history/history.jsonl
+<session-dir>/session.log
 ```
 
-启动恢复时会清理尾部孤儿 user 消息。如果历史文件在外部被修改，或旧版本写入了不完整的消息块，建议先备份该 session 目录，再使用 `/session new` 创建新会话。
+需要终止时按一次 `Ctrl-C` 进行关闭。
 
-### `/approve danger` 后文件操作异常
-
-`danger` 会跳过人工确认和 diff preview。它不会修复模型产生的错误参数、路径错误或工具自身的失败。建议恢复：
-
-```text
-/approve safe
-```
-
-并使用：
-
-```text
-/decisions
-/security
-```
-
-检查工具决策和安全状态。
-
-### MCP server 启动失败
+### 文件操作被拒绝
 
 检查：
 
-- 命令是否存在，例如 `npx`、Python 或自定义 server；
-- `args` 是否正确；
-- 环境变量是否传入；
-- 使用 `/mcp pending` 和 `/mcp` 查看状态；
-- 查看标准错误和 `session.log`；
-- 工作区 `.mcp.json` 是否是有效 JSON。
+- 路径是否在 `--workdir` 内；
+- 是否通过 symlink 指向目录外；
+- Agent profile 是否有 `CanWrite`；
+- Teammate 是否已经提交并通过计划；
+- diff preview 是否被拒绝；
+- 当前 HITL 模式和 Bash/权限规则。
 
-### Web 请求被拒绝
+### `/approve danger` 后仍被阻止
 
-这是默认安全策略的预期行为，常见原因是目标解析到本地或私有 IP。只有在明确需要访问内部服务并且环境受控时，才设置：
+`danger` 只自动通过 HITL review 和跳过 diff preview。它不会绕过：
 
-```bash
-WEB_ALLOW_PRIVATE_IPS=1
+- `SecurePath`；
+- capability gate；
+- Bash hard deny；
+- SSRF；
+- 工具参数校验；
+- Handler 自身错误。
+
+### MCP server 无法启动
+
+检查：
+
+- `command` 是否在 PATH；
+- `.mcp.json` 是否是合法 JSON；
+- server 是否实现 stdio MCP；
+- `/mcp pending` 是否仍在等待批准；
+- 环境变量是否真的由子进程读取；
+- 最近一次调用是否超时并停止了 Client。
+
+超时后可以先：
+
+```text
+/mcp disconnect <name>
+/mcp connect <name> <command> [args...]
 ```
 
-## 已知限制
+### Teammate 无法创建
 
-1. **Gemini 尚未在当前应用组装流程中注册**：虽然仓库中存在 Gemini Provider 实现，但 `Application.New` 当前只注册 OpenAI 和 Anthropic。
-2. **MCP 是外部进程集成**：MCP server 的可靠性、依赖安装和权限由外部命令决定；项目本身不能保证第三方 server 的安全性。
-3. **`bash` 不是完整沙箱**：它最终通过 `sh -c` 执行，安全策略只能降低风险，不能替代容器或操作系统隔离。
-4. **公共搜索实例不适合生产环境**：未显式配置时会尝试公共 SearXNG 实例，稳定性和隐私不可控。
-5. **上下文和工具输出仍可能很大**：虽然存在截断、压缩和输出限制，但复杂任务仍可能消耗大量 Token 和时间。
-6. **流式工具调用依赖 Provider 协议**：不同 OpenAI-compatible 服务对原生 tool call、DSML 和 stream event 的实现可能不同；不兼容的服务可能出现工具参数解析失败或显示协议标记。
-7. **自动批准会显著扩大风险面**：`/approve danger` 会跳过关键的人工确认，不建议在包含敏感数据、生产代码或未审查 MCP 的环境中使用。
-8. **状态文件包含会话内容**：历史、日志、Usage、决策和记忆可能包含源代码、命令输出或外部数据，需要按敏感数据处理。
-9. **README 和技能内容会影响模型行为**：工作区 `skills/` 与提示词会进入模型上下文，应审查来源，避免把不可信文件当成系统级指令。
-
-## 安全建议
-
-- API Key 仅使用环境变量或外部 Secret Manager 注入；
-- 不要把真实凭据写入 `examples/`、`.mcp.json`、`permissions.json` 或日志；
-- 默认使用 `/approve safe`，仅在受控环境临时使用 `/approve danger`；
-- 对外部 MCP server 逐个审批，不要盲目执行未知命令；
-- 对不可信代码库使用容器、虚拟机或专用用户；
-- 不要在生产机器上直接启用宽泛 Shell 权限；
-- 将状态目录和 `session.log` 当作可能包含敏感代码的文件保护；
-- 对 `WEB_ALLOW_PRIVATE_IPS=1`、自定义 `SEARXNG_URL` 和自定义 MCP endpoint 做变更审计；
-- 修改工具时同时检查路径穿越、命令注入、SSRF、敏感信息泄露和权限绕过；
-- 提交代码前运行：
+Teammate 必须创建 git worktree。检查：
 
 ```bash
-gofmt -w ./cmd ./internal
-go test ./...
-go test -race ./...
-go build ./...
+git rev-parse --is-inside-work-tree
+git worktree list
+git status
 ```
 
-## 相关文件索引
+确认目标名称没有残留 worktree/branch 冲突，并且主仓库 `HEAD` 包含 teammate 需要的基础修改。
 
-| 主题 | 主要文件 |
-|---|---|
-| CLI | `cmd/agent/main.go`、`cmd/agent/repl.go` |
-| 应用组装 | `internal/application/application.go` |
-| Agent Loop | `internal/agent/runner.go` |
-| LLM 抽象 | `internal/llm/types.go`、`internal/model/gateway.go` |
-| Provider | `internal/model/provider/*.go` |
-| 工具定义和执行 | `internal/tool/definition.go`、`internal/tool/executor.go`、`internal/tool/handlers.go` |
-| 安全 | `internal/security/*.go`、`internal/hitlaudit/*.go` |
-| 会话和历史 | `internal/session/repository.go`、`internal/history/history.go` |
-| 记忆 | `internal/memory/*.go` |
-| 任务 | `internal/task/*.go` |
-| 团队 | `internal/team/*.go`、`internal/agent/teammate.go` |
-| MCP | `internal/mcp/*.go` |
-| 网络 | `internal/web/*.go` |
-| Prompt | `internal/prompt/loader.go`、`internal/prompt/templates/` |
-| Skill | `internal/skill/loader.go`、`skills/` |
-| 评估 | `cmd/eval/main.go`、`internal/eval/` |
+### Web 请求被阻止
+
+目标可能解析到 loopback、私有地址或 link-local。只有在受控环境中才设置：
+
+```bash
+export WEB_ALLOW_PRIVATE_IPS=1
+```
+
+云 metadata/link-local 仍然不会放开。
+
+### 两个项目看到了相同 session
+
+默认项目状态键只使用目录 basename。为同名项目提供不同 `--data-dir`：
+
+```bash
+./go-code-agent --workdir /repo/a/app --data-dir ~/.config/go-code-agent-a
+./go-code-agent --workdir /repo/b/app --data-dir ~/.config/go-code-agent-b
+```
+
+## 当前限制
+
+1. **不是 OS 沙箱**：Shell、MCP 和第三方工具仍可能产生真实副作用。
+2. **Gemini 未接入组合根**：存在 Provider 源码，但启动流程不注册。
+3. **Permissions 尚未统一进入 Executor**：当前强制执行主要覆盖 Bash/Background Bash。
+4. **MCP 风险元数据与 HITL review 尚未完全统一**：第三方 MCP 应视为高信任边界。
+5. **部分 Prompt 文件尚未在 Loader 注册**：新增或使用模板前需核对 `prompt.NewLoader`。
+6. **QPS/Burst 配置尚未接入**：当前实际限流主要是 `LLM_MAX_CONCURRENCY`。
+7. **项目状态键只用 basename**：同名目录需要手动隔离 `--data-dir`。
+8. **Todo 不持久化**：持久工作应使用 `task_*` 和 DAG。
+9. **Teammate 只看到 worktree 的 HEAD 基线**：主目录未提交修改不会自动同步。
+10. **公共 SearXNG 不适合生产**：稳定性、隐私和可用性不可控。
+11. **状态文件包含敏感内容**：历史、日志、Tool 输出和记忆都可能包含源代码或外部数据。
+12. **当前仓库没有 LICENSE 文件**：公开分发或复用前应补充许可证。
 
 ## 许可证
 
-当前仓库未发现根目录许可证文件。若要公开发布或作为依赖使用，请先补充明确的许可证和第三方依赖声明。
+当前仓库尚未提供 LICENSE。若计划公开发布、二次分发或作为依赖使用，请先选择许可证并核对第三方依赖许可。

@@ -4,14 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent-refactor/internal/config"
-	"go-code-agent-refactor/internal/event"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/model"
-	"go-code-agent-refactor/internal/task"
-	"go-code-agent-refactor/internal/team"
-	"go-code-agent-refactor/internal/tool"
-	"go-code-agent-refactor/internal/worktree"
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/event"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/model"
+	"go-code-agent/internal/task"
+	"go-code-agent/internal/team"
+	"go-code-agent/internal/tool"
+	"go-code-agent/internal/worktree"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,6 +49,7 @@ type TeammateManager struct {
 	catalog     *tool.ToolCatalog
 	modelID     string
 	diffPreview tool.DiffPreview
+	approval    tool.ApprovalChecker
 	eventSink   event.Sink
 
 	spawnMu   sync.Mutex
@@ -61,6 +62,10 @@ type TeammateManager struct {
 
 // SetDiffPreview makes teammate file mutations go through the same preview gate as lead mutations.
 func (tm *TeammateManager) SetDiffPreview(preview tool.DiffPreview) { tm.diffPreview = preview }
+
+// SetApproval wires the session HITL adapter so teammate tools are gated
+// the same way as lead tools (plan gate still controls CanWrite).
+func (tm *TeammateManager) SetApproval(a tool.ApprovalChecker) { tm.approval = a }
 
 func (tm *TeammateManager) SetEventSink(sink event.Sink) { tm.eventSink = sink }
 
@@ -135,13 +140,13 @@ func (tm *TeammateManager) Wait() { tm.wg.Wait() }
 // If worktree creation fails, fail-closed: no teammate starts and error is returned.
 func (tm *TeammateManager) Spawn(ctx context.Context, name, role, prompt string) string {
 	tm.spawnMu.Lock()
+	defer tm.spawnMu.Unlock()
 	if !tm.lastSpawn.IsZero() {
 		if wait := config.SpawnMinInterval - time.Since(tm.lastSpawn); wait > 0 {
 			time.Sleep(wait)
 		}
 	}
 	tm.lastSpawn = time.Now()
-	tm.spawnMu.Unlock()
 
 	tm.mu.Lock()
 	idx := tm.findIndex(name)
@@ -150,6 +155,19 @@ func (tm *TeammateManager) Spawn(ctx context.Context, name, role, prompt string)
 			tm.mu.Unlock()
 			return fmt.Sprintf("Error: '%s' is currently %s", name, s)
 		}
+	}
+
+	if tm.worktrees == nil {
+		tm.mu.Unlock()
+		return fmt.Sprintf("Error: cannot spawn '%s': worktree service unavailable", name)
+	}
+	lease, err := tm.worktrees.Acquire(name)
+	if err != nil {
+		tm.mu.Unlock()
+		return fmt.Sprintf("Error: cannot spawn '%s': worktree isolation failed: %v", name, err)
+	}
+
+	if idx >= 0 {
 		tm.config.Members[idx].Status = "working"
 		tm.config.Members[idx].Role = role
 	} else {
@@ -158,19 +176,6 @@ func (tm *TeammateManager) Spawn(ctx context.Context, name, role, prompt string)
 	tm.save()
 	tm.mu.Unlock()
 
-	// Acquire worktree — best-effort: if isolation cannot be established,
-	// fall back to sharing the main workdir (read-only safe, no file conflict).
-	var worktreePath string
-	var worktreeNote string
-	if tm.worktrees != nil {
-		lease, err := tm.worktrees.Acquire(name)
-		if err != nil {
-			worktreeNote = fmt.Sprintf(" (worktree unavailable: %v, sharing main workspace)", err)
-		} else {
-			worktreePath = lease.WorktreeDir
-		}
-	}
-
 	lifetimeCtx := tm.getSessionCtx()
 	if lifetimeCtx == nil {
 		lifetimeCtx = context.Background()
@@ -178,9 +183,9 @@ func (tm *TeammateManager) Spawn(ctx context.Context, name, role, prompt string)
 	tm.wg.Add(1)
 	go func() {
 		defer tm.wg.Done()
-		tm.autonomousLoop(lifetimeCtx, name, role, prompt, worktreePath)
+		tm.autonomousLoop(lifetimeCtx, name, role, prompt, lease.WorktreeDir)
 	}()
-	return fmt.Sprintf("Spawned '%s' (role: %s, workdir: %s)%s", name, role, worktreePath, worktreeNote)
+	return fmt.Sprintf("Spawned '%s' (role: %s, workdir: %s)", name, role, lease.WorktreeDir)
 }
 
 // autonomousLoop runs a WORK → IDLE → WORK cycle within the assigned worktree.
@@ -220,14 +225,17 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 		CanMemory:   true,
 		DiffPreview: tm.diffPreview,
 	}
-	executor := tool.NewExecutor(tm.catalog, nil, nil)
+	executor := tool.NewExecutor(tm.catalog, tm.approval, nil)
 
 	traceID := "team-" + name
 	if tm.eventSink != nil {
 		tm.eventSink.Emit(event.Event{Type: event.AgentStarted, TraceID: traceID, AgentID: name})
 	}
 	for range config.TeammateWorkMaxRounds {
-		MicroCompact(*msgs)
+		// clear_at_least guard: only clear old tool results when it frees a
+		// worthwhile number of bytes, so we don't bust the cache prefix for a
+		// negligible saving.
+		MicroCompact(*msgs, config.MicroCompactMinClearBytes)
 
 		for _, m := range tm.bus.ReadInbox(name) {
 			if t, _ := m["type"].(string); t == "shutdown_request" {
@@ -238,7 +246,7 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 			*msgs = append(*msgs, llm.UserMessage(string(data)))
 		}
 
-		toolDefs := tool.NewExecutor(tm.catalog, nil, nil).ToolDefs()
+		toolDefs := tool.NewExecutor(tm.catalog, tm.approval, nil).ToolDefs()
 		modelStart := time.Now()
 		sr, err := tm.gateway.Stream(ctx, "teammate", llm.CallParams{
 			Model:     tm.modelID,

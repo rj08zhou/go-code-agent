@@ -5,7 +5,7 @@ package memory
 import (
 	"encoding/json"
 	"fmt"
-	"go-code-agent-refactor/internal/config"
+	"go-code-agent/internal/config"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -27,7 +27,9 @@ type Store struct {
 
 func NewStore(dataDir string) *Store {
 	dailyDir := filepath.Join(dataDir, "daily")
-	os.MkdirAll(dailyDir, 0o755)
+	if err := os.MkdirAll(dailyDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "[warn] memory: create daily dir: %v\n", err)
+	}
 	s := &Store{dataDir: dataDir, dailyDir: dailyDir}
 	s.cleanExpired()
 	s.rebuildCache()
@@ -109,6 +111,9 @@ func (s *Store) Write(content, category string) string {
 		}
 	}
 
+	if err := os.MkdirAll(s.dailyDir, 0o755); err != nil {
+		return fmt.Sprintf("Error writing memory: %v", err)
+	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Sprintf("Error writing memory: %v", err)

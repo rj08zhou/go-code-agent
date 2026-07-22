@@ -3,10 +3,10 @@ package agent
 import (
 	"context"
 	"fmt"
-	"go-code-agent-refactor/internal/config"
-	"go-code-agent-refactor/internal/llm"
-	"go-code-agent-refactor/internal/model"
-	"go-code-agent-refactor/internal/prompt"
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/model"
+	"go-code-agent/internal/prompt"
 	"strings"
 )
 

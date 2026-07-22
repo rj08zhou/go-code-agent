@@ -7,12 +7,19 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
 // ---------- Path Sandbox ----------
 
-// SecurePath resolves a user-supplied path relative to root.
+// SecurePath resolves a user-supplied path against root.
+// Rel may be relative to root, or an absolute path that still lies under
+// root. Absolute inputs must NOT be passed through filepath.Join with the
+// root: as of Go 1.25, Join no longer discards prior elements when a later
+// element is absolute (Join("/wd", "/Users/x") → "/wd/Users/x"), which
+// silently turned valid absolute workspace paths into nonsense and caused
+// explore agents to thrash on lstat failures.
 // If allowWrite is false, the target must exist.
 // Prevents symlink escapes and path traversal.
 func SecurePath(root, rel string, allowWrite bool) (string, error) {
@@ -26,21 +33,27 @@ func SecurePath(root, rel string, allowWrite bool) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve root: %w", err)
 	}
-	joined := filepath.Join(cleanRoot, rel)
-	clean, err := filepath.Abs(joined)
+
+	var candidate string
+	if filepath.IsAbs(rel) {
+		candidate = filepath.Clean(rel)
+	} else {
+		candidate = filepath.Join(cleanRoot, rel)
+	}
+	clean, err := filepath.Abs(candidate)
 	if err != nil {
 		return "", fmt.Errorf("resolve path: %w", err)
 	}
 	// Check prefix against cleanRoot
 	if !strings.HasPrefix(clean, cleanRoot+string(filepath.Separator)) && clean != cleanRoot {
-		return "", fmt.Errorf("path escapes workdir: %s", rel)
+		return "", fmt.Errorf("path escapes workdir (use a path relative to %s, or an absolute path inside it): %s", cleanRoot, rel)
 	}
 	// Resolve symlinks in the resolved path, then re-check against the
 	// symlink-resolved root to handle macOS /var→/private/var
 	resolved, err := filepath.EvalSymlinks(clean)
 	if err != nil {
 		if !allowWrite {
-			return "", fmt.Errorf("cannot resolve path: %w", err)
+			return "", fmt.Errorf("cannot resolve path %q under workdir %s: %w", rel, cleanRoot, err)
 		}
 	} else {
 		resolvedRoot, rootErr := filepath.EvalSymlinks(cleanRoot)
@@ -52,16 +65,17 @@ func SecurePath(root, rel string, allowWrite bool) (string, error) {
 	}
 	if !allowWrite {
 		if _, err := os.Stat(clean); err != nil {
-			return "", fmt.Errorf("path not found: %s", rel)
+			return "", fmt.Errorf("path not found: %s (workdir=%s)", rel, cleanRoot)
 		}
 	}
 	return clean, nil
 }
 
-// IsReadOnlyBash reports whether a command is read-only/inspection-only.
+// IsReadOnlyBash reports whether a command is read-only/inspection-only
+// under the default hard policy (no user permission rules).
 func IsReadOnlyBash(cmd string) bool {
 	p := NewDefaultBashPolicy()
-	allowed, needConfirm, _ := p.Validate(cmd)
+	allowed, needConfirm, _ := p.Validate(cmd, nil)
 	return allowed && !needConfirm
 }
 
@@ -76,33 +90,102 @@ const (
 	ApproveBlocked                      // never allowed
 )
 
-// ApprovalState tracks the user's current approval posture.
+// ApprovalState tracks the user's current approval posture for a session.
+// It is safe for concurrent use.
 type ApprovalState struct {
+	mu              sync.RWMutex
 	autoApproveAll  bool
 	autoApproveSafe bool
 }
 
-func (s *ApprovalState) SetAutoApproveAll(v bool)  { s.autoApproveAll = v }
-func (s *ApprovalState) SetAutoApproveSafe(v bool) { s.autoApproveSafe = v }
-func (s *ApprovalState) IsAutoApproveAll() bool    { return s.autoApproveAll }
-func (s *ApprovalState) IsAutoApproveSafe() bool   { return s.autoApproveSafe }
+// NewApprovalState returns a fresh state with both auto-approve flags off.
+func NewApprovalState() *ApprovalState { return &ApprovalState{} }
+
+func (s *ApprovalState) SetAutoApproveAll(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.autoApproveAll = v
+}
+func (s *ApprovalState) SetAutoApproveSafe(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.autoApproveSafe = v
+}
+func (s *ApprovalState) IsAutoApproveAll() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.autoApproveAll
+}
+func (s *ApprovalState) IsAutoApproveSafe() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.autoApproveSafe
+}
+
+// ShouldPreviewDiff reports whether file mutation previews should be shown.
+// Diff preview is skipped only when the user has opted into full auto-approve.
+func (s *ApprovalState) ShouldPreviewDiff() bool { return !s.IsAutoApproveAll() }
+
+// ApplyPreset sets the posture for /approve off|safe|danger.
+func (s *ApprovalState) ApplyPreset(preset string) {
+	switch strings.ToLower(strings.TrimSpace(preset)) {
+	case "danger", "all":
+		s.SetAutoApproveSafe(true)
+		s.SetAutoApproveAll(true)
+	case "safe":
+		s.SetAutoApproveSafe(true)
+		s.SetAutoApproveAll(false)
+	default: // "off", "reset", or unknown → manual
+		s.SetAutoApproveSafe(false)
+		s.SetAutoApproveAll(false)
+	}
+}
 
 func (s *ApprovalState) Decide(level ApprovalLevel, desc string) (allowed bool, reason string) {
-	if s.autoApproveAll {
-		return true, ""
-	}
 	switch level {
-	case ApproveAuto, ApproveSafe:
-		if s.autoApproveSafe {
+	case ApproveAuto:
+		return true, ""
+	case ApproveSafe:
+		if s.IsAutoApproveAll() || s.IsAutoApproveSafe() {
 			return true, ""
 		}
-		return true, ""
+		return false, fmt.Sprintf("[safe] %s requires approval. Use /approve safe to auto-approve.", desc)
 	case ApproveDanger:
-		return false, fmt.Sprintf("danger tool '%s' requires confirmation", desc)
+		if s.IsAutoApproveAll() {
+			return true, ""
+		}
+		return false, fmt.Sprintf("[DANGER] %s requires confirmation. Use /approve danger to auto-approve (risky!).", desc)
 	case ApproveBlocked:
-		return false, fmt.Sprintf("tool '%s' is blocked", desc)
+		return false, fmt.Sprintf("BLOCKED: %s is not permitted", desc)
+	default:
+		return false, fmt.Sprintf("unknown approval level for %q", desc)
 	}
-	return true, ""
+}
+
+// Session-scoped active approval used by diff-preview and /approve.
+// Defaults to a non-nil empty state so callers never panic.
+var (
+	activeApprovalMu sync.RWMutex
+	activeApproval   = NewApprovalState()
+)
+
+// SetActiveApproval installs the session's ApprovalState as the process-wide
+// active posture (diff preview, legacy SetAutoApproveAll). Pass nil to reset.
+func SetActiveApproval(s *ApprovalState) {
+	activeApprovalMu.Lock()
+	defer activeApprovalMu.Unlock()
+	if s == nil {
+		activeApproval = NewApprovalState()
+		return
+	}
+	activeApproval = s
+}
+
+// ActiveApproval returns the session ApprovalState.
+func ActiveApproval() *ApprovalState {
+	activeApprovalMu.RLock()
+	defer activeApprovalMu.RUnlock()
+	return activeApproval
 }
 
 // ---------- Bash Policy ----------
@@ -117,8 +200,9 @@ var allowedCommands = map[string]bool{
 	"ls": true, "ll": true, "la": true, "pwd": true, "cd": true,
 	"cat": true, "head": true, "tail": true, "less": true, "more": true,
 	"wc": true, "sort": true, "uniq": true, "cut": true, "tr": true,
-	"grep": true, "egrep": true, "fgrep": true, "awk": true, "sed": true,
+	"grep": true, "egrep": true, "fgrep": true, "rg": true, "awk": true, "sed": true,
 	"find": true, "locate": true, "which": true, "whereis": true, "type": true,
+	"stat": true, "tree": true, "jq": true, "kill": true, "pgrep": true,
 	"echo": true, "printf": true, "date": true, "env": true, "printenv": true,
 	"uname": true, "hostname": true, "whoami": true, "id": true, "groups": true,
 	"ps": true, "top": true, "htop": true, "df": true, "du": true, "free": true,
@@ -147,12 +231,17 @@ var dangerousRegexps = []*regexp.Regexp{
 	regexp.MustCompile(`dd\s+if=`),
 	regexp.MustCompile(`shutdown(\s|$)`),
 	regexp.MustCompile(`reboot(\s|$)`),
-	regexp.MustCompile(`sudo\s+rm\s+-rf`),
+	// Privilege escalation — block any sudo/doas/pkexec, not only destructive forms.
+	regexp.MustCompile(`(^|[\s;&|])sudo(\s|$)`),
+	regexp.MustCompile(`(^|[\s;&|])doas(\s|$)`),
+	regexp.MustCompile(`(^|[\s;&|])pkexec(\s|$)`),
 	regexp.MustCompile(`chmod\s+777\s+/`),
 	regexp.MustCompile(`wget\s+\S+\s*-O\s+/`),
 	regexp.MustCompile(`curl\s+\S+\s*-o\s+/`),
 	regexp.MustCompile(`\|(\s*)sh(\s|$)`),
 	regexp.MustCompile(`\|(\s*)bash(\s|$)`),
+	regexp.MustCompile(`\bnc\s+-l\b`),
+	regexp.MustCompile(`\bhistory\s+-c\b`),
 }
 
 // confirmRegexps are patterns that require user confirmation.
@@ -189,7 +278,8 @@ func NewDefaultBashPolicy() *BashPolicy {
 			"rm -r /",
 			"base64 -d |",
 			"docker run", "mkfs.", "dd if=",
-			"> /dev/sd", "sudo rm", "shutdown", "chmod 777 /",
+			"> /dev/sd", "shutdown", "chmod 777 /",
+			"/etc/shadow", "/etc/passwd",
 		},
 		confirmPatterns: []string{
 			"git push --force", "git push -f",
@@ -199,7 +289,9 @@ func NewDefaultBashPolicy() *BashPolicy {
 }
 
 // Validate checks the command against the allow/deny/confirm lists.
-func (p *BashPolicy) Validate(command string) (allowed bool, needConfirm bool, reason string) {
+// perms is optional session-scoped user rules (may be nil); hard deny
+// patterns always win before user allow/confirm rules are considered.
+func (p *BashPolicy) Validate(command string, perms *Permissions) (allowed bool, needConfirm bool, reason string) {
 	cmd := strings.TrimSpace(command)
 	lower := strings.ToLower(cmd)
 
@@ -241,10 +333,9 @@ func (p *BashPolicy) Validate(command string) (allowed bool, needConfirm bool, r
 		}
 	}
 
-	// 6. Check user-defined permission rules
-	if GlobalPermissions != nil {
-		level := GlobalPermissions.Match("bash", cmd)
-		switch level {
+	// 6. Session-scoped user permission rules (injected by the composition root).
+	if perms != nil {
+		switch perms.Match("bash", cmd) {
 		case "block":
 			return false, false, "blocked by user permission rule"
 		case "confirm":
@@ -254,9 +345,6 @@ func (p *BashPolicy) Validate(command string) (allowed bool, needConfirm bool, r
 
 	return true, false, ""
 }
-
-// GlobalPermissions is set by the application to enable user-defined tool permissions.
-var GlobalPermissions *Permissions
 
 func matchPattern(cmd, pattern string) bool {
 	return strings.Contains(strings.ToLower(cmd), strings.ToLower(strings.TrimSpace(pattern)))

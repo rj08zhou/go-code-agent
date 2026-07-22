@@ -3,7 +3,7 @@ package web
 import (
 	"context"
 	"fmt"
-	"go-code-agent-refactor/internal/security"
+	"go-code-agent/internal/security"
 	"io"
 	"net"
 	"net/http"
@@ -21,14 +21,20 @@ func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error
 		if lookupErr != nil || len(ips) == 0 {
 			return nil, fmt.Errorf("web: could not resolve %q: %w", host, lookupErr)
 		}
+		var chosen net.IP
 		for _, candidate := range ips {
-			if security.IsPrivateIP(candidate) && !security.AllowPrivateIPs() {
-				return nil, fmt.Errorf("web: %s resolves to blocked address %s", host, candidate)
+			if err := security.CheckDialIP(candidate); err != nil {
+				continue
 			}
+			chosen = candidate
+			break
 		}
-		ip = ips[0]
-	} else if security.IsPrivateIP(ip) && !security.AllowPrivateIPs() {
-		return nil, fmt.Errorf("web: private IP blocked: %s", ip)
+		if chosen == nil {
+			return nil, fmt.Errorf("web: %s resolves only to blocked addresses", host)
+		}
+		ip = chosen
+	} else if err := security.CheckDialIP(ip); err != nil {
+		return nil, fmt.Errorf("web: %w", err)
 	}
 
 	d := &net.Dialer{Timeout: 10 * time.Second}

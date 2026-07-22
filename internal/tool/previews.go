@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"go-code-agent-refactor/internal/security"
+	"go-code-agent/internal/security"
 )
 
 func previewWriteFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, error) {

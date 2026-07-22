@@ -2,7 +2,7 @@ package agent
 
 import (
 	"fmt"
-	"go-code-agent-refactor/internal/llm"
+	"go-code-agent/internal/llm"
 	"strings"
 	"testing"
 )
@@ -23,10 +23,13 @@ func TestMicroCompact_ClearsOldResults(t *testing.T) {
 		msgs = append(msgs, llm.ToolMessage(string(make([]byte, 200)), cid))
 	}
 
-	cleared := MicroCompact(msgs)
+	cleared, reclaimed := MicroCompact(msgs, 0)
 	// Older tool results should be cleared; recent ones kept.
 	if cleared == 0 {
 		t.Fatalf("expected some cleared, got 0")
+	}
+	if reclaimed <= 0 {
+		t.Fatalf("expected reclaimed bytes > 0, got %d", reclaimed)
 	}
 	// At least one old result should have been replaced with "[cleared: bash]"
 	foundCleared := false
@@ -47,9 +50,43 @@ func TestMicroCompact_NoOpWhenFewTools(t *testing.T) {
 		makeAssistant("", llm.ToolCall{ID: "c1", Name: "list_dir", Arguments: "{}"}),
 		llm.ToolMessage("dir listing content...", "c1"),
 	}
-	cleared := MicroCompact(msgs)
+	cleared, _ := MicroCompact(msgs, 0)
 	if cleared != 0 {
 		t.Fatalf("expected 0 cleared (only 1 tool result), got %d", cleared)
+	}
+}
+
+func TestMicroCompact_ClearAtLeastGuard(t *testing.T) {
+	// 20 tool results, each large enough to be clearable. The 5 oldest
+	// (20 - KeepRecent=15) are eligible, reclaiming ~5*185 bytes.
+	build := func() []llm.Message {
+		var msgs []llm.Message
+		msgs = append(msgs, llm.SystemMessage("system"), llm.UserMessage("task"))
+		for i := range 20 {
+			cid := fmt.Sprintf("c%d", i)
+			msgs = append(msgs, makeAssistant("", llm.ToolCall{ID: cid, Name: "bash", Arguments: "{}"}))
+			msgs = append(msgs, llm.ToolMessage(string(make([]byte, 200)), cid))
+		}
+		return msgs
+	}
+
+	// Guard higher than what can be reclaimed -> no-op, slice untouched.
+	msgs := build()
+	cleared, reclaimed := MicroCompact(msgs, 1<<20)
+	if cleared != 0 || reclaimed != 0 {
+		t.Fatalf("expected no clearing under high guard, got cleared=%d reclaimed=%d", cleared, reclaimed)
+	}
+	for _, m := range msgs {
+		if m.Role == llm.RoleTool && len(m.Content) != 200 {
+			t.Fatalf("guard should leave tool contents intact, found len=%d", len(m.Content))
+		}
+	}
+
+	// Guard below what can be reclaimed -> clears.
+	msgs = build()
+	cleared, reclaimed = MicroCompact(msgs, 100)
+	if cleared == 0 || reclaimed < 100 {
+		t.Fatalf("expected clearing above guard, got cleared=%d reclaimed=%d", cleared, reclaimed)
 	}
 }
 
