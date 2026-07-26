@@ -1,49 +1,56 @@
 # go-code-agent
 
-一个用 Go 构建的自主编程 Agent，具备多轮规划、自我反思、多 Agent 协作、持久化记忆以及 MCP（Model Context Protocol）集成能力。
+使用 Go 编写的终端自主编程 Agent：多轮规划、自我反思、多 Agent 协作、持久化记忆，以及 MCP（Model Context Protocol）集成。
+
+本项目是 CLI/REPL 应用，不是 HTTP 服务，也不是 IDE 插件。
+
+英文版见 [README.md](README.md)。
 
 ## 目录
 
 - [快速开始](#快速开始)
-- [架构](#架构)
+- [架构设计](#架构设计)
 - [执行流程](#执行流程)
-- [配置项](#配置项)
-- [文件布局](#文件布局)
+- [配置参考](#配置参考)
+- [目录结构](#目录结构)
 - [REPL 命令](#repl-命令)
 - [内置工具](#内置工具)
 - [LLM 提供商](#llm-提供商)
 - [安全模型](#安全模型)
-- [网络访问与 SSRF 防护](#网络访问与-ssrf-防护)
-- [Agentic 特性](#agentic-特性)
+- [Web 访问与 SSRF 防护](#web-访问与-ssrf-防护)
+- [Agent 能力](#agent-能力)
 - [记忆系统](#记忆系统)
 - [会话管理](#会话管理)
 - [多 Agent 协作](#多-agent-协作)
 - [MCP 集成](#mcp-集成)
 - [Token 管理](#token-管理)
-- [用量追踪](#用量追踪)
-- [依赖项](#依赖项)
+- [Usage 统计](#usage-统计)
+- [依赖](#依赖)
+- [示例工作流](#示例工作流)
 
 ---
 
 ## 快速开始
 
-### 前置条件
+### 环境要求
 
-- 已安装 Go 1.25+
-- 已配置至少一个 LLM API Key
+- Go `1.25.3`（以 `go.mod` 为准）
+- 至少一个 LLM API Key（`OPENAI_API_KEY` 或 `ANTHROPIC_API_KEY`）
+- 建议安装 Git（Teammate worktree 与可选 snapshot 依赖 Git）
 
 ### 安装
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/rj08zhou/go-code-agent.git
 cd go-code-agent
-go build -o agent ./cmd/agent/
+go mod download
+go build -o agent ./cmd/agent
 ```
 
 ### 运行
 
 ```bash
-# 默认：Anthropic (claude-*)
+# 默认：Anthropic（claude-*）
 export ANTHROPIC_API_KEY="sk-ant-..."
 ./agent
 
@@ -58,411 +65,285 @@ export OPENAI_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
 export MODEL_ID="glm-4.7-flash"
 ./agent
 
-# 忽略 MODEL_ID 前缀，强制指定提供商
-export LLM_PROVIDER="anthropic"  # openai | anthropic | gemini
+# 强制指定提供商（忽略 MODEL_ID 前缀推断）
+export LLM_PROVIDER="anthropic"  # openai | anthropic
 ./agent
 
 # 启用 LLM-as-Judge（默认配置）
 export JUDGE_ENABLED=1
 ./agent
 
-# 启用 Judge，自定义模型和阈值
+# 自定义 Judge 模型与分数阈值
 export JUDGE_ENABLED=1
 export JUDGE_MODEL=claude-haiku-4.5
 export JUDGE_MIN_SCORE=8
-./agent
-
-# 使用独立的 LLM 服务进行评判（例如更便宜/更快的模型）
-export JUDGE_ENABLED=1
-export JUDGE_PROVIDER=openai
-export JUDGE_API_KEY="<judge-api-key>"
-export JUDGE_BASE_URL="https://api.deepseek.com"
-export JUDGE_MODEL="deepseek-chat"
 ./agent
 ```
 
 ### 会话管理
 
 ```bash
-./agent                          # 恢复最近一次会话
-./agent --new-session            # 开启全新会话
-./agent --session <id>           # 恢复指定会话
+./agent --session <id>     # 恢复指定会话
+./agent --new-session      # 强制新建会话
+./agent --workdir /path/to/project
 ```
+
+默认持久化状态根目录：
+
+```text
+~/.config/go-code-agent/<basename(workdir)>/
+```
+
+可用 `--data-dir` 覆盖配置根目录（最终解析为 `{data-dir}/go-code-agent/<basename(workdir)>`）。
 
 ### 可选功能
 
 ```bash
-# LLM-as-Judge：完成后的验证
-#（完整配置示例请参考上方的"运行"章节）
-JUDGE_ENABLED=1 ./agent
+# LLM-as-Judge：完成后校验
+export JUDGE_ENABLED=1
 
-# 高风险操作启用人工确认（Human-in-the-loop）
+# 将 HITL 提升为 interactive（所有工具都需确认）
 ./agent --human
-./agent --human --human-mode auto-approve    # CI 友好模式
 
-# 写操作启用基于 git-stash 的快照/回滚
-SNAPSHOT_ENABLED=1 ./agent
+# 显式指定 HITL 模式
+./agent --human-mode=auto-approve
+
+# 危险写操作前启用 git-stash snapshot / 失败回滚
+export SNAPSHOT_ENABLED=1
+./agent
 ```
 
-**💡 Judge 配置说明**：如需详细配置（自定义模型、独立端点等），请参考[运行](#运行)章节中的完整 `export` 命令示例。
-
-所有持久化状态（会话、记忆、用量、HITL 审计、权限、命令历史）都存储在独立的**状态目录**（`DataDir`）中，默认位于用户级配置目录下，并按项目路径定位：
-
-```
-{UserConfigDir}/go-code-agent/projects/<sha256(workdir)[:16]>/
-```
-
-其中 `UserConfigDir` 在 macOS 为 `~/Library/Application Support`、Linux 为 `~/.config`、Windows 为 `%APPDATA%`。这样项目目录保持干净，且同一项目无论二进制从何处启动，都映射到同一份状态。可用 `--data-dir <path>` 或环境变量 `GO_CODE_AGENT_DATA_DIR` 覆盖。
-
-**工作目录**（`Workdir`，即 agent 编辑文件、执行命令的目录）与状态目录是分离的——通过 `--workdir <path>` 指定（默认当前目录）。
-
-会话在重启和崩溃后均可恢复。
+默认启动姿态：HITL **开启**，模式 **safe-only**，`/approve safe`（安全工具自动继续；危险工具与写文件 diff 会进入审查）。
 
 ---
 
-## 架构
+## 架构设计
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                        USER INPUT (REPL)                         │
-│   slash commands → repl_commands.go (short-circuit)              │
-│   user message  → agentLoop (memory via memory_search tool)     │
+│   slash commands → cmd/agent/repl.go                             │
+│   user message  → Runner.Run (memory recall + tool loop)         │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                ORCHESTRATION (internal/agent, loop.go)           │
-│                                                                  │
-│  Pre-round:   microCompact → tokenCheck → drain bg/inbox        │
-│  Gates:       think-gate → planning-gate → write-gate           │
-│  Reflection:  mini-reflect → strategy-change → stuck            │
-│  Termination: maxRounds → auto-lesson → judge verify            │
+│              COMPOSITION ROOT (internal/application)             │
+│  Application (process) → SessionRuntime → Build / BuildRunner    │
 └──────────────┬───────────────────────────────┬───────────────────┘
                │                               │
                ▼                               ▼
 ┌──────────────────────────┐   ┌───────────────────────────────────┐
-│  LLM PROVIDERS           │   │  TOOL DISPATCH                    │
-│  (provider_*.go)         │   │  (tool_registry + MCP)            │
+│  MODEL GATEWAY           │   │  TOOL PIPELINE                    │
+│  (internal/model)        │   │  (internal/tool)                  │
 │                          │   │                                   │
-│  openai / anthropic /    │   │  34 built-in + mcp__* tools        │
-│  gemini (stub)           │   │  security gate → HITL gate →      │
-│  + retry (exp backoff)   │   │  timeout → snapshot/rollback      │
+│  openai / anthropic      │   │  39 built-in + mcp__* tools       │
+│  role throttle + retry   │   │  validate → capability → preview  │
+│                          │   │  → HITL → timeout → sanitize      │
 └──────────────────────────┘   └────────────────┬──────────────────┘
                                                 │
                      ┌──────────────────────────┼──────────────────┐
                      ▼                          ▼                  ▼
 ┌───────────────────────┐  ┌─────────────────────┐  ┌─────────────────┐
 │  Planning             │  │  Execution          │  │  Multi-agent    │
-│  DAGScheduler +       │  │  bash / files / bg  │  │  TeamMgr + Bus  │
-│  TodoList + think     │  │  subagent           │  │  Protocols      │
+│  PlanGate + Todo +    │  │  bash / files / bg  │  │  TeammateMgr    │
+│  task DAG             │  │  explore / web_*    │  │  Bus + Protocols│
 └───────────────────────┘  └─────────────────────┘  └─────────────────┘
                                                 │
                                                 ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                       STORAGE / STATE                            │
-│  MemoryStore (evergreen + daily, BM25+vector hybrid search)     │
-│  TaskStore (file-persisted JSON) + DAG edges                    │
-│  MessageBus (JSONL inbox) + ProtocolStore (TTL)                 │
-│  HistoryStore (append-only JSONL + checkpoint compaction)       │
-│  Skills / Prompts (workspace dir) + MCP servers                 │
+│  MemoryStore (MEMORY.md + daily JSONL)                           │
+│  TaskService (file-persisted JSON) + DAG edges                   │
+│  MessageBus (JSONL inbox) + ProtocolStore                        │
+│  HistoryStore (JSONL + compression checkpoints)                  │
+│  SessionRepository (sessions.json + per-session dirs)            │
+│  Skills / Prompts + MCP servers                                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 组件所有权
+### 组件归属
 
-`AppContext`（`internal/agent/app.go`）是持有全部进程级/会话级状态的唯一
-根对象；`main.go` 只构造一次（`agent.NewApp(model, workdir, dataDir, bashValidate)`），
-其余全部通过它访问——除工具注册表外，没有任何子系统以裸包变量形式存在。
+`application.Application` 是组合根。`cmd/agent` 只负责解析参数、调用 `application.New` / `Build`，并运行 REPL。
 
-- **进程级配置**（`AppContext` 字段，由 `NewApp` 一次性构造）：`Model`、`Workdir`、`DataDir`、`System`（每会话重建）
-- **工作目录全局子系统**（`AppContext` 字段，进程生命周期内持久）：`Skills`、`MemStore`、`MCPMgr`、`PromptLoader`、`SessionManager`、`Snapshot`、`Judge`
-- **每会话**（会话切换时重新绑定，经 `SessionManager.Active()` 访问）：`TaskManager`、`DAGScheduler`、`MessageBus`、`ProtocolStore`、`HistoryStore`、`TeammateManager`
-- **编译期能力表**（包级、非实例级）：`ToolDefs` / `ToolHandlers` / `ToolSecurityMap`，由 `InitTools()` 一次性填充
+| 生命周期 | 归属 | 示例 |
+|----------|------|------|
+| 进程级 | `Application` | Gateway、provider 注册表、session repository、dataDir |
+| 会话级 | `SessionRuntime` + `BuiltRunner` | Runner、catalog、HITL、ApprovalState、MCP、team、history、tasks |
+| 单次 `Run()` | `Runner.turn`（`turnState`） | rounds、failures、readCounts、lesson/judge 计数 |
 
-生命周期由 `AppContext` 的三个方法驱动，每个都收敛了此前在 `main.go` 与
-`repl_commands.go` 之间重复的一段流程：
-- `NewApp(model, workdir, dataDir, bashValidate)` —— 一次调用构造全部工作目录全局子系统
-- `ActivateSession(sess)` —— 把 `sess` 绑定进 `SessionManager`，重建 `TeamMgr`，重新生成 `System`
-- `DeactivateActiveSession()` —— 关闭全部 teammate，把当前活跃会话落盘到记忆
+`ApprovalState` 是**会话级**对象（在 `Build` 中创建，挂在 `BuiltRunner` 上，并注入 `HITLApprovalAdapter`），不是进程全局单例。
 
 ---
 
 ## 执行流程
 
-### 单条用户消息的生命周期
+### 单条用户消息生命周期
 
 ```
 user msg
   │
-  ├─ buildSystemPrompt()         ← system.md 模板 + 技能 + 常驻记忆 + 任务
-  │      （常驻 MEMORY.md 在会话启动时加载一次；日常记忆
-  │       由模型按需通过 memory_search 工具召回）
-  │
+  ├─ 注入 memory recall（UserMessage，利于 prompt cache）
+  ├─ AgentStarted 事件
   ▼
-agentLoop(ctx, &conv)
+Runner.Run(ctx, messages, traceID)
   │
-  ├─ [preRound]
-  │    ├─ microCompact: 将旧的工具结果折叠为摘要
-  │    ├─ tokenCheck: 超过 300K tokens → autoCompact（LLM 摘要）
-  │    ├─ drain background results → 注入为工具消息
-  │    └─ drain team inbox → 注入为用户消息
-  │
-  ├─ [gates]
-  │    ├─ think-gate (round 0): 规划前强制进行纯文本深度思考（打印 `💭 深度思考` 标记）
-  │    ├─ planning-gate (round 1): 执行前强制创建任务
-  │    └─ write-gate: 文件写入前要求计划审批（teammate）
-  │
-  ├─ LLM stream call → 解析响应
-  │    ├─ 仅文本 → 检查 auto-lesson → 完成
-  │    └─ tool_calls[] → 逐一派发：
-  │         ├─ 安全检查（bash 策略、路径沙箱）
-  │         ├─ HITL 审批门控（如已启用）
-  │         ├─ 快照预状态（如已启用）
-  │         ├─ 超时包装器（5 分钟上限）
-  │         ├─ 执行处理器 → 收集结果
-  │         ├─ 输出中的密钥脱敏
-  │         └─ 失败时快照回滚（如已启用）
-  │
-  ├─ [post-dispatch]
-  │    ├─ planningGate: 首轮工具调用后检查任务是否存在
-  │    ├─ judge: 所有任务完成 + JUDGE_ENABLED → LLM 验证
-  │    └─ 反思触发器：
-  │         ├─ mini-reflect: 工具调用失败时
-  │         ├─ strategy-change: 连续失败 3 次后
-  │         ├─ stuck detection: 10 轮无进展
-  │         └─ 周期性完整反思：每 5 轮一次
-  │
-  └─ 循环直至：仅文本响应 | 达到 maxRounds(100) | 判定为 stuck
+  for each round:
+  │  ├─ prepareRound
+  │  │    丢弃已消费 nudge → max-rounds / soft-deadline 收束
+  │  │    autoCompact / microCompact → plan gate → task note → reflection
+  │  ├─ callModel
+  │  │    修复 tool_call 配对 → explore prompt budget → Stream
+  │  ├─ truncation? 合成 tool error 后 continue
+  │  ├─ 无工具? auto-lesson → judge → TurnComplete / return
+  │  └─ 有工具? executeToolBatch → afterTools（手动 compress、lesson budget）
+  ▼
+REPL 将新消息追加到 HistoryStore
 ```
 
 ### 多轮对话
 
 ```
-会话启动：
-  HistoryStore.LoadRuntime() → 从 JSONL 恢复消息
-  ↓
-每轮：
-  user input → agentLoop (N 轮) → 持久化新消息
-  ↓
-会话结束：
-  Deactivate → session_to_memory prompt → 将经验保存到 MemoryStore
+会话启动（Build）
+  → 确保 session 目录，接线 sinks（session.log、usage.jsonl）
+  → 如需恢复则加载 history
+  → 打印 REPL banner
+
+每个用户回合
+  → 排空后台通知与 inbox
+  → Runner.Run
+  → 持久化 assistant/tool 消息与可选 checkpoint
+
+会话切换 / 新建 / 归档
+  → 关闭 SessionRuntime hooks
+  → 用新选项再次 Build
 ```
 
 ---
 
-## 配置项
+## 配置参考
 
 ### 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `MODEL_ID` | `claude-opus-4.7` | 模型标识符（也可通过前缀推断提供商） |
-| `LLM_PROVIDER` | 自动推断 | 强制指定提供商：`openai` \| `anthropic` \| `gemini` |
-| `ANTHROPIC_API_KEY` | — | claude-* 系列模型必需 |
-| `ANTHROPIC_BASE_URL` | SDK 默认值 | Anthropic 网关/代理覆盖 |
-| `OPENAI_API_KEY` | — | gpt-*/o*/兼容接口必需 |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | 代理/本地模型端点 |
-| `SNAPSHOT_ENABLED` | `0` | 设为 `1` 启用基于 git-stash 的回滚 |
-| `JUDGE_ENABLED` | 未设置 | 启用 Judge（`1` / `true` / `yes` / `on`） |
-| `JUDGE_MODEL` | 主模型 | Judge 调用的模型 ID（空 = 复用主模型） |
-| `JUDGE_MIN_SCORE` | 7 | 低于此分数触发重试（1-10 分制） |
-| `JUDGE_PROVIDER` | 自动推断 | 显式指定后端 SDK（`openai` / `anthropic` / `gemini`） |
-| `JUDGE_API_KEY` | 主密钥 | 仅 Judge 使用的密钥（否则使用对应后端的常规密钥） |
-| `JUDGE_BASE_URL` | 主 URL | 仅 Judge 使用的端点（否则使用对应后端的常规 URL） |
-| `WEB_ALLOW_PRIVATE_IPS` | `0` | 设为 `1` 允许 `web_fetch`/`web_search` 访问内网/私有地址（默认拦截） |
-| `WEB_SEARCH_PROVIDER` | 自动 | 强制指定搜索后端：`tavily` \| `brave`（需配合 `WEB_SEARCH_API_KEY`）；未设置则走自动降级链 |
-| `WEB_SEARCH_API_KEY` | — | 强制指定 `WEB_SEARCH_PROVIDER` 时使用的 API Key |
-| `SEARXNG_URL` | — | 指定一个可信/自建 SearXNG 实例，单独使用而非走公共实例列表 |
-| `SEARXNG_INSTANCES` | 内置列表 | 逗号分隔，覆盖降级链中依次尝试的公共 SearXNG 实例列表 |
+| `MODEL_ID` | `claude-opus-4.7` | 模型 ID（也用于推断提供商） |
+| `LLM_PROVIDER` | 自动推断 | 强制提供商：`openai` \| `anthropic` |
+| `ANTHROPIC_API_KEY` | — | Anthropic 模型必需 |
+| `ANTHROPIC_BASE_URL` | SDK 默认 | Anthropic 网关/代理 |
+| `OPENAI_API_KEY` | — | OpenAI / 兼容接口必需 |
+| `OPENAI_BASE_URL` | SDK 默认 | 代理或本地模型端点 |
+| `LLM_MAX_QPS` | `4.0` | 进程级 LLM 请求/秒 |
+| `LLM_MAX_BURST` | `8` | 令牌桶突发容量 |
+| `LLM_MAX_CONCURRENCY` | `4` | 最大并发 LLM 调用 |
+| `SNAPSHOT_ENABLED` | 关闭 | 设为 `1` 启用 git-stash 回滚 |
+| `CONTEXT_WINDOW_TOKENS` | 模型默认 | 覆盖上下文窗口大小 |
+| `WEB_ALLOW_PRIVATE_IPS` | 关闭 | 允许 `web_*` 访问私网 IP |
+| `WEB_SEARCH_PROVIDER` | auto | `tavily` \| `brave`（需 API Key）或自动降级链 |
+| `WEB_SEARCH_API_KEY` | — | 强制搜索后端的 API Key |
+| `SEARXNG_URL` | — | 可信 SearXNG 实例 |
+| `SEARXNG_INSTANCES` | 内置列表 | 逗号分隔的 SearXNG 回退列表 |
 
-### CLI 标志
+### 命令行参数
 
-| 标志 | 默认值 | 说明 |
+| 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--session <id>` | — | 按 ID 激活指定会话 |
-| `--new-session` | false | 强制创建新会话 |
-| `--human` | false | 启用人工确认（Human-in-the-loop） |
-| `--human-mode` | interactive | `interactive` / `auto-approve` / `auto-reject` / `notify-only` |
-| `--workdir <path>` | 当前目录 | 指定 agent 编辑文件、执行命令的项目目录（`Workdir`） |
-| `--data-dir <path>` | `{UserConfigDir}/go-code-agent/projects/<hash>` | 覆盖持久化状态目录（`DataDir`） |
+| `--workdir <path>` | 当前目录 | Agent 编辑与执行命令的项目目录 |
+| `--data-dir <path>` | `~/.config`（或 `$XDG_CONFIG_HOME`） | 配置根；状态位于 `{data-dir}/go-code-agent/<project>` |
+| `--session <id>` | — | 恢复指定会话 |
+| `--new-session` | false | 强制新建会话 |
+| `--human` | false | HITL 提升为 interactive，并切换到 `/approve off` |
+| `--human-mode` | （保持默认） | `interactive` \| `safe-only` \| `auto-approve` \| `auto-reject` \| `notify-only` |
 
-### Judge 提供商解析逻辑
+### LLM-as-Judge 环境变量
 
-Judge 使用 `llm.JudgeProvider()` 在运行时动态选择 LLM 后端：
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `JUDGE_ENABLED` | 未设置 | 启用 Judge（`1` / `true` / `yes` / `on`） |
+| `JUDGE_MODEL` | 主模型 | Judge 使用的模型 ID |
+| `JUDGE_MIN_SCORE` | 7 | 低于该分数触发重试（1–10） |
+| `JUDGE_PROVIDER` | 推断 | `openai` / `anthropic` |
+| `JUDGE_API_KEY` | 主 Key | Judge 专用 Key |
+| `JUDGE_BASE_URL` | 主 URL | Judge 专用端点 |
 
-1. **未设置任何 JUDGE_* 变量** → 使用与主 Agent 相同的提供商（保持向后兼容）
-2. **设置了 JUDGE_API_KEY 或 JUDGE_BASE_URL** → 使用独立凭证创建隔离的提供商实例
-3. **仅设置了 JUDGE_PROVIDER** → 复用该后端类型的共享提供商实例
+### 可调常量（`internal/config/config.go`）
 
-这使得 Judge 可以在不同的（通常更便宜的）模型上运行，甚至使用完全独立的 LLM 服务，而不影响主 Agent 的配置。
+编译期常量（不可通过环境变量配置）。部分取值：
 
-### 可调常量（infra/consts.go）
-
-所有阈值集中在一个文件中，便于统一调整：
-
-| 分类 | 常量 | 值 | 说明 |
-|------|------|-----|------|
-| **循环** | MaxRounds | 100 | Agent 循环硬性安全上限 |
-|  | StuckThreshold | 20 | 多少轮无进展判定为 stuck |
-|  | ReflectInterval | 20 | 每 N 轮周期性反思 |
-|  | MaxConsecutiveFailures | 3 | 同一工具连续失败 → 策略变更 |
-|  | LessonThreshold | 3 | 自动总结经验最少轮数 |
-|  | SubagentMaxRounds | 30 | 子 Agent 内循环上限 |
-|  | TeammateWorkMaxRounds | 50 | Teammate 工作阶段上限 |
-|  | DefaultMaxOutputTokens | 16,384 | 每次 LLM 调用默认最大输出 token 数 |
-| **Token** | TokenThreshold | 300,000 | autoCompact 触发阈值 |
-|  | KeepRecent | 15 | microCompact 保留最近 N 条工具消息 |
-|  | MaxOutputLen | 500,000 | 每条工具输出最大字节数（500KB） |
-|  | TokenCheckInterval | 3 | 每 N 轮重新检查 token 数 |
-| **超时** | PerToolTimeout | 5 min | 每个工具处理器硬性上限 |
-|  | BashTimeout | 120s | bash / background_run 超时 |
-|  | LlmMaxRetries | 5 | LLM 调用重试次数 |
-|  | LlmBaseDelay | 1s | 指数退避基数 |
-|  | LlmRateLimitDelay | 10s | 429 专用基础退避时间 |
-|  | LlmMaxDelay | 60s | 指数退避上限 |
-|  | LlmCallTimeout | 5 min | 单次 provider Call/Stream 调用的墙钟上限 |
-|  | LlmHTTPTimeout | 6 min | 底层 HTTP 传输超时（兜底） |
-|  | LlmDefaultMaxQPS | 2.0 | 进程级 LLM 限流（每秒请求数） |
-|  | LlmDefaultMaxBurst | 4 | 令牌桶突发容量 |
-|  | LlmDefaultMaxConcurrency | 2 | 进程级最大并发 LLM 调用数 |
-|  | SpawnMinInterval | 750ms | teammate/subagent 生成之间的错峰间隔 |
-| **记忆** | MemoryTTLDays | 90 | 日常文件超过此天数自动删除 |
-|  | MaxEvergreenChars | 8,000 | MEMORY.md 注入截断长度 |
-|  | DeduplicateThreshold | 0.7 | 去重 Jaccard 相似度阈值 |
-|  | MaxMemoryContentLen | 2,000 | 每条记忆条目最大字符数 |
-| **搜索** | Bm25K1 | 1.5 | TF 饱和度参数 |
-|  | Bm25B | 0.75 | 长度归一化参数 |
-|  | HybridKeywordWeight | 0.65 | 混合合并中 BM25 权重 |
-|  | HybridVectorWeight | 0.35 | 混合合并中向量权重 |
-| **团队** | PollInterval | 5s | 空闲 teammate 收件箱轮询间隔 |
-|  | IdleTimeout | 60s | 空闲 teammate 自动关闭 |
-|  | MaxTeamMessageSize | 64 KB | 防止收件箱洪水 |
-|  | PlanRequestTTL | 30 min | 待审计划请求过期时间 |
-|  | ApprovedPlanTTL | 24h | 已批准计划过期时间 |
-| **Judge** | JudgeMinScore | 7 | 重试阈值（1-10） |
-|  | JudgeMaxRetryInjects | 2 | 验证失败最多重试次数 |
-| **规划** | PlanningGateMinTaskChars | 80 | 跳过门控的最小查询字符数 |
-|  | LessonRoundsLimit | 3 | 总结经验后额外最多轮数 |
-| **网络** | WebFetchTimeout | 20s | `web_fetch` 请求+重定向的总超时 |
-|  | WebFetchMaxBytes | 2 MB | `web_fetch` 响应体大小上限 |
-|  | WebSearchTimeout | 8s | `web_search` 降级链中每个后端的超时 |
+| 类别 | 常量 | 值 | 说明 |
+|------|------|----|------|
+| **Loop** | `MaxRounds` | 100 | Agent 循环硬上限 |
+| | `StuckThreshold` | 12 | 无进展轮数 → stuck |
+| | `ReflectInterval` | 12 | 每 N 轮周期性反思 |
+| | `MaxConsecutiveFailures` | 3 | 同工具连续失败 → 策略变更 |
+| | `LessonThreshold` | 3 | 触发 auto-lesson 的最少轮数 |
+| | `SubagentMaxRounds` | 16 | Explore 软轮数上限 |
+| | `TeammateWorkMaxRounds` | 50 | Teammate 工作阶段上限 |
+| | `DefaultMaxOutputTokens` | 16384 | 默认最大输出 token |
+| | `SubagentPromptTokenBudget` | 80000 | Explore 累计 prompt 预算 |
+| | `ExploreBudgetWarnFrac` | 0.70 | 「开始收束总结」软提示阈值 |
+| **Tokens** | `TokenThreshold` | 300000 | autoCompact 辅助上界 |
+| | `CompactionThresholdFrac` | 0.75 | 触发 compact 的上下文占比 |
+| | `MicroCompactThresholdFrac` | 0.5 | microCompact 压力门槛 |
+| | `MicroCompactMinClearBytes` | 4096 | 回收过少则跳过 microCompact |
+| | `KeepRecent` | 15 | compact 后保留的完整近期 tool 消息数 |
+| | `TokenCheckInterval` | 3 | 每 N 轮重新估算 token |
+| **Timing** | `PerToolTimeout` | 5 min | 单工具硬超时 |
+| | `BashTimeout` | 120s | bash / background_run 超时 |
+| | `LlmMaxRetries` | 5 | LLM 重试次数 |
+| | `LlmCallTimeout` | 5 min | 单次 Call/Stream 超时 |
+| | `WebFetchSubagentBudget` | 60s | Lead `web_fetch` 子代理总时限 |
+| | `WebSearchTimeout` | 25s | 搜索总预算 |
+| | `WebSearchPerBackendTimeout` | 7s | 单后端搜索上限 |
+| **Memory** | `MemoryTTLDays` | 90 | daily 文件过期清理天数 |
+| | `MaxEvergreenChars` | 8000 | MEMORY.md 注入截断 |
+| | `MaxMemoryContentLen` | 2000 | 单条记忆最大字符数 |
+| **Judge** | `JudgeMaxRetryInjects` | 2 | 校验失败最大重试注入次数 |
+| **Team** | `PollInterval` | 5s | 空闲 teammate 轮询 inbox |
+| | `IdleTimeout` | 60s | 空闲 teammate 自动关闭 |
 
 ---
 
-## 文件布局
+## 目录结构
 
 ```
 go-code-agent/
-├── cmd/agent/                    # 应用层（package main）—— 只做组装，不含业务逻辑
-│   ├── main.go                   # 入口：标志解析、依赖组装、REPL 循环、SIGINT 清理
-│   └── repl_commands.go          # 斜杠命令派发器（/session、/tasks 等）
-│
-├── internal/                     # 可复用基础设施 + Agent 引擎
-│   ├── agent/                    # Agent 引擎（package agent）
-│   │   ├── app.go                #   AppContext：根对象 + NewApp/ActivateSession/DeactivateActiveSession
-│   │   ├── loop.go               #   核心多轮执行循环（Run）
-│   │   ├── plan.go               #   Think-gate + planning-gate 逻辑
-│   │   ├── reflection.go         #   Mini-reflect、strategy-change、stuck 检测
-│   │   ├── judge.go              #   LLM-as-Judge 完成后验证器
-│   │   ├── decisions.go          #   自主决策审计轨迹（decisions.jsonl，/decisions）
-│   │   ├── compression.go        #   microCompact + autoCompact（token 管理）
-│   │   ├── subagent.go           #   `explore` 只读子 Agent 生成器（多文件调查委托，隔离上下文）
-│   │   ├── team.go               #   TeammateManager：WORK/IDLE 自治循环
-│   │   ├── tool_registry.go      #   工具定义（34+ 工具在此注册）
-│   │   ├── tool_base.go          #   基础工具处理器（bash、文件、compress 等）
-│   │   ├── web_tools.go          #   web_fetch（子代理摘要+密钥脱敏）/web_search（直连列表）工具
-│   │   ├── system_prompt.go      #   系统提示词组装（提示词从内嵌二进制加载）
-│   │   ├── security.go           #   工具安全注册表、checkToolApproval、HITL 门控 glue
-│   │   ├── snapshot.go           #   基于 git-stash 的 Saga 模式快照/回滚
-│   │   └── log_file.go           #   每会话文件日志（session.log）
-│   ├── llm/                      # LLM 抽象层
-│   │   ├── llm_types.go          #   中立类型：Message、ToolCall、ToolDef、Role
-│   │   ├── llm_client.go         #   重试包装器、trace ID、流式接口
-│   │   ├── provider.go           #   提供商注册表 + PickProvider 逻辑
-│   │   ├── provider_openai.go    #   OpenAI/兼容后端（流式 + 工具）
-│   │   ├── provider_anthropic.go #   Anthropic 后端（流式 + 工具）
-│   │   ├── provider_gemini.go    #   Gemini 占位（预留）
-│   │   └── tool_helpers.go       #   工具参数提取辅助函数（MkOk/MkErr/ParseArgs）
-│   ├── session/                  # 会话生命周期
-│   │   ├── session.go            #   每会话聚合根（拥有 task/team/history）
-│   │   └── session_manager.go    #   CRUD、BootstrapOrCreate、activate/deactivate、索引
-│   ├── history/                  # 对话持久化
-│   │   └── history.go            #   Append-only JSONL + checkpoint 压缩
-│   ├── hitlaudit/                # 人工确认 + 审计
-│   │   ├── hitlaudit.go          #   审计日志（JSONL）+ 审批门控
-│   │   └── human_approval.go     #   4 种模式审批逻辑 + 风险分类
-│   ├── security/                 # 安全原语（不依赖 internal/agent）
-│   │   ├── approval.go           #   ApprovalLevel + ApprovalState（auto/safe/danger 门控）
-│   │   ├── bash_policy.go        #   命令白名单 + 危险模式检测
-│   │   ├── path_sandbox.go       #   SecurePath：路径穿越/符号链接逃逸防护
-│   │   ├── secrets.go            #   SecretsSanitizer：脱敏 API 密钥/令牌/私钥
-│   │   ├── permissions.go        #   用户可编辑的 permissions.json（按工具+模式 allow/deny/ask）
-│   │   └── ssrf.go               #   SSRF 策略：内网/私有 IP 黑名单（详见"网络访问与 SSRF 防护"章节）
-│   ├── web/                      # web_fetch/web_search 的出站网络访问
-│   │   ├── client.go             #   SSRF 加固的 http.Client（拨号时 IP 校验、重定向防护）
-│   │   ├── fetch.go               #   web_fetch：GET + Content-Type 分发处理
-│   │   ├── html.go               #   HTML → 可读文本抽取（golang.org/x/net/html）
-│   │   └── search.go             #   Searcher 接口 + DDG/SearXNG/Tavily/Brave + 降级链
-│   ├── task/                     # 任务管理
-│   │   ├── task.go               #   TaskManager：CRUD、文件持久化
-│   │   ├── task_scheduler.go     #   DAGScheduler：拓扑排序、阶段执行
-│   │   └── todo.go               #   简易 TodoList（遗留，DAG 前）
-│   ├── team/                     # 多 Agent 基础设施
-│   │   ├── team_bus.go           #   MessageBus：每个 Agent 的 JSONL 收件箱、死信
-│   │   └── team_protocols.go     #   ProtocolStore：带 TTL 的计划审批
-│   ├── memory/                   # 持久化记忆
-│   │   └── memory.go             #   双层存储 + BM25 + 哈希向量搜索
-│   ├── mcp/                      # Model Context Protocol
-│   │   ├── mcp.go                #   MCPManager：服务器生命周期、断路器
-│   │   └── mcp_jsonrpc.go        #   JSON-RPC 2.0 over stdio 传输
-│   ├── prompt/                   # 模板引擎
-│   │   └── prompt.go             #   Loader + 渲染器（{{.Var}} 替换）
-│   ├── skill/                    # 技能系统
-│   │   └── skills.go             #   SkillLoader：读取 SKILL.md 文件
-│   ├── background/               # 后台任务运行器
-│   │   └── background.go         #   Goroutine 池 + 结果收集
-│   ├── usage/                    # Token 用量遥测
-│   │   └── usage.go              #   UsageRecorder：每次调用的 JSONL 日志
-│   └── logging/                  # 终端输出
-│       └── log.go                #   彩色输出辅助函数（system/error/tool/agent）
-│
-├── infra/                        # 横切常量
-│   └── consts.go                 # 所有可调阈值集中在此
-│
-├── embedded/                     # 编译期内置资源（package embedded）
-│   ├── embedded.go               #   //go:embed README_zh.md → Content []byte
-│   └── README_zh.md              #   根 README 的真实副本（通过 `go generate ./embedded` 刷新）
-│
-├── frontend/                     # 独立的 README 查看器（也是 /readme 命令的底层实现）
-│   ├── main.go                   #   入口：`go run ./frontend` 启动服务并打开浏览器
-│   └── server/                   #   server 包：Markdown → 带样式 HTML，临时 localhost 服务
-│
-├── utils/                        # 共享工具函数
-│   └── utils.go                  # 路径辅助函数（JoinWorkdir、Truncate 等）
-│
-├── prompts/                      # 提示词模板（*.md）→ 通过 prompts/embed.go 编译期内嵌为二进制
-│   ├── system.md                 # 主系统提示词模板（embed.go 内嵌，运行时不依赖 {workdir}/prompts/）
-│   ├── think_required.md         # Think-gate 注入内容
-│   ├── planning_required.md      # Planning-gate 注入内容
-│   ├── strategy_change.md        # Strategy-change 反思内容
-│   ├── auto_lesson.md            # 自动总结经验提示词
-│   ├── session_to_memory.md      # 会话停用 → 记忆提取
-│   ├── judge_system.md           # Judge 系统提示词
-│   ├── judge_critical.md         # Judge 关键反馈注入
-│   ├── teammate.md               # Teammate 系统提示词模板
-│   ├── todo_nag.md               # Todo 提醒注入
-│   ├── human_modify.md           # HITL 修改反馈
-│   └── human_reject.md           # HITL 拒绝反馈
-│
-├── skills/                       # 技能定义（启动时加载）
-│   ├── agent-builder/SKILL.md    # 元技能：构建 Agent
-│   ├── code-review/SKILL.md      # 代码审查方法论
-│   ├── judge/SKILL.md            # 评判/评估技能
-│   └── pdf/SKILL.md              # PDF 处理技能
-│
-├── go.mod / go.sum               # Go 模块定义
-└── （运行时状态默认不在本目录——见 `--data-dir`；若选择项目内状态，
-     原有的 `.go-code-agent/` 仍可能出现在项目根）
+├── cmd/
+│   ├── agent/
+│   │   ├── main.go              # 参数解析、Application.New、Build 循环
+│   │   └── repl.go              # Slash 命令与对话循环
+│   └── eval/
+│       └── main.go              # Eval 入口
+├── internal/
+│   ├── application/             # 组合根（Application、SessionRuntime）
+│   ├── agent/                   # Runner 循环、explore、teammate、judge、压缩
+│   ├── tool/                    # Catalog、executor、内置 handlers
+│   ├── model/                   # Gateway + provider 实现
+│   ├── hitlaudit/               # HITL manager + ApprovalAdapter
+│   ├── security/                # 路径沙箱、bash 策略、ApprovalState、SSRF、diff
+│   ├── session/                 # 会话索引与 meta.json
+│   ├── history/                 # 对话 JSONL + checkpoint
+│   ├── memory/                  # Evergreen + daily 记忆
+│   ├── task/                    # 持久化任务 DAG + TodoManager
+│   ├── team/                    # 消息总线与协议
+│   ├── mcp/                     # MCP stdio 客户端/管理器
+│   ├── web/                     # web_fetch / web_search
+│   ├── event/                   # 事件 sinks（console、audit、usage、session.log）
+│   ├── config/                  # 环境配置 + 编译期常量
+│   ├── prompt/                  # Prompt 模板
+│   ├── skill/                   # SKILL.md 加载器
+│   ├── worktree/                # Teammate git worktree
+│   ├── background/              # 后台任务监管
+│   ├── store/                   # 原子写文件
+│   ├── llm/                     # 共享 LLM 消息类型
+│   ├── logging/                 # 结构化日志
+│   ├── utils/                   # 终端与辅助函数
+│   └── eval/                    # 回归评估辅助
+├── prompts/                     # 可选 prompt 覆盖
+├── skills/                      # 示例工作区 skills
+├── go.mod
+├── README.md
+└── README_zh.md
 ```
 
 ---
@@ -471,336 +352,204 @@ go-code-agent/
 
 | 命令 | 说明 |
 |------|------|
-| `/session` | 列出所有会话及其状态和最后活跃时间 |
-| `/session new [title]` | 创建并切换到新会话 |
-| `/session switch <id>` | 切换到已有会话（停用当前会话） |
-| `/session rename [id] <title>` | 重命名会话 |
-| `/session archive [id]` | 归档会话（从活跃列表中移除） |
-| `/compact` | 手动触发对话压缩（LLM 摘要） |
-| `/tasks` | 列出当前会话中所有任务及其状态 |
-| `/dag` | 展示 DAG 执行计划（拓扑阶段）。互不相关的任务批次（互不连通的分量）会被拆分为各自独立、带标签的 `Workflow`，每个 `Workflow` 内给出确定性的执行顺序 |
-| `/decisions` | 显示当前会话的自主决策审计轨迹（decisions.jsonl） |
-| `/team` | 列出活跃 teammates 及其状态（WORK/IDLE） |
-| `/inbox` | 读取主导 Agent 的收件箱消息 |
-| `/memory` | 显示记忆统计（常驻字符数、日常文件数、条目数） |
-| `/search <query>` | 用混合 BM25+向量搜索记忆 |
-| `/mcp` | 列出已连接的 MCP 服务器及其工具 |
-| `/mcp connect <name> <cmd>` | 运行时连接新的 MCP 服务器 |
-| `/mcp disconnect <name>` | 运行时断开某个 MCP 服务器 |
-| `/usage` | Token 用量汇总（按来源、模型、会话） |
-| `/approve [safe\|danger\|off]` | 切换工具调用的自动审批级别 |
-| `/security` | 显示当前安全配置状态 |
-| `/security test-bash <cmd>` | 对某条命令试跑 bash 白名单/危险模式检测 |
-| `/readme` | 启动 README 查看器并在浏览器中打开 `README_zh.md`（内容在编译时已嵌入二进制，无需磁盘文件） |
+| `/help` | 显示命令帮助 |
+| `/session` | 当前会话信息 |
+| `/session list` | 列出会话 |
+| `/session switch <id>` | 切换会话（重建 runtime） |
+| `/session new` | 新建会话 |
+| `/session rename <title>` | 重命名当前会话 |
+| `/session archive` | 归档当前会话 |
+| `/tasks` | 渲染短期 Todo |
+| `/dag` | 显示持久化任务 DAG |
+| `/task clear\|reset` | 清理已完成 / 清空全部任务 |
+| `/memory` | 记忆统计 |
+| `/mcp` | 列出 MCP 服务器 |
+| `/mcp pending` / `approve <name>` | 待批准 MCP |
+| `/mcp connect` / `disconnect` | 运行时连接/断开 MCP |
+| `/team` | 列出 / 拉起 / 关闭 / 发消息给 teammate |
+| `/inbox` | 读取 lead inbox |
+| `/judge` | 开关 LLM-as-Judge |
+| `/hitl [mode]` | 开关或设置 HITL 模式 |
+| `/approve [off\|safe\|danger]` | 审批预设（并同步 HITL） |
+| `/permissions [reload]` | 查看 / 重载 permissions.json |
+| `/security` | 安全状态 |
+| `/security test-bash <cmd>` | 干跑 bash 策略 |
+| `/decisions` | 最近决策日志 |
+| `/usage` | Token 用量汇总 |
+| `/compact` | 手动压缩上下文 |
+| `/search <query>` | 一次性 web 搜索 |
+| `/exit` `/quit` | 退出 |
 
 ---
 
-### `/readme` — 在浏览器中查看 README
-
-`/readme` 会启动一个本地查看器，把 `README_zh.md` 渲染成带样式的网页（标题取自文档首个 `#`，支持代码块/表格/引用等），并在默认浏览器中打开。服务器绑定在 `127.0.0.1` 的临时端口上，仅在本地可访问；每次请求都会重新渲染，刷新即可看到文档改动。
-
-**文档已嵌入二进制**：`README_zh.md` 在编译时通过 `//go:embed` 打包进 `agent` 可执行文件（见 `embedded/` 包），因此 `/readme` 不依赖运行时磁盘上的文件——即使从任意目录启动、甚至删除了 `README_zh.md`，也能正常显示。
-
-- 重复执行 `/readme` 会复用/回收上一个查看器，不会泄漏端口；退出 Agent 时服务器随之关闭。
-- 在无界面/远程机器上浏览器可能无法自动打开，但终端会打印 URL，可手动复制打开。
-- 同一个查看器也可作为独立前端项目运行：`go run ./frontend`（位于 `frontend/`，核心逻辑在 `frontend/server` 包，使用 `blackfriday/v2` 渲染 Markdown）。
-
-> 注意：嵌入的是 `embedded/README_zh.md` 的一份**真实副本**（Go 的 `//go:embed` 不支持 `..` 且拒绝符号链接）。修改根目录 `README_zh.md` 后请执行 `go generate ./embedded` 同步副本。
-
 ## 内置工具
+
+39 个内置工具（目录顺序稳定，利于 prompt cache），外加动态 `mcp__*` 工具。
 
 ### 核心（文件与 Shell）
 
 | 工具 | 说明 |
 |------|------|
-| `bash` | 执行 Shell 命令（白名单门控，120s 超时） |
-| `read_file` | 读取文件内容，可指定行数限制（优化：缓冲读取，内存高效） |
-| `write_file` | 创建/覆盖文件（显示 diff 预览） |
-| `edit_file` | 搜索/替换式精确编辑（优化：逐行处理，< 500KB 文件显示 diff） |
-| `delete_file` | 删除文件（启用 HITL 时需要确认） |
+| `read_file` / `list_dir` | 读文件 / 列目录 |
+| `search_file` / `search_content` | 按文件名 / 内容搜索 |
+| `write_file` / `edit_file` / `insert_file` / `delete_file` | 变更（启用时带 diff preview） |
+| `bash` | 前台 Shell（超时 + 策略） |
+| `background_run` / `check_background` | 后台任务 |
 
-**性能优化**：
-- `read_file`：使用 `bufio.Scanner` 逐行读取，内存高效；到达行数限制时提前停止。
-- `edit_file`：逐行处理文件，而非一次性加载整个文件到内存。仅对 < 500KB 的文件生成 diff 预览，避免大文件性能下降。
-- 两个工具均使用动态缓冲区分配和提前退出策略以获得最佳性能。
-
-### 推理
+### 推理 / Meta
 
 | 工具 | 说明 |
 |------|------|
-| `compress` | 手动触发上下文压缩 |
-
-> **深度思考**：`think` 工具已移除。Agent 现在以纯文本进行结构化深度思考（带权衡分析），并在每轮推理前打印 `💭 深度思考` 暗色分隔标记呈现给用户，不再占用工具调用。
+| `explore` | 隔离只读探索子代理 |
+| `compress` | 请求对话压缩 |
+| `load_skill` | 加载工作区 skill |
 
 ### 规划与任务
 
 | 工具 | 说明 |
 |------|------|
-| `TodoWrite` | 快速待办清单（简单扁平列表） |
-| `task_create` | 创建带元数据的结构化任务 |
-| `task_get` | 按 ID 获取任务详情 |
-| `task_update` | 更新任务状态/描述 |
-| `task_list` | 列出所有任务，可按状态过滤 |
-| `task_add_dep` | 添加依赖边（A 必须在 B 之前完成） |
-| `task_remove_dep` | 移除依赖边 |
-| `task_ready` | 列出所有依赖已满足的任务 |
-| `task_dag` | 以拓扑阶段形式渲染完整 DAG |
-
-### 子 Agent 与技能
-
-| 工具 | 说明 |
-|------|------|
-| `explore` | 委托多文件调查给只读子 Agent（30 轮上限）。子 Agent 在自身隔离上下文中读文件/跑安全 shell，只回传简洁摘要，原始文件内容不进入主 Agent 上下文——适合架构梳理、跨多文件的调用链追踪等需要阅读大量源码的场景 |
-| `load_skill` | 将技能定义加载到上下文中 |
-
-### 后台执行
-
-| 工具 | 说明 |
-|------|------|
-| `background_run` | 在后台运行长时间命令（非阻塞） |
-| `check_background` | 检查后台任务的状态/输出 |
-
-### 网络访问
-
-| 工具 | 说明 |
-|------|------|
-| `web_fetch` | 抓取公开 URL 并返回**简洁摘要**（HTML → 纯文本后交由只读子 Agent 消化，原始页面内容不进入主 Agent 上下文；默认拦截内网/私有地址）。可选 `prompt` 参数可指定子 Agent 针对具体问题回答 |
-| `web_search` | 通过零配置降级链（SearXNG → DuckDuckGo）搜索网络，或使用配置的付费后端（Tavily/Brave）。**直连**返回紧凑的 title/url/snippet 列表，主 Agent 需要看到 URL 以决定下一步 fetch |
-
-这两个工具背后的安全模型详见[网络访问与 SSRF 防护](#网络访问与-ssrf-防护)章节。
+| `TodoWrite` | 短期清单 |
+| `task_create` / `task_list` / `task_update` / `task_get` | 持久化任务 |
+| `task_add_dep` / `task_remove_dep` / `task_ready` / `task_dag` / `claim_task` | DAG 调度 |
 
 ### 多 Agent 协作
 
 | 工具 | 说明 |
 |------|------|
-| `spawn_teammate` | 创建具有特定角色的新 teammate Agent |
-| `list_teammates` | 列出所有 teammates 及其状态 |
-| `send_message` | 向指定 teammate 发送消息 |
-| `read_inbox` | 读取主导 Agent 收件箱中的消息 |
-| `broadcast` | 向所有活跃 teammates 发送消息 |
-| `shutdown_request` | 请求 teammate 优雅关闭 |
-| `plan_approval` | 批准/拒绝 teammate 的执行计划 |
-| `claim_task` | Teammate 从 DAG 中认领一个就绪任务 |
+| `spawn_teammate` / `list_teammates` | 生命周期 |
+| `send_message` / `read_inbox` / `broadcast` | 消息 |
+| `shutdown_request` / `plan_approval` / `submit_plan` | 协议 |
 
 ### 记忆
 
 | 工具 | 说明 |
 |------|------|
-| `memory_write` | 写入一条记忆条目（常驻或日常） |
-| `memory_search` | 按查询搜索记忆 |
-| `memory_delete` | 按 ID 删除记忆条目 |
-| `session_save_memory` | 提取会话经验并保存到记忆 |
+| `memory_write` / `memory_search` / `memory_delete` / `memory_stats` | 长期记忆 |
+| `session_save_memory` | 归档会话收获 |
+
+### Web 访问
+
+| 工具 | 说明 |
+|------|------|
+| `web_fetch` | 通过隔离子代理抓取 URL（仅 `web_fetch` + `web_search`） |
+| `web_search` | 多后端搜索与回退 |
 
 ### MCP（动态）
 
-MCP 工具在服务器连接时动态注册为 `mcp__<server>__<tool>`，遵循与内置工具相同的安全/HITL/超时流程。
+MCP 服务器启动/批准后，以 `mcp__<server>__<tool>` 形式注册到会话工具目录。
 
 ---
 
 ## LLM 提供商
 
-| 提供商 | 状态 | 流式 | 工具调用 | 模型 |
-|--------|------|------|----------|------|
-| Anthropic | 完整 | ✅ SSE | ✅ 原生 | claude-*（opus、sonnet、haiku） |
-| OpenAI | 完整 | ✅ SSE | ✅ 原生 | gpt-*、o*、任何兼容端点 |
-| Gemini | 占位 | ❌ | ❌ | gemini-*（预留） |
+支持的后端：
+
+- Anthropic API（`anthropic-sdk-go`）
+- OpenAI API 及 OpenAI 兼容端点（`openai-go`）
 
 ### 提供商选择逻辑
 
-```
-LLM_PROVIDER 环境变量已设置？
-  → 是：直接使用该提供商
-  → 否：从 MODEL_ID 前缀推断：
-           "claude-*"  → anthropic
-           "gemini-*"  → gemini
-           其他         → openai（覆盖 gpt-*、o*、兼容接口）
-```
+1. 若设置了 `LLM_PROVIDER` 则使用它
+2. 否则根据 `MODEL_ID` 前缀与可用 Key 推断
+3. Gateway 上按角色限流（`lead`、`explore`、`teammate`、`judge`）
 
 ### 重试策略
 
-所有提供商共享相同的重试包装器：
-- **最大重试次数**：5
-- **退避策略**：指数退避（1s → 2s → 4s → 8s → 16s 上限 60s）
-- **可重试**：429（速率限制）、500/502/503（服务器错误）、网络超时
-- **不可重试**：400（错误请求）、401（认证失败）、404
+指数退避，并对限流单独处理（`LlmMaxRetries`、`LlmBaseDelay`、`LlmRateLimitDelay`、`LlmMaxDelay`），另有单次调用与 HTTP 超时。
 
 ---
 
 ## 安全模型
 
-四层独立防护，默认全部启用：
+围绕工具执行的多层防护。
 
 ### 1. Bash 策略（命令白名单）
 
-```
-用户查询 → Agent 调用 bash("rm -rf /") →
-  BashPolicy.Validate(cmd):
-    ├─ 白名单检查（ls、cat、grep、go、git 等）
-    ├─ 危险模式检测（rm -rf、sudo 等）
-    ├─ 如果危险 + HITL 已启用 → 提示审批
-    └─ 如果被阻止 → 拒绝并附上解释
-```
+常见安全命令白名单，外加危险模式的 deny/confirm 正则（如 `rm -rf /`、提权、危险 git 等）。
 
 ### 2. 路径沙箱
 
-- 阻止访问敏感路径：`.ssh/`、`.aws/`、`.gnupg/` 等
-- 防止符号链接逃逸（检查前解析真实路径）
-- 所有文件工具（read/write/edit/delete）均经过此门控
+`security.SecurePath` 将文件操作限制在 workdir / 允许根内。工作区内的绝对路径会被正确保留（已处理 Go 1.25 `filepath.Join` 对绝对段的行为）。
 
-### 3. 工具审批级别
+### 3. 审批级别与 HITL
 
-| 级别 | 行为 |
+两套协作组件：
+
+| 组件 | 作用 |
 |------|------|
-| `auto`（默认） | 只读/自动批准类工具无需确认直接执行；安全级和危险级工具仍需确认 |
-| `safe` | 仅"安全"类工具自动执行；危险级工具仍需确认 |
-| `danger`（别名 `all`） | **所有**工具（含破坏性工具）全部无需确认直接执行——最宽松级别（请谨慎使用） |
-| `off`（别名 `reset`） | 所有工具都需要手动确认（关闭自动审批） |
+| `security.ApprovalState` | 会话 `/approve` 姿态：`off` / `safe` / `danger`；控制自动放行与是否展示 diff preview |
+| `hitlaudit.HITLManager` | 交互模式：`safe-only`、`interactive`、`auto-approve`、`auto-reject`、`notify-only` |
 
-运行时使用 `/approve [level]` 切换。
+`HITLApprovalAdapter` 将二者适配为 executor 使用的 `tool.ApprovalChecker`（含分块 diff 确认）。
 
-### 4. 密钥脱敏器
+### 4. 密钥脱敏
 
-扫描所有工具输出，匹配以下模式：
-- API 密钥（`sk-*`、`key-*`、Bearer 令牌）
-- AWS 凭证、私钥
-- 含密码的数据库连接字符串
-- 通用 `password=`、`secret=` 模式
+工具输出在返回模型 / 写入日志前会做脱敏。
 
-检测到的密钥在添加到对话上下文之前被替换为 `[REDACTED]`。
+### 其他安全能力
 
-### 额外安全特性
-
-- **Diff 预览**：任何文件修改前在终端显示统一 diff。当自动审批完全开启（`/approve danger`/`all`）时，逐块 diff 预览也会一并跳过——该模式表示完全信任、用于非交互式运行，此时冗长 diff 只会变成噪声
-- **HITL 审批**：4 种模式（interactive/auto-approve/auto-reject/notify-only）
-- **快照/回滚**：基于 git-stash 的 Saga 模式，用于写工具（通过 `SNAPSHOT_ENABLED=1` 选择启用）
-- **每工具超时**：5 分钟硬性上限，防止挂起的处理器冻结 REPL
-- **用户权限规则**：`{dataDir}/permissions.json` 支持按"工具+模式"配置 allow/deny/ask（例如允许 `git commit -m *` 但拒绝 `git push --force*`）——该规则层位于 bash 硬性危险模式黑名单**之后**，因此用户的 `allow` 规则永远无法复活被黑名单禁止的命令。默认 `dataDir` 为用户级状态目录（见 `--data-dir`），**不在**项目目录内。可用 `/permissions`、`/permissions reload` 查看/热重载。
+- 写文件工具的 diff preview（`/approve danger` 时跳过）
+- 可选 git snapshot + 失败回滚（`SNAPSHOT_ENABLED=1`）
+- 决策审计日志（`decisions.jsonl`）
+- 会话事件日志（`session.log`）
+- 权限规则文件（dataDir 下的 `permissions.json`）
 
 ---
 
-## 网络访问与 SSRF 防护
+## Web 访问与 SSRF 防护
 
-`web_fetch` 和 `web_search` 工具（见[内置工具](#内置工具)）是 Agent 唯一能访问公共互联网的途径。两者都统一经过同一个 SSRF 加固的 HTTP 客户端（`internal/web/client.go`），因此下面的安全保证不依赖具体工具如何处理返回结果。
+### 默认拒绝私网
 
-### 默认拦截内网访问
-
-每个出站连接都在**真正建立连接时、针对实际解析出的 IP** 做校验（而非仅检查 hostname 字符串）——这正是防御 DNS rebinding 攻击的关键：域名的 DNS 解析结果可能在"首次检查时看起来安全"和"实际连接时指向内网"之间发生变化。
-
-| 地址空间 | 默认行为 | 放开方式 |
-|----------|----------|----------|
-| 环回地址（`127.0.0.0/8`、`::1`）、RFC1918 私有网段（`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`），以及项目安全规则中额外点名的 `9.*`/`11.*`/`21.*`/`30.*` | 拦截 | `WEB_ALLOW_PRIVATE_IPS=1` |
-| 链路本地/云元数据地址（`169.254.0.0/16`、`fe80::/10`）—— 真实 SSRF 攻击实际瞄准的地址空间（例如通过 `169.254.169.254` 窃取云 IAM 凭证） | **始终拦截** | 无放开选项——永不可 opt-out |
-
-额外防护：重定向最多跟随 5 跳，且拒绝跳转到非 `http(s)` 协议的地址；响应体通过 `io.LimitReader` 读取（不会先整体读入内存），默认上限 `WebFetchMaxBytes`（2 MB）。
+除非启用 `WEB_ALLOW_PRIVATE_IPS`，否则 `web_fetch` / `web_search` 会拦截私网 / 链路本地 / 元数据地址。
 
 ### web_search 降级链
 
-`web_search` 无需任何配置即可使用：
-
-```
-是否设置了 WEB_SEARCH_PROVIDER=tavily|brave 且配置了 WEB_SEARCH_API_KEY？
-  → 是：只使用该后端（用户明确配置的付费后端不会被自动降级覆盖）
-  → 否：1. 若配置了 SEARXNG_URL（可信/自建实例），单独尝试
-        2. 否则依次尝试内置的公共 SearXNG 实例列表
-           （或 SEARXNG_INSTANCES 覆盖的列表）
-        3. 最终兜底 DuckDuckGo Lite（零 key，始终可用）
-        4. 全部失败 → 明确报错，绝不静默返回空结果
-```
+在配置的 API 提供商与 SearXNG 实例间自动降级；有总预算与单后端超时，避免一个挂起的后端拖死整条链路。
 
 ### 不可信内容处理
 
-`web_fetch` 现在采用**子代理隔离**模式：页面由只读 `web_fetch` 子代理拉取并消化，**原始页面内容不进入主 Agent 上下文**，子代理只回传简洁摘要（模仿用轻量模型消化网页的做法，既节省上下文也降低注入面）。可选的 `prompt` 参数可让子代理针对具体问题作答。两个工具的输出都会经过与 bash/文件工具相同的 `SecretsSanitizer` 脱敏处理，因为抓取到的页面可能反射出看起来像凭证的文本。
+抓取页面会标记为不可信内容、限制体积，并在注入模型前清洗明显密钥。
 
 ---
 
-## Agentic 特性
+## Agent 能力
 
-### Think → Plan → Act → Reflect 循环
+### Think → Plan → Act → Reflect
 
-```
-Round 0:  [think-gate] → 强制 Agent 先进行纯文本深度思考（打印 `💭 深度思考` 标记）
-Round 1:  [planning-gate] → 强制创建任务（如果查询 > 80 字符）
-Round 2+: [execution] → Agent 执行任务
-每 5 轮:  [periodic reflection] → Agent 回顾进展
-失败时:   [mini-reflect] → 对工具失败立即反思
-3 次后:   [strategy-change] → 强制策略转向
-10 轮后:  [stuck detection] → 通知 Agent 已卡住
-100 轮:   [maxRounds] → 硬性停止
-```
+- 复杂任务时，plan gate 会在早期轮次推动使用规划类工具
+- Reflection 注入 stuck / 失败 / todo-nag 提示
+- 重复相同 tool call 与 explore 重读会受到限制
 
-> **深度思考机制**：原 `think` 工具已移除。Agent 改为以纯文本进行结构化思考（含权衡分析），在每轮 LLM 推理前打印暗色 `💭 深度思考` 分隔标记，渲染为「深度思考」区块呈现给用户。多文件/架构级调查应直接委托 `explore` 子代理，而非手动 `list_dir`/`bash` 遍历（详见[系统提示词 Exploration Strategy](#agentic-特性)）。
+### DAG 调度
 
-### DAG 调度器
+带依赖边的持久化任务（`task_*` 工具）。就绪任务可被认领；`/dag` 展示拓扑与进度。
 
-任务可以有依赖边，形成有向无环图（DAG）：
+### Auto-Lesson
 
-```
-task_create("设计 API")     → T1
-task_create("实现 API")     → T2
-task_create("编写测试")     → T3
-task_add_dep(T2, T1)          → T2 依赖于 T1
-task_add_dep(T3, T2)          → T3 依赖于 T2
-
-task_dag() 输出：
-  Stage 0: [T1: 设计 API]
-  Stage 1: [T2: 实现 API]
-  Stage 2: [T3: 编写测试]
-```
-
-调度器提供 `task_ready` 来列出所有依赖已完成的任务，使得 teammates 可以并行执行。
-
-### 自动总结经验
-
-完成工作后（≥3 轮工具调用），Agent 会被提示将经验教训写入记忆。这些经验通过混合搜索在 future 会话中被召回，实现跨会话学习。
+轮数足够后，lead（具备 memory 能力）可能被提示通过 `memory_write` 记录经验。
 
 ### LLM-as-Judge
 
-当设置了 `JUDGE_ENABLED` 时：
-1. Agent 完成所有任务
-2. 第二次 LLM 调用评估："Agent 是否真正达成了用户的目标？"
-3. 评分 1-10；低于阈值（默认 7）→ 注入关键反馈 → Agent 重试
-4. 每次 agentLoop 运行最多 2 次重试注入，防止无限循环
+可选的完成后校验。低分会注入重试反馈，最多 `JudgeMaxRetryInjects` 次。
 
 ---
 
 ## 记忆系统
 
-### 双层架构
+### 两层架构
 
-```
-┌─────────────────────────────────────────┐
-│  常驻层（MEMORY.md）                     │
-│  - 长期事实、偏好                        │
-│  - 注入到每条系统提示词                   │
-│  - 最多 8000 字符（超出则截断）          │
-│  - 通过 memory_write 手动写入           │
-└─────────────────────────────────────────┘
+| 层级 | 存储 | 用途 |
+|------|------|------|
+| Evergreen | `MEMORY.md` | 稳定偏好 / 事实 |
+| Daily | `daily/YYYY-MM-DD.jsonl` | 带 TTL 清理的短期笔记 |
 
-┌─────────────────────────────────────────┐
-│  日常层（memory/daily/*.jsonl）          │
-│  - 带时间戳的条目                       │
-│  - 90 天 TTL（自动删除）                │
-│  - 可通过混合搜索检索                   │
-│  - 由会话经验自动填充                   │
-└─────────────────────────────────────────┘
-```
+### 搜索与去重
 
-### 混合搜索
+写入时用 Jaccard 相似度去重；超过 `MemoryTTLDays` 的 daily 文件会在 Store 初始化时清理。
 
-记忆召回使用双信号合并：
+### 自动召回
 
-1. **BM25 关键词搜索**（权重 0.65）：基于 TF-IDF 的评分，可配置 k1/b 参数
-2. **哈希向量相似度**（权重 0.35）：基于随机投影的词袋模型，用于语义近似
-
-两个评分在加权合并前均归一化到 [0,1]。结果会去重（Jaccard > 0.7），Top-3 在每次 LLM 调用前注入系统提示词。
-
-### 自动召回流程
-
-```
-用户消息 → 提取关键词 → 混合搜索 → Top-3 结果
-  → 作为"相关记忆："段落注入系统提示词
-  → LLM 看到来自过往会话的上下文
-```
+每个用户回合会把相关记忆以一条 `UserMessage`（“Relevant memory: …”）注入一次，从而保持 system 块稳定、利于 prompt cache。
 
 ---
 
@@ -808,38 +557,17 @@ task_dag() 输出：
 
 ### 生命周期
 
-```
-SessionManager.BootstrapOrCreate(forceNew, explicitID)
-  → forceNew（且无显式 id）：NewSession("New session")
-  → 否则：BootstrapSession 解析 显式 id > 最近活跃 > 全新会话
-  → NewSession 创建目录：{dataDir}/sessions/<uuid>/
-    子目录：tasks/、team/、history/、transcripts/
-  │
-AppContext.ActivateSession(session)
-  → SessionManager.Activate：绑定 session，落盘为索引中的活跃会话
-  → 用该会话的 Bus/TaskMgr/DagSched/Protocols 重建 TeammateManager
-  → 为当前活跃会话重新生成 System（系统提示词）
-  │
-Work（多轮）
-  → 历史以 JSONL 追加（每次写入 fsync）
-  → 任务以 JSON 文件持久化
-  │
-AppContext.DeactivateActiveSession()
-  → ShutdownTeammates：关闭所有运行中的 teammate
-  → SessionManager.Deactivate：session_to_memory 提示词提取经验，
-    保存到 MemoryStore，更新会话索引（最后活跃时间戳）
-  │
-Archive(session)
-  → 在索引中标记为已归档
-  → 数据保留但从 /session 列表中隐藏
-```
+1. `Application.New` 创建进程级服务与 dataDir
+2. `Build` 解析/创建会话，确保会话目录，装配 `BuiltRunner`
+3. REPL 运行直到退出或切换会话
+4. 切换 / 新建 / 归档会关闭 hooks 并重新 Build
 
 ### 历史持久化
 
-- **格式**：Append-only JSONL（每行一个 JSON 对象）
-- **崩溃安全**：每次写入后 fsync；恢复时修剪尾部悬挂的 tool_calls
-- **压缩**：基于 Checkpoint —— 当 autoCompact 运行时，它写入一个包含 LLM 摘要的 checkpoint 条目，随后的 LoadRuntime 从最新 checkpoint 开始
-- **类型**：system、user、assistant、tool、checkpoint
+- 追加写入 `history/history.jsonl`
+- 压缩时把完整 transcript 存到 `transcripts/`，并写入可恢复的 checkpoint
+- `session.log`（JSONL 事件）、`usage.jsonl`、`decisions.jsonl` 位于会话目录
+- 索引：`{dataDir}/sessions.json`；元数据：`{dataDir}/sessions/<id>/meta.json`
 
 ---
 
@@ -847,43 +575,15 @@ Archive(session)
 
 ### TeammateManager
 
-每个 teammate 是一个自治 Agent，拥有自己的：
-- 对话上下文（与主导 Agent 分离）
-- WORK/IDLE 状态机
-- 收件箱（通过 MessageBus）
-- 对共享 TaskManager 和 DAGScheduler 的访问权
+拉起 teammate，可选独立 git worktree，共享消息总线，并复用与 lead 相同的 HITL/approval adapter。
 
-### 状态机
+### 通信
 
-```
-IDLE ──(收到消息)──→ WORK
-  │                            │
-  │ (IdleTimeout=60s)          │ (任务完成 / 无更多工作)
-  ▼                            ▼
-SHUTDOWN                     IDLE
-```
+通过 `team.MessageBus` 的 JSONL inbox。协议辅助覆盖 shutdown 请求与 plan approval。
 
-### 通信协议
+### Explore 子代理
 
-```
-主导 Agent ──send_message──→ Teammate 收件箱（JSONL）
-主导 Agent ──broadcast────→ 所有 teammate 收件箱
-Teammate ──send_message──→ 主导 Agent 收件箱
-Teammate ──plan_approval──→ ProtocolStore（TTL=30min）
-主导 Agent ──plan_approval──→ 批准/拒绝（TTL=24h）
-```
-
-### 计划审批协议
-
-Teammates 在执行写操作前必须提交执行计划：
-1. Teammate 创建计划 → 存储在 ProtocolStore 中，TTL 30 分钟
-2. 主导 Agent 在收件箱中收到通知
-3. 主导 Agent 通过 `plan_approval` 工具审查并批准/拒绝
-4. Teammate 仅在批准后继续
-
-### DAG 感知自动认领
-
-空闲的 teammates 自动从共享 DAG 面板中认领就绪任务（依赖已满足），无需显式的主导 Agent 协调即可实现并行执行。
+只读向隔离，带 prompt/token 预算与 soft-deadline 收束；工具集受限（不能任意写文件/写记忆）。
 
 ---
 
@@ -891,136 +591,84 @@ Teammates 在执行写操作前必须提交执行计划：
 
 ### 配置
 
-在工作区根目录创建 `.mcp.json`：
+工作区 `.mcp.json` 和/或 `MCP_SERVERS` 风格配置（以 manager 当前 schema 为准）。不受信服务器可能需要 `/mcp approve`。
 
-```json
-{
-  "servers": {
-    "my-server": {
-      "command": "node",
-      "args": ["path/to/server.js"],
-      "env": {"API_KEY": "value"}
-    },
-    "python-tools": {
-      "command": "python",
-      "args": ["-m", "my_mcp_server"],
-      "env": {}
-    }
-  }
-}
-```
+### 工作方式
 
-### 工作原理
+1. Manager 启动 stdio MCP 服务器
+2. 工具以**追加**方式合并进会话 `ToolCatalog`（排在 builtins 之后，顺序保持稳定）
+3. 可通过 REPL 运行时 connect/disconnect
 
-1. 启动时，`MCPManager` 读取 `.mcp.json` 并作为子进程启动每个服务器
-2. 通过 stdio（stdin/stdout）上的 JSON-RPC 2.0 进行通信
-3. 通过 `initialize` + `tools/list` 调用发现服务器能力
-4. 工具在工具注册表中注册为 `mcp__<server>__<tool>`
-5. 它们经过与内置工具相同的安全/HITL/超时流程
+### 熔断 / 安全提示
 
-### 断路器
-
-每个 MCP 服务器都有一个断路器：
-- **CLOSED**（正常）：调用正常通过
-- **OPEN**（连续失败 3 次后）：调用拒绝，进入 30 秒冷却
-- **HALF-OPEN**（冷却后）：下一次调用为探测；成功 → CLOSED，失败 → OPEN
-
-### 运行时管理
-
-```
-/mcp                        # 列出所有服务器 + 状态 + 工具数量
-/mcp connect <name> <cmd>   # 运行时连接新服务器
-```
+失败服务器会在 `/mcp` 中展示；工具名带 `mcp__` 前缀便于归因。第三方 MCP 工具应视为扩大后的能力面，仍受 HITL / 路径 / 网络等闸门约束（在适用处）。
 
 ---
 
 ## Token 管理
 
-### microCompact（每轮）
+### microCompact（压缩门控）
 
-将旧的工具结果消息折叠为简短摘要，仅保留最近 N 条（默认 15 条）完整内容。这防止了长时间使用工具期间上下文无限增长。
+仅当估算用量超过上下文窗口的 `MicroCompactThresholdFrac`，且至少能回收 `MicroCompactMinClearBytes` 时，才清理旧 tool 结果——避免短会话无谓打爆 prompt cache。
 
 ### autoCompact（阈值触发）
 
-当估计的总 token 数超过 300K 时：
-1. 将完整对话发送给 LLM，附带"总结"指令
-2. 用一条 checkpoint 消息替换所有消息（system + 最近除外）
-3. Checkpoint 持久化到历史 JSONL 以供崩溃恢复
-4. Token 数量急剧下降；Agent 在完整上下文感知下继续
+需要压缩时（窗口占比 / explore 阈值）：
+
+1. 将完整 transcript 保存到 `transcripts/`
+2. 用 LLM 总结较早轮次
+3. 保留近期轮次，并使缓存的 token 估算失效
+4. 写入 history checkpoint 以便恢复
+
+### Explore 预算
+
+Explore 子代理跟踪累计 prompt token，接近 70% 时注入 budget-warn，硬预算或 soft deadline 到达时以无工具总结收束。
 
 ### Token 估算
 
-使用简单启发式：`len(content) / 4`（近似 GPT tokenization）。每 3 轮重新检查一次，避免每次迭代都产生 O(N) 开销。
+用 `EstimateRequestTokens` 做启发式估算，按间隔刷新而非每轮都算。
 
 ---
 
-## 用量追踪
+## Usage 统计
 
-每次 LLM 调用都记录到 `memory/usage.jsonl`，包含：
+LLM 调用会追加到 `{sessionDir}/usage.jsonl`，并同时向 event sinks 发送 usage 事件。
 
-| 字段 | 说明 |
-|------|------|
-| `trace_id` | 将一个用户请求的所有调用关联起来 |
-| `session_id` | 产生此调用的会话 |
-| `source` | `agent` / `judge` / `subagent` / `team` / `compress` / `memory-save` |
-| `provider` | `openai` / `anthropic` |
-| `model` | 实际使用的模型 ID |
-| `input_tokens` | 消耗的提示词 token 数 |
-| `output_tokens` | 生成的完成 token 数 |
-| `duration_ms` | 调用的墙上时钟时间 |
-| `timestamp` | ISO 8601 时间戳 |
+常见字段包括 role/source、model、prompt/completion/cache tokens、耗时与 trace id。
 
-使用 `/usage` REPL 命令查看聚合统计。
+用 `/usage` 查看汇总。
 
 ---
 
-## 依赖项
+## 依赖
 
 | 包 | 用途 |
 |----|------|
 | `github.com/anthropics/anthropic-sdk-go` | Anthropic API 客户端 |
-| `github.com/openai/openai-go` | OpenAI API 客户端 |
-| `github.com/chzyer/readline` | 带历史的Interactive REPL |
-| `github.com/tidwall/gjson` | 快速 JSON 路径查询 |
-| `github.com/tidwall/sjson` | JSON 变更 |
-| `github.com/invopop/jsonschema` | 工具定义的 JSON Schema 生成 |
-| `golang.org/x/net` | `web_fetch`/`web_search` 的 HTML 解析（`golang.org/x/net/html`） |
-| `golang.org/x/sync` | 并发原语（errgroup） |
+| `github.com/openai/openai-go` | OpenAI / 兼容 API 客户端 |
+| `github.com/chzyer/readline` | 带历史的交互 REPL |
+| `golang.org/x/net` | web fetch/search 的 HTML 解析 |
 
 ---
 
 ## 示例工作流
 
 ```
-$ JUDGE_ENABLED=1 ./agent --human
+$ JUDGE_ENABLED=1 ./agent
 
-> 实现一个用户管理的 REST API，包含 CRUD 端点
+> 先分析这个仓库的工具管线，再提一个聚焦的重构建议。先不要改代码。
 
-[think] 分析需求：REST API、用户 CRUD、需要规划...
-[task_create] "设计 API Schema" → T1
-[task_create] "实现 Handlers" → T2（依赖于 T1）
-[task_create] "编写测试" → T3（依赖于 T2）
-[task_create] "添加文档" → T4（依赖于 T2）
+[explore] 只读调查…
+[memory_search] 与 executor 管线相关的旧笔记
+[TodoWrite] 整理发现
 
-[正在处理 T1：设计 API Schema]
-  bash: go mod init user-api
-  write_file: internal/model/user.go
-  write_file: internal/handler/user.go（骨架）
+> 好，把 HITLApprovalAdapter 拆到单独文件。
 
-[T1 完成 → T2 就绪]
-[正在处理 T2：实现 Handlers]
-  edit_file: internal/handler/user.go（完整实现）
-  bash: go build ./...  ✓
+[hitl] reviewing write_file [safe]
+[write_file] internal/hitlaudit/approval_adapter.go
+[edit_file] internal/hitlaudit/human_approval.go
+[bash] go test ./internal/hitlaudit/
 
-[T2 完成 → T3、T4 就绪]
-[正在处理 T3：编写测试]
-  write_file: internal/handler/user_test.go
-  bash: go test ./... -v  ✓
-
-[所有任务完成]
-[judge] 评估完成度... 评分：9/10 ✓
-[auto-lesson] 将经验写入记忆供未来参考
-[memory_write] "REST API 模式：model → handler → router → test"
-
-完成。
+[judge] score=9 approved
+Done.
 ```
