@@ -308,16 +308,3 @@ func applyAcceptedHunks(oldContent, filename string, hunks []diffHunk, accepted 
 	}
 	return string(patched), nil
 }
-
-// --------------------------------------------------------------------------
-// Diff-preview toggle (backed by the session ApprovalState)
-// --------------------------------------------------------------------------
-
-// SetAutoApproveAll updates the active session ApprovalState.
-// Prefer ApprovalState.ApplyPreset via /approve; this remains for callers
-// that only need to flip the danger auto-approve / preview skip flag.
-func SetAutoApproveAll(v bool) { ActiveApproval().SetAutoApproveAll(v) }
-
-// ShouldPreviewDiff reports whether mutation diffs should be shown.
-// False only when the active session has /approve danger (auto-approve all).
-func ShouldPreviewDiff() bool { return ActiveApproval().ShouldPreviewDiff() }

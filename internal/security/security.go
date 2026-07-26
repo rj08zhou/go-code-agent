@@ -90,7 +90,11 @@ const (
 	ApproveBlocked                      // never allowed
 )
 
-// ApprovalState tracks the user's current approval posture for a session.
+// ApprovalState is the session's auto-approve posture for tool risk levels
+// (/approve off|safe|danger). It answers "may this risk class run without
+// prompting?" and whether file-mutation diff previews should be shown
+// (skipped only under full auto-approve / danger). Distinct from HITLManager,
+// which owns interactive prompt modes (safe-only, interactive, …).
 // It is safe for concurrent use.
 type ApprovalState struct {
 	mu              sync.RWMutex
@@ -160,32 +164,6 @@ func (s *ApprovalState) Decide(level ApprovalLevel, desc string) (allowed bool, 
 	default:
 		return false, fmt.Sprintf("unknown approval level for %q", desc)
 	}
-}
-
-// Session-scoped active approval used by diff-preview and /approve.
-// Defaults to a non-nil empty state so callers never panic.
-var (
-	activeApprovalMu sync.RWMutex
-	activeApproval   = NewApprovalState()
-)
-
-// SetActiveApproval installs the session's ApprovalState as the process-wide
-// active posture (diff preview, legacy SetAutoApproveAll). Pass nil to reset.
-func SetActiveApproval(s *ApprovalState) {
-	activeApprovalMu.Lock()
-	defer activeApprovalMu.Unlock()
-	if s == nil {
-		activeApproval = NewApprovalState()
-		return
-	}
-	activeApproval = s
-}
-
-// ActiveApproval returns the session ApprovalState.
-func ActiveApproval() *ApprovalState {
-	activeApprovalMu.RLock()
-	defer activeApprovalMu.RUnlock()
-	return activeApproval
 }
 
 // ---------- Bash Policy ----------

@@ -20,7 +20,6 @@ type Executor struct {
 	sanitizer OutputSanitizer
 	decisions DecisionLogger
 	timeout   time.Duration
-	snapshot  bool
 }
 
 // OutputSanitizer redacts secrets from tool outputs.
@@ -68,18 +67,11 @@ func (e *Executor) WithSanitizer(s OutputSanitizer) *Executor {
 }
 
 func NewExecutor(catalog *ToolCatalog, approval ApprovalChecker, network NetworkChecker) *Executor {
-	cfg := config.CurrentConfig()
-	snapshotEnabled := false
-	perToolTimeout := config.PerToolTimeout
-	if cfg != nil {
-		snapshotEnabled = cfg.SnapshotEnabled
-	}
 	return &Executor{
 		catalog:  catalog,
 		approval: approval,
 		network:  network,
-		timeout:  perToolTimeout,
-		snapshot: snapshotEnabled,
+		timeout:  config.PerToolTimeout,
 	}
 }
 

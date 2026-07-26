@@ -1,12 +1,9 @@
 package background
 
 import (
-	"go-code-agent/internal/config"
 	"testing"
 	"time"
 )
-
-func init() { config.SetConfig(config.Load()) }
 
 func TestSupervisor_RunAndCheck(t *testing.T) {
 	sv := New(t.TempDir())

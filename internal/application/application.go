@@ -53,7 +53,6 @@ type Application struct {
 // New constructs the Application with all project-level services.
 func New(cfgDir, workdir string) (*Application, error) {
 	cfg := config.Load()
-	config.SetConfig(cfg)
 
 	// Resolve data directory
 	dataDir := resolveDataDir(cfgDir, workdir)
@@ -199,11 +198,13 @@ type RunnerParams struct {
 	Bus          *team.MessageBus
 	WebService   tool.WebService
 	HITLMgr      *hitlaudit.HITLManager
+	Approval     *security.ApprovalState
 	MCPMgr       *mcp.Manager
 	WorktreeSvc  *worktree.Service
 	Protocols    *team.ProtocolStore
 	PromptLoader *prompt.Loader
 	Permissions  *security.Permissions
+	Config       *config.Config
 }
 
 // BuiltRunner holds a fully-wired Runner together with all session services
@@ -252,7 +253,10 @@ type BuiltRunner struct {
 //	defer built.Close()
 func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 	st := rt.SessionState
-	cfg := config.CurrentConfig()
+	cfg := params.Config
+	if cfg == nil {
+		cfg = &config.Config{ModelID: "default"}
+	}
 	sessionDir := rt.sessionRepo.SessionDir(st.ID)
 
 	// --- Tool catalog ---
@@ -261,12 +265,13 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 	// --- Executor with HITL + secrets sanitizer ---
 	hitlApproval := hitlaudit.NewHITLApprovalAdapter(params.HITLMgr)
 	hitlApproval.SetWorkdir(rt.workdir)
+	hitlApproval.SetApproval(params.Approval)
 	exec := tool.NewExecutor(catalog, hitlApproval, nil).
 		WithSanitizer(security.NewSecretsSanitizer()).
 		WithDecisionLogger(params.DecisionLog)
 
 	// --- Subagent & team ---
-	subagentRunner := agent.NewSubagentRunner(rt.gateway, catalog, cfg.ModelID)
+	subagentRunner := agent.NewSubagentRunner(rt.gateway, catalog, cfg)
 	subagentRunner.SetCompression(agent.NewCompression(rt.gateway, nil, sessionDir, cfg.ModelID))
 	subagentRunner.SetApproval(hitlApproval)
 	teamMgr := agent.NewTeammateManager(
@@ -317,7 +322,7 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 		ProjectID:   rt.workdir,
 		DiffPreview: params.DiffPreview,
 	}
-	runner := agent.NewRunner(profile, rt.gateway, exec, scope)
+	runner := agent.NewRunner(profile, rt.gateway, exec, scope, cfg)
 	if params.MemoryStore != nil {
 		runner.SetLessonWriter(agent.NewLLMLessonWriter(rt.gateway, params.MemoryStore, params.PromptLoader, cfg.ModelID))
 	}
@@ -483,7 +488,10 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime)
 	workdir := app.workdir
 	sessionDir := repo.SessionDir(st.ID)
 	promptLoader := prompt.NewLoader()
-	cfg := config.CurrentConfig()
+	cfg := app.cfg
+	if cfg == nil {
+		cfg = &config.Config{ModelID: "default"}
+	}
 
 	hitlMgr := hitlaudit.NewHITLManager(promptLoader)
 	approval := security.NewApprovalState()
@@ -504,8 +512,6 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime)
 			fmt.Fprintf(os.Stderr, "[warn] %v\n", modeErr)
 		}
 	}
-	security.SetActiveApproval(approval)
-
 	// Permissions + DiffPreview + Usage tracker
 	perms := security.NewPermissions()
 	_ = perms.Load(app.dataDir)
@@ -539,11 +545,13 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime)
 			SearxngInstances: cfg.SearxngInstances,
 		})),
 		HITLMgr:      hitlMgr,
+		Approval:     approval,
 		MCPMgr:       mcp.NewManager(workdir),
 		WorktreeSvc:  worktree.New(workdir, sessionDir),
 		Protocols:    team.NewProtocolStore(msgBus),
 		PromptLoader: promptLoader,
 		Permissions:  perms,
+		Config:       cfg,
 	}
 
 	built := rt.BuildRunner(params)

@@ -436,10 +436,7 @@ Bash deny-list and permissions.json still apply when HITL is off.
 func (r *repl) nextBuild() *application.BuildOptions { return r.next }
 
 func (r *repl) approvalState() *security.ApprovalState {
-	if r.built != nil && r.built.Approval != nil {
-		return r.built.Approval
-	}
-	return security.ActiveApproval()
+	return r.built.Approval
 }
 
 func (r *repl) applyApprovePreset(preset string, mode hitlaudit.HITLMode) {

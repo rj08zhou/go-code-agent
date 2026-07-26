@@ -1,12 +1,15 @@
-// Package config holds process-wide configuration parsed from environment.
-// It is immutable after construction; no package-level mutable state.
+// Package config holds process-wide configuration parsed from environment
+// and compile-time tuning constants.
+//
+// Config is immutable after Load(). Callers receive *Config via explicit
+// injection from the composition root (Application); there is no process
+// global accessor.
 package config
 
 import (
 	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -174,6 +177,11 @@ const (
 	SubagentCompactionThreshold = 12000
 	MaxExploreDelegations       = 3
 	MaxRepeatedToolCalls        = 3
+	// MaxReadsAfterExplore caps lead read_file/list_dir calls after a
+	// successful explore in the same Run(). Stops the common failure mode
+	// where lead re-walks the tree "to be more concrete" after explore
+	// already returned a summary. search_content/search_file stay unlimited.
+	MaxReadsAfterExplore = 2
 	// SubagentToolOutputMaxChars caps each tool result inside an explore
 	// subagent. Sized for a mid-size file via read_file (default 500 lines)
 	// without letting bash/list dumps balloon every subsequent prompt.
@@ -286,15 +294,3 @@ const PlanningGateMinTaskChars = 80
 
 // TokenCheckInterval controls re-check frequency.
 const TokenCheckInterval = 3
-
-var globalCfg atomic.Pointer[Config]
-
-func CurrentConfig() *Config { return globalCfg.Load() }
-
-func SetConfig(cfg *Config) {
-	// Compare-and-swap ensures exactly-once initialization.
-	if !globalCfg.CompareAndSwap(nil, cfg) {
-		// Already initialized: allow forced update for hot-reload scenarios.
-		globalCfg.Store(cfg)
-	}
-}
