@@ -1,3 +1,4 @@
+// Package security provides outbound request hardening.
 package security
 
 import (
@@ -7,56 +8,28 @@ import (
 	"strings"
 )
 
-// SSRF guard for any outbound HTTP request the agent makes on the
-// LLM's behalf (web_fetch, web_search). Default posture is DENY
-// access to private/reserved networks; the only escape hatch is the
-// explicit env var WEB_ALLOW_PRIVATE_IPS=1, checked once here rather
-// than scattered across callers, so every caller gets the same
-// behavior for free.
-//
-// This module is intentionally decision-only (no net.Dial here): it
-// takes an already-resolved net.IP and says allow/deny. Callers (see
-// internal/web/client.go) are responsible for plugging this into a
-// custom DialContext so the check runs on the ACTUAL IP a hostname
-// resolved to - not the hostname string, which is meaningless for
-// SSRF purposes (a hostname is just a label; only the IP it resolves
-// to determines what network is actually reached, and that resolution
-// can also change between check-time and connect-time, i.e. DNS
-// rebinding - hence "verify at dial time", see BlockedDialIP's doc).
-
 // alwaysBlockedCIDRs are denied unconditionally, even when
-// WEB_ALLOW_PRIVATE_IPS=1 is set. Deliberately narrow: only the
-// address space that has no legitimate use case for an "I explicitly
-// opted into internal network access" operator, and that real-world
-// SSRF exploits actually target - cloud metadata/IMDS endpoints live
-// in link-local space (169.254.169.254), which is why link-local as a
-// whole is the one range that never gets an opt-out. "This network"
-// (0.0.0.0/8) is simply never a valid destination.
+// WEB_ALLOW_PRIVATE_IPS=1 is set. Cloud metadata/IMDS lives in
+// link-local space (169.254.169.254), so link-local never gets an opt-out.
 var alwaysBlockedCIDRs = mustParseCIDRs([]string{
-	"169.254.0.0/16", // link-local / cloud metadata (AWS/GCP/Azure IMDS)
+	"169.254.0.0/16", // link-local / cloud metadata
 	"fe80::/10",      // IPv6 link-local
-	"0.0.0.0/8",      // "this network" - never a valid destination
+	"0.0.0.0/8",      // "this network" — never a valid destination
 })
 
 // privateCIDRs are denied by default but MAY be allowed by setting
-// WEB_ALLOW_PRIVATE_IPS=1. Includes loopback + RFC1918 private space
-// (an operator explicitly enabling "internal network access" plausibly
-// wants to reach a local dev service too) plus the extra ranges this
-// project's security rules call out explicitly (9.*, 11.*, 21.*, 30.*
-// - these are real public IANA-assigned /8 blocks, not private space,
-// but are blocked here per explicit instruction rather than general
-// private-range logic).
+// WEB_ALLOW_PRIVATE_IPS=1.
 var privateCIDRs = mustParseCIDRs([]string{
 	"127.0.0.0/8",    // loopback
 	"::1/128",        // IPv6 loopback
-	"10.0.0.0/8",     // RFC1918 private
-	"172.16.0.0/12",  // RFC1918 private
-	"192.168.0.0/16", // RFC1918 private
+	"10.0.0.0/8",     // RFC1918
+	"172.16.0.0/12",  // RFC1918
+	"192.168.0.0/16", // RFC1918
 	"fc00::/7",       // IPv6 unique local
-	"9.0.0.0/8",      // explicitly listed in project security rules
-	"11.0.0.0/8",     // explicitly listed in project security rules
-	"21.0.0.0/8",     // explicitly listed in project security rules
-	"30.0.0.0/8",     // explicitly listed in project security rules
+	"9.0.0.0/8",
+	"11.0.0.0/8",
+	"21.0.0.0/8",
+	"30.0.0.0/8",
 })
 
 func mustParseCIDRs(cidrs []string) []*net.IPNet {
@@ -71,12 +44,9 @@ func mustParseCIDRs(cidrs []string) []*net.IPNet {
 	return nets
 }
 
-// AllowPrivateNetworkAccess reports whether WEB_ALLOW_PRIVATE_IPS=1 is
-// set, i.e. the operator has explicitly opted into letting the agent's
-// web tools reach private/internal address space. Re-read from the
-// environment on every call (cheap, and lets tests toggle it without
-// touching global state elsewhere).
-func AllowPrivateNetworkAccess() bool {
+// AllowPrivateIPs reports whether WEB_ALLOW_PRIVATE_IPS opts into
+// private/internal address space (still subject to always-blocked ranges).
+func AllowPrivateIPs() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("WEB_ALLOW_PRIVATE_IPS"))) {
 	case "1", "true", "yes", "on":
 		return true
@@ -84,21 +54,33 @@ func AllowPrivateNetworkAccess() bool {
 	return false
 }
 
-// IsBlockedIP reports whether ip must never be dialed by the agent's
-// web tools: link-local/loopback/metadata addresses are blocked
-// unconditionally; general private ranges (and the extra ranges named
-// in project security rules) are blocked unless the operator has set
-// WEB_ALLOW_PRIVATE_IPS=1.
+// AllowPrivateNetworkAccess is an alias kept for callers that used the
+// master-branch name.
+func AllowPrivateNetworkAccess() bool { return AllowPrivateIPs() }
+
+// IsPrivateIP reports whether ip is in a private/reserved range that is
+// blocked by default (including always-blocked ranges). Prefer IsBlockedIP
+// for dial-time decisions.
+func IsPrivateIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	return IsBlockedIP(ip)
+}
+
+// IsBlockedIP reports whether ip must never be dialed by web tools:
+// always-blocked ranges are denied even with WEB_ALLOW_PRIVATE_IPS=1;
+// other private ranges are denied unless that override is set.
 func IsBlockedIP(ip net.IP) bool {
 	if ip == nil {
-		return true // can't classify => fail closed
+		return true
 	}
 	for _, n := range alwaysBlockedCIDRs {
 		if n.Contains(ip) {
 			return true
 		}
 	}
-	if AllowPrivateNetworkAccess() {
+	if AllowPrivateIPs() {
 		return false
 	}
 	for _, n := range privateCIDRs {
@@ -106,26 +88,58 @@ func IsBlockedIP(ip net.IP) bool {
 			return true
 		}
 	}
-	// IsPrivate covers any RFC1918/ULA ranges not already listed above
-	// (defense in depth against a gap in the explicit list).
 	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
 		return true
 	}
 	return false
 }
 
-// CheckDialIP is the single choke point web/client.go's DialContext
-// calls with the IP it is actually about to open a TCP connection to
-// (post-DNS-resolution). Checking HERE - at dial time, on the resolved
-// IP - rather than checking the hostname up front is what defeats DNS
-// rebinding: an attacker-controlled domain could resolve to a public
-// IP when first checked and to 127.0.0.1/169.254.169.254 by the time
-// the actual connection is made (or a redirect Location resolves
-// differently), so validating the string-form hostname is not a
-// sufficient guard on its own.
+// CheckDialIP is the dial-time choke point: validate the resolved IP
+// about to be connected, defeating DNS rebinding between check and connect.
 func CheckDialIP(ip net.IP) error {
 	if IsBlockedIP(ip) {
-		return fmt.Errorf("blocked: %s is a private/reserved address (set WEB_ALLOW_PRIVATE_IPS=1 to allow internal network access)", ip)
+		return fmt.Errorf("blocked: %s is a private/reserved address (set WEB_ALLOW_PRIVATE_IPS=1 to allow internal network access; link-local/metadata remain blocked)", ip)
 	}
 	return nil
+}
+
+// ValidateHost checks whether a hostname resolves only to safe IPs.
+func ValidateHost(host string) error {
+	if host == "" {
+		return fmt.Errorf("empty host")
+	}
+	// Strip port if present for host-only checks.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if IsBlockedIP(ip) {
+			return fmt.Errorf("host %q is a private/reserved address — blocked", host)
+		}
+		return nil
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return err
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("no IPs resolved for host %q", host)
+	}
+	for _, ip := range ips {
+		if IsBlockedIP(ip) {
+			return fmt.Errorf("host %q resolves to private IP %s — blocked (use WEB_ALLOW_PRIVATE_IPS=1 to override; link-local/metadata remain blocked)", host, ip)
+		}
+	}
+	return nil
+}
+
+// RedactSecretsInLog replaces known env secrets with ***.
+func RedactSecretsInLog(s string, secrets ...string) string {
+	for _, sec := range secrets {
+		if sec == "" {
+			continue
+		}
+		s = strings.ReplaceAll(s, sec, "***")
+	}
+	return s
 }

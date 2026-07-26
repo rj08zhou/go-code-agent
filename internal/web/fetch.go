@@ -3,58 +3,55 @@ package web
 import (
 	"context"
 	"fmt"
-	"go-code-agent/infra"
+	"go-code-agent/internal/config"
 	"net/http"
 	"strings"
 )
 
-// FetchTimeout / FetchMaxBytes are re-exported aliases of the
-// infra-level constants (see infra/consts.go's "Outbound web access"
-// block for the full rationale/env-var overview) - kept as package-
-// level names here so callers/tests in this package don't need to
-// import infra just to reference them.
 const (
-	FetchTimeout  = infra.WebFetchTimeout
-	FetchMaxBytes = infra.WebFetchMaxBytes
+	FetchMaxBytes = config.WebFetchMaxBytes
+	FetchTimeout  = config.WebFetchTimeout
 )
 
-// FetchResult is what web_fetch hands back to the caller (and,
-// wrapped as tool output, to the LLM).
 type FetchResult struct {
 	URL         string
 	StatusCode  int
 	ContentType string
-	Text        string // extracted readable text (HTML pages) or raw body (non-HTML text)
-	Truncated   bool   // body exceeded FetchMaxBytes and was cut
+	Text        string
+	Truncated   bool
+	// NoStaticText is set when the page returned HTML but yielded no
+	// extractable static text (e.g. a JS-rendered SPA). In that case Text
+	// holds a diagnostic note / metadata rather than article content, and
+	// the truncation marker is meaningless.
+	NoStaticText bool
 }
 
-// Fetch retrieves url through the SSRF-hardened client and returns its
-// readable text content. HTML responses are run through HTMLToText;
-// other text-ish content types (plain text, JSON, markdown...) are
-// returned as-is (secrets sanitization and any size/content warnings
-// are the caller's job - this function only does network + extraction).
 func Fetch(ctx context.Context, rawURL string) (*FetchResult, error) {
-	u, err := ValidateRequestURL(rawURL)
+	cleanURL, err := ValidateRequestURL(rawURL)
 	if err != nil {
 		return nil, err
 	}
-
 	client := NewSafeHTTPClient(FetchTimeout)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cleanURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
 	}
-	// Identify the agent (courteous to server operators, and lets them
-	// choose to block it if they don't want automated fetches) without
-	// pretending to be a browser.
-	req.Header.Set("User-Agent", "go-code-agent-webfetch/1.0 (+tool; respects robots via server-side blocking)")
+	req.Header.Set("User-Agent", "go-code-agent-webfetch/1.0")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetching %s: %w", u.String(), err)
+		return nil, fmt.Errorf("fetching %s: %w", cleanURL, err)
 	}
 	defer resp.Body.Close()
+
+	// Reject error responses instead of returning the error page body as if
+	// it were article content (observed: 404/502 gateway pages polluting
+	// web_fetch results and wasting a subagent round).
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d %s for %s",
+			resp.StatusCode, http.StatusText(resp.StatusCode), cleanURL)
+	}
 
 	body, truncated, err := ReadLimited(resp.Body, FetchMaxBytes)
 	if err != nil && len(body) == 0 {
@@ -62,34 +59,56 @@ func Fetch(ctx context.Context, rawURL string) (*FetchResult, error) {
 	}
 
 	ct := resp.Header.Get("Content-Type")
-	text := extractText(body, ct)
+	text, noStaticText := extractText(body, ct)
 
 	return &FetchResult{
-		URL:         u.String(),
-		StatusCode:  resp.StatusCode,
-		ContentType: ct,
-		Text:        text,
-		Truncated:   truncated,
+		URL:          cleanURL,
+		StatusCode:   resp.StatusCode,
+		ContentType:  ct,
+		Text:         text,
+		Truncated:    truncated,
+		NoStaticText: noStaticText,
 	}, nil
 }
 
-// extractText decides, from the response's declared Content-Type,
-// whether to run HTML extraction or just decode the bytes as text.
-// Binary/unrecognized types get a short placeholder rather than dumping
-// raw bytes (which would be useless to an LLM and could contain
-// control characters that mangle the transcript).
-func extractText(body []byte, contentType string) string {
+// extractText converts a response body to text. The second return value is
+// true when the page was HTML but had no extractable static text (SPA), in
+// which case the returned string is a diagnostic note / metadata.
+func extractText(body []byte, contentType string) (string, bool) {
 	ct := strings.ToLower(contentType)
 	switch {
 	case strings.Contains(ct, "text/html"), strings.Contains(ct, "application/xhtml"):
-		return HTMLToText(string(body))
+		text := HTMLToText(string(body))
+		// Empty OR chrome-only extractions (nav/promo CTAs with no article)
+		// both count as "no useful static text" — fall back to metadata so
+		// the subagent doesn't thrash on junk.
+		if strings.TrimSpace(text) != "" && !isBoilerplateText(text) {
+			return text, false
+		}
+		if meta := HTMLMetaFallback(string(body)); meta != "" {
+			note := "[This page is rendered client-side (JavaScript); no static article text was found. "
+			if strings.TrimSpace(text) != "" {
+				note = "[Extracted text looked like site chrome/promos with no article body. "
+			}
+			return note + "Metadata extracted below.]\n\n" + meta, true
+		}
+		return "[This page returned HTML with no extractable article text " +
+			"(JS-rendered SPA or chrome-only page). Try an alternative source or a direct API/raw URL.]", true
 	case strings.Contains(ct, "text/"), strings.Contains(ct, "json"), strings.Contains(ct, "xml"),
 		strings.Contains(ct, "javascript"), ct == "":
-		// Empty Content-Type: assume text rather than guessing binary,
-		// since a hostile/misconfigured server omitting it is common
-		// and we'd rather show something than nothing.
-		return string(body)
+		return string(body), false
 	default:
-		return fmt.Sprintf("[non-text content, Content-Type: %s, %d bytes - not displayed]", contentType, len(body))
+		return fmt.Sprintf("[non-text content, Content-Type: %s, %d bytes]", contentType, len(body)), false
 	}
+}
+
+func ValidateRequestURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("url is empty")
+	}
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		return "", fmt.Errorf("unsupported scheme (only http/https allowed)")
+	}
+	return raw, nil
 }
