@@ -35,20 +35,18 @@ func TestApprovalStateDecide(t *testing.T) {
 
 func TestApprovePresetClearsDangerPreviewSkip(t *testing.T) {
 	s := NewApprovalState()
-	SetActiveApproval(s)
-	t.Cleanup(func() { SetActiveApproval(nil) })
 
 	s.ApplyPreset("danger")
-	if ShouldPreviewDiff() {
+	if s.ShouldPreviewDiff() {
 		t.Fatal("danger preset should skip diff preview")
 	}
 	s.ApplyPreset("safe")
-	if !ShouldPreviewDiff() {
+	if !s.ShouldPreviewDiff() {
 		t.Fatal("safe preset must re-enable diff preview")
 	}
 	s.ApplyPreset("danger")
 	s.ApplyPreset("off")
-	if !ShouldPreviewDiff() {
+	if !s.ShouldPreviewDiff() {
 		t.Fatal("off preset must re-enable diff preview")
 	}
 	if s.IsAutoApproveAll() || s.IsAutoApproveSafe() {

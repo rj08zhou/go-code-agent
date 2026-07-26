@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent/internal/config"
 	"go-code-agent/internal/tool"
 	"io"
 	"strings"
@@ -13,8 +12,6 @@ import (
 	"testing"
 	"time"
 )
-
-func init() { config.SetConfig(config.Load()) }
 
 // --- inferMCPEffects ---
 

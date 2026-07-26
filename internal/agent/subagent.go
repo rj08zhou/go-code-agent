@@ -38,14 +38,19 @@ func exploreToolNames(agentType string) []string {
 type SubagentRunner struct {
 	gateway   *model.Gateway
 	catalog   *tool.ToolCatalog
+	cfg       *config.Config
 	modelID   string
 	approval  tool.ApprovalChecker
 	eventSink event.Sink
 	compress  *Compression
 }
 
-func NewSubagentRunner(gw *model.Gateway, catalog *tool.ToolCatalog, modelID string) *SubagentRunner {
-	return &SubagentRunner{gateway: gw, catalog: catalog, modelID: modelID}
+func NewSubagentRunner(gw *model.Gateway, catalog *tool.ToolCatalog, cfg *config.Config) *SubagentRunner {
+	modelID := "default"
+	if cfg != nil && cfg.ModelID != "" {
+		modelID = cfg.ModelID
+	}
+	return &SubagentRunner{gateway: gw, catalog: catalog, cfg: cfg, modelID: modelID}
 }
 
 func (s *SubagentRunner) SetEventSink(sink event.Sink) {
@@ -109,7 +114,7 @@ func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir str
 	// entire prefix for subsequent requests).
 	exec := tool.NewExecutor(exploreCatalog, s.approval, nil).
 		WithSanitizer(&truncateSanitizer{maxLen: config.SubagentToolOutputMaxChars})
-	runner := NewRunner(profile, s.gateway, exec, scope)
+	runner := NewRunner(profile, s.gateway, exec, scope, s.cfg)
 	runner.SetEventSink(s.eventSink)
 	if s.compress != nil {
 		runner.SetCompression(s.compress)

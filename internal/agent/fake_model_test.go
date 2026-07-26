@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"go-code-agent/internal/config"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/tool"
@@ -13,7 +12,6 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	config.SetConfig(config.Load())
 	os.Exit(m.Run())
 }
 
@@ -30,12 +28,33 @@ type fakeProvider struct {
 	// so the model stops returning tool calls, simulating a real conversation.
 	oneShot bool
 	// multiShot: if >0, toolCalls are returned for the first N calls only.
-	multiShot  int
+	multiShot int
+	// callScript: if non-nil, Call/Stream return script[i] tools for the
+	// i-th invocation (0-based); past the end → content only, no tools.
+	callScript [][]llm.ToolCall
 	callCount  int
 	lastParams *llm.CallParams
 }
 
 func (f *fakeProvider) Name() string { return f.name }
+
+func (f *fakeProvider) nextTools() []llm.ToolCall {
+	if f.callScript != nil {
+		idx := f.callCount - 1
+		if idx < 0 || idx >= len(f.callScript) {
+			return nil
+		}
+		return f.callScript[idx]
+	}
+	tc := f.toolCalls
+	if f.oneShot && f.callCount > 1 {
+		return nil
+	}
+	if f.multiShot > 0 && f.callCount > f.multiShot {
+		return nil
+	}
+	return tc
+}
 
 func (f *fakeProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Completion, error) {
 	f.lastParams = &params
@@ -43,16 +62,9 @@ func (f *fakeProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Co
 	if f.callErr != nil {
 		return nil, f.callErr
 	}
-	tc := f.toolCalls
-	if f.oneShot && f.callCount > 1 {
-		tc = nil
-	}
-	if f.multiShot > 0 && f.callCount > f.multiShot {
-		tc = nil
-	}
 	return &llm.Completion{
 		Content:      f.content,
-		ToolCalls:    tc,
+		ToolCalls:    f.nextTools(),
 		FinishReason: f.finishReason,
 	}, nil
 }
@@ -63,13 +75,7 @@ func (f *fakeProvider) Stream(ctx context.Context, params llm.CallParams, sink m
 	if f.callErr != nil {
 		return nil, f.callErr
 	}
-	tc := f.toolCalls
-	if f.oneShot && f.callCount > 1 {
-		tc = nil
-	}
-	if f.multiShot > 0 && f.callCount > f.multiShot {
-		tc = nil
-	}
+	tc := f.nextTools()
 	sink.OnTextDelta(f.content)
 	sink.OnDone()
 	return &llm.StreamResult{
@@ -98,7 +104,7 @@ func TestRunner_Integration_ModelReceivesTools(t *testing.T) {
 	exec := tool.NewExecutor(catalog, nil, nil)
 	scope := &tool.ToolScope{Role: "lead", CanRead: true, CanWrite: true, CanExecute: true, CanNetwork: true}
 	profile := NewLeadProfile("You are a test agent.")
-	runner := NewRunner(profile, gw, exec, scope)
+	runner := NewRunner(profile, gw, exec, scope, nil)
 	fakeModel.content = "done"
 
 	outcome := runner.Run(context.Background(), []llm.Message{llm.UserMessage("hello")}, "trace-1")
@@ -157,7 +163,7 @@ func TestRunner_Integration_ExecutesToolAndCollectsResult(t *testing.T) {
 		CanExecute: true,
 	}
 	profile := NewLeadProfile("You are a test agent.")
-	runner := NewRunner(profile, gw, exec, scope)
+	runner := NewRunner(profile, gw, exec, scope, nil)
 
 	fakeModel.toolCalls = []llm.ToolCall{{
 		ID:        "call_1",
@@ -215,7 +221,7 @@ func TestRunner_Integration_FailingToolProducesStructuredResult(t *testing.T) {
 	exec := tool.NewExecutor(catalog, nil, nil)
 	scope := &tool.ToolScope{Role: "lead", CanExecute: true}
 	profile := NewLeadProfile("You are a test agent.")
-	runner := NewRunner(profile, gw, exec, scope)
+	runner := NewRunner(profile, gw, exec, scope, nil)
 
 	fakeModel.toolCalls = []llm.ToolCall{{ID: "call_1", Name: "risky_op", Arguments: `{}`}}
 	fakeModel.content = "done"
@@ -256,7 +262,7 @@ func TestRunner_Integration_CapabilityDenied(t *testing.T) {
 	exec := tool.NewExecutor(catalog, nil, nil)
 	scope := &tool.ToolScope{Role: "explore", CanRead: true, CanWrite: false}
 	profile := NewExploreProfile()
-	runner := NewRunner(profile, gw, exec, scope)
+	runner := NewRunner(profile, gw, exec, scope, nil)
 
 	fakeModel.toolCalls = []llm.ToolCall{{ID: "call_1", Name: "write_file", Arguments: `{"path":"secret.txt","content":"data"}`}}
 	fakeModel.content = "done"
@@ -295,7 +301,7 @@ func TestRunner_Integration_ApprovalCheck(t *testing.T) {
 	exec := tool.NewExecutor(catalog, denyAll, nil)
 	scope := &tool.ToolScope{Role: "lead", CanExecute: true}
 	profile := NewLeadProfile("You are a test agent.")
-	runner := NewRunner(profile, gw, exec, scope)
+	runner := NewRunner(profile, gw, exec, scope, nil)
 
 	fakeModel.toolCalls = []llm.ToolCall{{ID: "call_1", Name: "bash", Arguments: `{"command":"rm -rf /"}`}}
 	fakeModel.content = "done"
@@ -334,7 +340,7 @@ func TestRunner_Integration_TimeoutTools(t *testing.T) {
 	exec := tool.NewExecutor(catalog, nil, nil)
 	scope := &tool.ToolScope{Role: "lead", CanExecute: true}
 	profile := NewLeadProfile("You are a test agent.")
-	runner := NewRunner(profile, gw, exec, scope)
+	runner := NewRunner(profile, gw, exec, scope, nil)
 
 	fakeModel.toolCalls = []llm.ToolCall{{ID: "call_1", Name: "sleep_forever", Arguments: `{}`}}
 	fakeModel.content = "done"
@@ -376,7 +382,7 @@ func TestRunner_Integration_MaxRoundsTermination(t *testing.T) {
 	scope := &tool.ToolScope{Role: "lead", CanRead: true}
 	profile := NewLeadProfile("You are a test agent.")
 	profile.MaxRounds = 3
-	runner := NewRunner(profile, gw, exec, scope)
+	runner := NewRunner(profile, gw, exec, scope, nil)
 
 	fakeModel.toolCalls = []llm.ToolCall{{ID: "call_1", Name: "noop", Arguments: `{}`}}
 	// NOT oneShot — we want it to loop until max rounds, then trigger wrap-up
@@ -412,7 +418,7 @@ func TestRunner_Integration_MemoryCapabilityDenied(t *testing.T) {
 	exec := tool.NewExecutor(catalog, nil, nil)
 	scope := &tool.ToolScope{Role: "explore", CanRead: true, CanMemory: false}
 	profile := NewExploreProfile()
-	runner := NewRunner(profile, gw, exec, scope)
+	runner := NewRunner(profile, gw, exec, scope, nil)
 
 	fakeModel.toolCalls = []llm.ToolCall{{ID: "call_1", Name: "memory_write", Arguments: `{"content":"test"}`}}
 	fakeModel.content = "done"
@@ -451,7 +457,7 @@ func TestRunner_Integration_AutoLessonSkipsSubagent(t *testing.T) {
 	exec := tool.NewExecutor(catalog, nil, nil)
 	scope := &tool.ToolScope{Role: "explore", CanRead: true, CanMemory: false}
 	profile := NewExploreProfile()
-	runner := NewRunner(profile, gw, exec, scope)
+	runner := NewRunner(profile, gw, exec, scope, nil)
 
 	spy := &spyLessonWriter{}
 	runner.SetLessonWriter(spy)
@@ -492,7 +498,7 @@ func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
 	exec := tool.NewExecutor(catalog, nil, nil)
 	scope := &tool.ToolScope{Role: "lead", CanRead: true, CanMemory: true}
 	profile := NewLeadProfile("You are a test agent.")
-	runner := NewRunner(profile, gw, exec, scope)
+	runner := NewRunner(profile, gw, exec, scope, nil)
 
 	spy := &spyLessonWriter{}
 	runner.SetLessonWriter(spy)

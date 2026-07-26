@@ -2,11 +2,8 @@ package model
 
 import (
 	"context"
-	"go-code-agent/internal/config"
 	"testing"
 )
-
-func init() { config.SetConfig(config.Load()) }
 
 func TestRoleThrottle_AcquireRelease(t *testing.T) {
 	th := NewRoleThrottle(10)

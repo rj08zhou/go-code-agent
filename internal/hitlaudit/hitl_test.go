@@ -3,14 +3,11 @@ package hitlaudit
 import (
 	"context"
 	"encoding/json"
-	"go-code-agent/internal/config"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/tool"
 	"os"
 	"testing"
 )
-
-func init() { config.SetConfig(config.Load()) }
 
 // --- HITLApprovalAdapter ---
 

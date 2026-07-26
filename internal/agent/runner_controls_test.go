@@ -24,7 +24,7 @@ func TestRunner_BlocksRepeatedIdenticalToolCalls(t *testing.T) {
 		Role:       "explore",
 		CanRead:    true,
 		CanExecute: true,
-	})
+	}, nil)
 	fake.toolCalls = []llm.ToolCall{{ID: "call_1", Name: "noop", Arguments: `{}`}}
 
 	outcome := runner.Run(context.Background(), []llm.Message{llm.UserMessage("inspect")}, "repeat-test")

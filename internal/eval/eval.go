@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/application"
-	"go-code-agent/internal/config"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/tool"
@@ -191,7 +190,7 @@ func (h *Harness) runMocked(ctx context.Context, t Task, workdir string) Result 
 
 	profile := agent.NewLeadProfile("You are a coding agent under eval. Follow instructions precisely.")
 	profile.MaxRounds = 30 // shorter for eval
-	runner := agent.NewRunner(profile, gw, exec, scope)
+	runner := agent.NewRunner(profile, gw, exec, scope, nil)
 
 	outcome := runner.Run(ctx, []llm.Message{llm.UserMessage(t.Prompt)}, "eval-"+t.Name)
 	r.Rounds = outcome.Rounds
@@ -215,7 +214,6 @@ func (h *Harness) runLive(ctx context.Context, t Task, workdir string) Result {
 	}
 
 	// Initialize application with real config and provider
-	config.SetConfig(config.Load())
 	app, err := application.New(cfgDir, workdir)
 	if err != nil {
 		r.Error = fmt.Sprintf("init app: %v", err)
@@ -243,15 +241,16 @@ func (h *Harness) runLive(ctx context.Context, t Task, workdir string) Result {
 		CanNetwork: true,
 	}
 
+	cfg := app.Config()
 	if h.Model != "" {
-		cfg := config.CurrentConfig()
-		cfg.ModelID = h.Model
-		config.SetConfig(cfg)
+		cp := *cfg
+		cp.ModelID = h.Model
+		cfg = &cp
 	}
 
 	profile := agent.NewLeadProfile("You are a coding agent under eval. Follow instructions precisely.")
 	profile.MaxRounds = 30
-	runner := agent.NewRunner(profile, gw, exec, scope)
+	runner := agent.NewRunner(profile, gw, exec, scope, cfg)
 	outcome := runner.Run(ctx, []llm.Message{llm.UserMessage(t.Prompt)}, "eval-live-"+t.Name)
 	r.Rounds = outcome.Rounds
 	r.ToolCalls = len(outcome.ToolResults)
