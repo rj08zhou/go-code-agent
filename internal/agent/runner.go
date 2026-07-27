@@ -27,45 +27,6 @@ type Profile struct {
 	CanMemory    bool
 }
 
-// turnState holds ephemeral counters and flags for a single Run() invocation.
-// Runner instances are reused across REPL turns; this state is reset each time.
-type turnState struct {
-	rounds                int
-	failures              int
-	consecutiveFails      int
-	lastFailedTool        string
-	roundsSinceComplete   int
-	roundsWithoutTodo     int
-	hasOpenItems          bool
-	lastTriggered         map[string]int
-	usedThink             bool
-	usedExplore           bool
-	exploreSucceeded      bool // at least one explore tool result succeeded this Run
-	usedPlanning          bool
-	originalTask          string
-	lessonWritten         bool
-	lessonRoundsRemaining int
-	lessonPromptInjected  bool
-	judgeRetryInjects     int
-	usage                 llm.Usage
-	promptTokensUsed      int64
-	toolCallCounts        map[string]int
-	exploreDelegations    int
-	readsAfterExplore     int // lead read_file/list_dir count after exploreSucceeded
-	cachedTokens          int
-	cachedTokensAt        int
-	readCounts            map[string]int
-	budgetWarnInjected    bool
-}
-
-func newTurnState() turnState {
-	return turnState{
-		lastTriggered:  make(map[string]int),
-		toolCallCounts: make(map[string]int),
-		readCounts:     make(map[string]int),
-	}
-}
-
 // Runner is the unified agent execution engine with integrated
 // compression, reflection, judge, and snapshot support.
 type Runner struct {
@@ -75,18 +36,19 @@ type Runner struct {
 	scope    *tool.ToolScope
 
 	// Integrated modules (session-lifetime collaborators)
-	compress     *Compression
-	reflection   *Reflection
-	judge        *Judge
-	snapshot     *SnapshotManager
-	subagent     *SubagentRunner
-	planGate     *PlanGate
-	lessonWriter LessonWriter
-	memoryRecall func(string) string
-	todoState    func() (bool, string)
-	taskProgress func() string
-	eventSink    event.Sink
-	cfg          *config.Config // process config; nil → safe defaults in Run
+	compress       *Compression
+	reflection     *Reflection
+	judge          *Judge
+	snapshot       *SnapshotManager
+	subagent       *SubagentRunner
+	planGate       *PlanGate
+	lessonWriter   LessonWriter
+	memoryRecall   func(string) string
+	todoState      func() (bool, string)
+	taskProgress   func() string
+	dynamicContext func() string // evergreen / tasks / MCP snapshot per Run
+	eventSink      event.Sink
+	cfg            *config.Config // process config; nil → safe defaults in Run
 
 	// Ephemeral per-Run state
 	turn turnState
@@ -180,6 +142,11 @@ func (r *Runner) SetTodoState(fn func() (bool, string)) { r.todoState = fn }
 // SetTaskProgress supplies the latest persistent DAG summary for each loop.
 func (r *Runner) SetTaskProgress(fn func() string) { r.taskProgress = fn }
 
+// SetDynamicContext supplies a per-Run snapshot (evergreen memory, open tasks,
+// MCP catalog) injected as a user <session-context> message so the system
+// prompt remains static and cacheable.
+func (r *Runner) SetDynamicContext(fn func() string) { r.dynamicContext = fn }
+
 // TurnOutcome reports the result of one agent loop run.
 type TurnOutcome struct {
 	Rounds        int
@@ -207,10 +174,9 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 	r.resetTurnState()
 
 	ctx = model.WithTraceID(ctx, traceID)
-	// Capture original task for plan gate and inject relevant memory once per turn.
-	// Use UserMessage (not SystemMessage) so the OpenAI-compatible system block
-	// stays stable across turns and prompt caching can hit.
-	messages := r.injectMemoryRecall(append([]llm.Message{}, thread...))
+	// Capture original task for plan gate and inject dynamic context once per
+	// turn as UserMessage so the system block stays stable for prompt caching.
+	messages := r.injectTurnContext(append([]llm.Message{}, thread...))
 
 	out := TurnOutcome{}
 	maxRounds := r.profile.MaxRounds
@@ -366,7 +332,8 @@ var ephemeralNudgePrefixes = []string{
 	"<auto-lesson>",
 	"<think-first>",
 	"<planning-required>",
-	"<system>",
+	"<session-context>",
+	"<response-truncated>",
 }
 
 const postExploreNudge = `<post-explore>Explore already returned a summary. Synthesize and answer the user now.
@@ -604,22 +571,5 @@ func isRepoWalkBash(command string) bool {
 // postExploreBlock decides whether a lead tool call should be refused after a
 // successful explore. Explore-role runners are never gated here.
 func (r *Runner) postExploreBlock(tc llm.ToolCall) (blocked bool, reason string) {
-	if !r.turn.exploreSucceeded || r.profile.Role == "explore" {
-		return false, ""
-	}
-	switch tc.Name {
-	case "read_file", "list_dir":
-		if r.turn.readsAfterExplore >= config.MaxReadsAfterExplore {
-			return true, fmt.Sprintf(
-				"post-explore read budget exhausted (%d/%d); synthesize from the explore summary. "+
-					"If one fact is missing, use search_content/search_file instead of more read_file/list_dir.",
-				config.MaxReadsAfterExplore, config.MaxReadsAfterExplore)
-		}
-	case "bash":
-		if isRepoWalkBash(extractBashCommand(tc.Arguments)) {
-			return true, "post-explore repo walk via bash blocked (find/ls -R/tree); " +
-				"synthesize from the explore summary or use search_content/search_file for a specific fact"
-		}
-	}
-	return false, ""
+	return postExploreBlockTurn(&r.turn, r.profile.Role, tc)
 }

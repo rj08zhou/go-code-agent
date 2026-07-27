@@ -337,7 +337,6 @@ go-code-agent/
 │   ├── logging/                 # Structured logging
 │   ├── utils/                   # Terminal + helpers
 │   └── eval/                    # Regression eval helpers
-├── prompts/                     # Optional prompt overrides
 ├── skills/                      # Example workspace skills
 ├── go.mod
 └── README.md

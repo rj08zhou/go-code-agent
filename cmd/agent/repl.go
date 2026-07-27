@@ -30,10 +30,10 @@ func newRepl(built *application.BuiltRunner, rtCtx context.Context, readFn func(
 
 func (r *repl) run() {
 	r.next = nil
-	runner := r.built.Runner
-	histStore := r.built.HistStore
+	runner := r.built.Runtime.Runner
+	histStore := r.built.Session.HistStore
 
-	messages, restored, err := histStore.LoadRuntime(r.built.SysPrompt)
+	messages, restored, err := histStore.LoadRuntime(r.built.Session.SysPrompt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load history: %v\n", err)
 		return
@@ -123,17 +123,17 @@ func (r *repl) run() {
 }
 
 func (r *repl) printBanner() {
-	fmt.Printf("go-code-agent | session: %s\n", r.built.SessionID)
-	fmt.Printf("workdir: %s | model: %s | HITL: %s", r.built.Workdir, r.built.ModelID, hitlStatus(r.built))
-	if r.built.JudgeEnabled {
+	fmt.Printf("go-code-agent | session: %s\n", r.built.Session.ID)
+	fmt.Printf("workdir: %s | model: %s | HITL: %s", r.built.Session.Workdir, r.built.Session.ModelID, hitlStatus(r.built))
+	if r.built.Runtime.JudgeEnabled {
 		fmt.Print(" | judge: on")
 	}
-	perms := r.built.Permissions
+	perms := r.built.Security.Permissions
 	if perms != nil && perms.Count() > 0 {
 		fmt.Printf(" | permissions: %d rules", perms.Count())
 	}
-	mcpCount := r.built.MCPMgr.Count()
-	pending := r.built.MCPMgr.ListPending()
+	mcpCount := r.built.Team.MCP.Count()
+	pending := r.built.Team.MCP.ListPending()
 	if mcpCount > 0 {
 		fmt.Printf(" | mcp: %d active", mcpCount)
 	}
@@ -145,20 +145,20 @@ func (r *repl) printBanner() {
 }
 
 func (r *repl) drainBackground() {
-	for _, n := range r.built.BGSvc.Notifications() {
+	for _, n := range r.built.Team.BG.Notifications() {
 		fmt.Fprintf(os.Stderr, "[bg] job %s: %s\n", n["id"], n["status"])
 	}
-	for _, j := range r.built.BGSvc.Drain() {
+	for _, j := range r.built.Team.BG.Drain() {
 		fmt.Fprintln(os.Stderr, "[bg] completed:", j)
 	}
 }
 
 func (r *repl) checkInbox(messages *[]llm.Message) {
-	mb := r.built.Bus
+	mb := r.built.Team.Bus
 	if mb == nil {
 		return
 	}
-	msgs := mb.ReadInbox(r.built.AgentID)
+	msgs := mb.ReadInbox(r.built.Session.AgentID)
 	if len(msgs) == 0 {
 		return
 	}
@@ -209,31 +209,31 @@ Bash deny-list and permissions.json still apply when HITL is off.
 		} else {
 			switch parts[1] {
 			case "clear":
-				fmt.Println(r.built.TaskSvc.ClearCompleted())
+				fmt.Println(r.built.Tasks.Service.ClearCompleted())
 			case "reset":
-				r.built.TaskSvc.Reset()
+				r.built.Tasks.Service.Reset()
 				fmt.Println("All tasks cleared.")
 			default:
 				fmt.Printf("Unknown: %s\n", parts[1])
 			}
 		}
 	case "/tasks":
-		if r.built.TodoSvc != nil {
-			fmt.Println(r.built.TodoSvc.Render())
+		if r.built.Tasks.Todos != nil {
+			fmt.Println(r.built.Tasks.Todos.Render())
 		} else {
 			fmt.Println("No todos.")
 		}
 		fmt.Println("(persistent / dependency-tracked tasks are shown via /dag)")
 	case "/dag":
-		fmt.Println(r.built.TaskSvc.TopoView())
-		if progress := r.built.TaskSvc.ProgressSummary(); progress != "" {
+		fmt.Println(r.built.Tasks.Service.TopoView())
+		if progress := r.built.Tasks.Service.ProgressSummary(); progress != "" {
 			fmt.Println(progress)
 		}
 	case "/memory":
-		fmt.Println(r.built.MemoryStore.Stats())
+		fmt.Println(r.built.Tasks.Memory.Stats())
 	case "/mcp":
 		if len(parts) >= 2 && parts[1] == "pending" {
-			pending := r.built.MCPMgr.ListPending()
+			pending := r.built.Team.MCP.ListPending()
 			if len(pending) == 0 {
 				fmt.Println("No pending MCP servers.")
 			} else {
@@ -241,17 +241,17 @@ Bash deny-list and permissions.json still apply when HITL is off.
 				fmt.Println("Use /mcp approve <name> to start a server.")
 			}
 		} else if len(parts) >= 3 && parts[1] == "approve" {
-			fmt.Println(r.built.MCPMgr.Approve(context.Background(), parts[2]))
+			fmt.Println(r.built.Team.MCP.Approve(context.Background(), parts[2]))
 		} else if len(parts) >= 4 && parts[1] == "connect" {
-			fmt.Println(r.built.MCPMgr.Connect(context.Background(), parts[2], parts[3], parts[4:]))
+			fmt.Println(r.built.Team.MCP.Connect(context.Background(), parts[2], parts[3], parts[4:]))
 		} else if len(parts) >= 3 && parts[1] == "disconnect" {
-			fmt.Println(r.built.MCPMgr.Disconnect(parts[2]))
+			fmt.Println(r.built.Team.MCP.Disconnect(parts[2]))
 		} else {
-			fmt.Println("MCP servers: " + r.built.MCPMgr.List())
+			fmt.Println("MCP servers: " + r.built.Team.MCP.List())
 		}
 	case "/team":
 		if len(parts) == 1 {
-			fmt.Println(r.built.TeamMgr.ListAll())
+			fmt.Println(r.built.Team.Mgr.ListAll())
 			break
 		}
 		switch parts[1] {
@@ -259,38 +259,38 @@ Bash deny-list and permissions.json still apply when HITL is off.
 			if len(parts) < 5 {
 				fmt.Println("Usage: /team spawn <name> <role> <prompt>")
 			} else {
-				fmt.Println(r.built.TeamMgr.Spawn(context.Background(), parts[2], parts[3], strings.Join(parts[4:], " ")))
+				fmt.Println(r.built.Team.Mgr.Spawn(context.Background(), parts[2], parts[3], strings.Join(parts[4:], " ")))
 			}
 		case "shutdown":
 			if len(parts) < 3 {
 				fmt.Println("Usage: /team shutdown <name>")
 			} else {
-				fmt.Println(r.built.TeamMgr.ShutdownByName(parts[2]))
+				fmt.Println(r.built.Team.Mgr.ShutdownByName(parts[2]))
 			}
 		case "message":
 			if len(parts) < 4 {
 				fmt.Println("Usage: /team message <name> <content>")
 			} else {
-				fmt.Println(r.built.Bus.Send("lead", parts[2], strings.Join(parts[3:], " "), "message", nil))
+				fmt.Println(r.built.Team.Bus.Send("lead", parts[2], strings.Join(parts[3:], " "), "message", nil))
 			}
 		case "inbox":
-			data, _ := json.Marshal(r.built.Bus.ReadInbox("lead"))
+			data, _ := json.Marshal(r.built.Team.Bus.ReadInbox("lead"))
 			fmt.Println(string(data))
 		default:
-			fmt.Println(r.built.TeamMgr.ListAll())
+			fmt.Println(r.built.Team.Mgr.ListAll())
 		}
 	case "/session":
 		if len(parts) < 2 {
-			fmt.Printf("Session: %s (%s)\n", r.built.SessionID, r.built.SessionTitle)
+			fmt.Printf("Session: %s (%s)\n", r.built.Session.ID, r.built.Session.Title)
 			fmt.Println("Usage: /session [list|switch <id>|new|rename <title>|archive]")
 		} else {
 			switch parts[1] {
 			case "list":
-				fmt.Println(r.built.SessionRepo.ListSessions())
+				fmt.Println(r.built.Session.Repo.ListSessions())
 			case "switch":
 				if len(parts) < 3 {
 					fmt.Println("Usage: /session switch <id>")
-				} else if err := r.built.SessionRepo.SwitchActive(parts[2]); err != "" {
+				} else if err := r.built.Session.Repo.SwitchActive(parts[2]); err != "" {
 					fmt.Println(err)
 				} else {
 					r.next = &application.BuildOptions{SessionID: parts[2]}
@@ -303,13 +303,13 @@ Bash deny-list and permissions.json still apply when HITL is off.
 				if len(parts) < 3 {
 					fmt.Println("Usage: /session rename <title>")
 				} else {
-					fmt.Println(r.built.SessionRepo.RenameSession(r.built.SessionID, strings.Join(parts[2:], " ")))
+					fmt.Println(r.built.Session.Repo.RenameSession(r.built.Session.ID, strings.Join(parts[2:], " ")))
 				}
 			case "archive":
-				if r.built.MemoryStore != nil {
-					r.built.MemoryStore.SaveSessionMemory(r.built.SessionID, summarizeMessages(*messages))
+				if r.built.Tasks.Memory != nil {
+					r.built.Tasks.Memory.SaveSessionMemory(r.built.Session.ID, summarizeMessages(*messages))
 				}
-				if err := r.built.SessionRepo.ArchiveSession(r.built.SessionID); err != "" {
+				if err := r.built.Session.Repo.ArchiveSession(r.built.Session.ID); err != "" {
 					fmt.Println(err)
 				} else {
 					r.next = &application.BuildOptions{NewSession: true}
@@ -320,25 +320,25 @@ Bash deny-list and permissions.json still apply when HITL is off.
 			}
 		}
 	case "/judge":
-		if r.built.Judge.IsEnabled() {
-			r.built.Judge.SetEnabled(false)
+		if r.built.Runtime.Judge.IsEnabled() {
+			r.built.Runtime.Judge.SetEnabled(false)
 		} else {
-			r.built.Judge.SetEnabled(true)
+			r.built.Runtime.Judge.SetEnabled(true)
 		}
-		fmt.Printf("Judge: %v\n", r.built.Judge.IsEnabled())
+		fmt.Printf("Judge: %v\n", r.built.Runtime.Judge.IsEnabled())
 	case "/hitl":
 		if len(parts) > 1 {
 			switch strings.ToLower(parts[1]) {
 			case "off":
-				r.built.HitlMgr.SetEnabled(false)
+				r.built.Security.HITL.SetEnabled(false)
 				fmt.Println("HITL disabled — no approval prompts (bash deny / permissions still apply).")
 			case "on":
-				r.built.HitlMgr.SetEnabled(true)
-				fmt.Printf("HITL enabled (mode=%s).\n", r.built.HitlMgr.Mode())
+				r.built.Security.HITL.SetEnabled(true)
+				fmt.Printf("HITL enabled (mode=%s).\n", r.built.Security.HITL.Mode())
 			default:
 				if mode, err := hitlaudit.ParseMode(parts[1]); err == nil {
-					r.built.HitlMgr.SetMode(mode)
-					r.built.HitlMgr.SetEnabled(true)
+					r.built.Security.HITL.SetMode(mode)
+					r.built.Security.HITL.SetEnabled(true)
 					r.syncApprovalWithHITL(mode)
 					fmt.Printf("HITL mode: %s\n", parts[1])
 				} else {
@@ -347,21 +347,21 @@ Bash deny-list and permissions.json still apply when HITL is off.
 				}
 			}
 		} else {
-			r.built.HitlMgr.SetEnabled(!r.built.HitlMgr.IsEnabled())
-			if r.built.HitlMgr.IsEnabled() {
-				fmt.Printf("HITL enabled (mode=%s).\n", r.built.HitlMgr.Mode())
+			r.built.Security.HITL.SetEnabled(!r.built.Security.HITL.IsEnabled())
+			if r.built.Security.HITL.IsEnabled() {
+				fmt.Printf("HITL enabled (mode=%s).\n", r.built.Security.HITL.Mode())
 			} else {
 				fmt.Println("HITL disabled.")
 			}
 		}
 	case "/inbox":
-		data, _ := json.Marshal(r.built.Bus.ReadInbox(r.built.AgentID))
+		data, _ := json.Marshal(r.built.Team.Bus.ReadInbox(r.built.Session.AgentID))
 		fmt.Println(string(data))
 	case "/search":
 		if len(parts) < 2 {
 			fmt.Println("Usage: /search <query>")
-		} else if r.built.WebService != nil {
-			output, err := r.built.WebService.Search(context.Background(), strings.Join(parts[1:], " "))
+		} else if r.built.Runtime.Web != nil {
+			output, err := r.built.Runtime.Web.Search(context.Background(), strings.Join(parts[1:], " "))
 			if err != nil {
 				fmt.Println(err)
 			} else {
@@ -369,18 +369,18 @@ Bash deny-list and permissions.json still apply when HITL is off.
 			}
 		}
 	case "/permissions":
-		if len(parts) > 1 && parts[1] == "reload" && r.built.ReloadPermissions != nil {
-			if err := r.built.ReloadPermissions(); err != nil {
+		if len(parts) > 1 && parts[1] == "reload" && r.built.Security.ReloadPermissions != nil {
+			if err := r.built.Security.ReloadPermissions(); err != nil {
 				fmt.Println(err)
 			} else {
 				fmt.Println("Permissions reloaded.")
 			}
 		} else {
-			fmt.Println(r.built.Permissions.Describe())
+			fmt.Println(r.built.Security.Permissions.Describe())
 		}
 	case "/usage":
-		if r.built.UsageTracker != nil {
-			fmt.Println(r.built.UsageTracker.Render())
+		if r.built.Session.Usage != nil {
+			fmt.Println(r.built.Session.Usage.Render())
 		} else {
 			fmt.Println("Usage tracking not available.")
 		}
@@ -412,16 +412,16 @@ Bash deny-list and permissions.json still apply when HITL is off.
 			}
 		}
 	case "/decisions":
-		if r.built.DecisionLog != nil {
-			fmt.Println(r.built.DecisionLog.Render())
+		if r.built.Security.DecisionLog != nil {
+			fmt.Println(r.built.Security.DecisionLog.Render())
 		} else {
 			fmt.Println("Decision log not available.")
 		}
 	case "/compact":
-		if r.built.Compact == nil {
+		if r.built.Session.Compact == nil {
 			fmt.Println("Compaction unavailable.")
 		} else {
-			*messages = r.built.Compact(ctx, *messages)
+			*messages = r.built.Session.Compact(ctx, *messages)
 			fmt.Printf("Compacted conversation to %d messages.\n", len(*messages))
 		}
 	case "/exit", "/quit":
@@ -436,12 +436,12 @@ Bash deny-list and permissions.json still apply when HITL is off.
 func (r *repl) nextBuild() *application.BuildOptions { return r.next }
 
 func (r *repl) approvalState() *security.ApprovalState {
-	return r.built.Approval
+	return r.built.Security.Approval
 }
 
 func (r *repl) applyApprovePreset(preset string, mode hitlaudit.HITLMode) {
-	r.built.HitlMgr.SetEnabled(true)
-	r.built.HitlMgr.SetMode(mode)
+	r.built.Security.HITL.SetEnabled(true)
+	r.built.Security.HITL.SetMode(mode)
 	r.approvalState().ApplyPreset(preset)
 }
 
@@ -458,7 +458,7 @@ func (r *repl) syncApprovalWithHITL(mode hitlaudit.HITLMode) {
 
 func (r *repl) printApproveStatus() {
 	state := r.approvalState()
-	mode := r.built.HitlMgr.Mode()
+	mode := r.built.Security.HITL.Mode()
 	fmt.Println("Approval status:")
 	fmt.Printf("  HITL mode:           %s\n", mode)
 	fmt.Printf("  Auto-approve safe:   %v\n", state.IsAutoApproveSafe())

@@ -339,7 +339,6 @@ go-code-agent/
 │   ├── logging/                 # 结构化日志
 │   ├── utils/                   # 终端与辅助函数
 │   └── eval/                    # 回归评估辅助
-├── prompts/                     # 可选 prompt 覆盖
 ├── skills/                      # 示例工作区 skills
 ├── go.mod
 ├── README.md
