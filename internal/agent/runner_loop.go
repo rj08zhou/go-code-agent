@@ -15,7 +15,7 @@ import (
 func (r *Runner) resetTurnState() {
 	r.turn = newTurnState()
 	if r.todoState != nil {
-		r.turn.hasOpenItems, _ = r.todoState()
+		r.turn.planning.HasOpenItems, _ = r.todoState()
 	}
 }
 
@@ -33,8 +33,24 @@ func (r *Runner) emit(e event.Event) {
 	r.eventSink.Emit(e)
 }
 
-func (r *Runner) injectMemoryRecall(messages []llm.Message) []llm.Message {
+func (r *Runner) injectTurnContext(messages []llm.Message) []llm.Message {
 	r.turn.originalTask = lastUserMessage(messages)
+	messages = r.injectDynamicContext(messages)
+	return r.injectMemoryRecall(messages)
+}
+
+func (r *Runner) injectDynamicContext(messages []llm.Message) []llm.Message {
+	if r.dynamicContext == nil {
+		return messages
+	}
+	block := strings.TrimSpace(r.dynamicContext())
+	if block == "" {
+		return messages
+	}
+	return append(messages, llm.UserMessage(block))
+}
+
+func (r *Runner) injectMemoryRecall(messages []llm.Message) []llm.Message {
 	if r.memoryRecall == nil || r.turn.originalTask == "" {
 		return messages
 	}
@@ -77,7 +93,7 @@ func (r *Runner) prepareRound(
 	// persisted by the REPL, so removing them is transparent to history.
 	if trimmed, removed := dropConsumedNudges(messages); removed > 0 {
 		messages = trimmed
-		r.turn.cachedTokens = 0
+		r.turn.tokens.invalidateCache()
 		r.emit(event.Event{
 			Type:    event.ContextDecision,
 			TraceID: traceID,
@@ -102,22 +118,21 @@ func (r *Runner) prepareRound(
 	if r.compress != nil && r.turn.rounds > 0 && r.turn.rounds%config.TokenCheckInterval == 0 {
 		// Refresh cached token estimate every TokenCheckInterval rounds
 		// (matching original preRound pattern).
-		if r.turn.rounds-r.turn.cachedTokensAt >= config.TokenCheckInterval || r.turn.cachedTokens == 0 {
-			r.turn.cachedTokens = llm.EstimateRequestTokens(messages, toolDefs)
-			r.turn.cachedTokensAt = r.turn.rounds
+		if r.turn.rounds-r.turn.tokens.CachedAt >= config.TokenCheckInterval || r.turn.tokens.Cached == 0 {
+			r.turn.tokens.refreshCache(llm.EstimateRequestTokens(messages, toolDefs), r.turn.rounds)
 		}
 		shouldCompact := NeedsCompaction(messages, toolDefs, ctxWindowTokens)
-		if r.profile.Role == "explore" && r.turn.cachedTokens > config.SubagentCompactionThreshold {
+		if r.profile.Role == "explore" && r.turn.tokens.Cached > config.SubagentCompactionThreshold {
 			shouldCompact = true
 		}
 		if shouldCompact {
 			if r.profile.Role == "explore" {
-				r.turn.promptTokensUsed += int64(r.turn.cachedTokens)
+				r.turn.tokens.PromptUsed += int64(r.turn.tokens.Cached)
 			}
 			messages = r.compress.AutoCompact(ctx, messages, r.profile.SystemPrompt)
 			// Invalidate cache after compaction since the message slice
 			// was rebuilt.
-			r.turn.cachedTokens = 0
+			r.turn.tokens.invalidateCache()
 			r.emit(event.Event{
 				Type:    event.ContextDecision,
 				TraceID: traceID,
@@ -140,17 +155,16 @@ func (r *Runner) prepareRound(
 	if r.turn.rounds > 0 && r.turn.rounds%microCompactInterval == 0 {
 		// Refresh the token estimate if the auto-compaction block above
 		// didn't already do it this round (e.g. when compression is off).
-		if r.turn.cachedTokens == 0 || r.turn.rounds-r.turn.cachedTokensAt >= config.TokenCheckInterval {
-			r.turn.cachedTokens = llm.EstimateRequestTokens(messages, toolDefs)
-			r.turn.cachedTokensAt = r.turn.rounds
+		if r.turn.tokens.Cached == 0 || r.turn.rounds-r.turn.tokens.CachedAt >= config.TokenCheckInterval {
+			r.turn.tokens.refreshCache(llm.EstimateRequestTokens(messages, toolDefs), r.turn.rounds)
 		}
 		microThreshold := int(float64(ctxWindowTokens) * config.MicroCompactThresholdFrac)
-		if r.turn.cachedTokens > microThreshold {
+		if r.turn.tokens.Cached > microThreshold {
 			cleared, reclaimed := MicroCompact(messages, config.MicroCompactMinClearBytes)
 			if cleared > 0 {
 				// Reclaimed bytes changed the message list; force a
 				// re-estimate on the next token check.
-				r.turn.cachedTokens = 0
+				r.turn.tokens.invalidateCache()
 				r.emit(event.Event{
 					Type:    event.ContextDecision,
 					TraceID: traceID,
@@ -168,7 +182,7 @@ func (r *Runner) prepareRound(
 	// --- Planning gate (round 0 & 1 only) ---
 	if r.planGate != nil && r.turn.rounds <= 1 {
 		if planMsg := r.planGate.Eval(
-			r.turn.rounds, r.turn.usedPlanning, r.turn.usedThink, r.turn.usedExplore,
+			r.turn.rounds, r.turn.planning.UsedPlanning, r.turn.planning.UsedThink, r.turn.explore.Used,
 			r.turn.originalTask,
 		); planMsg != "" {
 			r.emit(event.Event{
@@ -179,22 +193,14 @@ func (r *Runner) prepareRound(
 		}
 	}
 
-	// Show pending tasks ONCE at round 0 as a user note (not system),
-	// preserving system block stability for prompt caching.
-	if r.turn.rounds == 0 && r.taskProgress != nil {
-		if progress := strings.TrimSpace(r.taskProgress()); progress != "" {
-			messages = append(messages, llm.UserMessage(
-				"Note: the following tasks from a previous session are still open. "+
-					"Only resume them if the user explicitly asks. "+
-					"If the user says nothing about them, ignore them:\n"+progress))
-		}
-	}
-
 	// --- Reflection check ---
 	if r.reflection != nil {
 		progressSummary := ""
+		if r.taskProgress != nil {
+			progressSummary = r.taskProgress()
+		}
 		taskCount := 0
-		if r.turn.hasOpenItems || r.turn.originalTask != "" {
+		if r.turn.planning.HasOpenItems || r.turn.originalTask != "" {
 			taskCount = 1
 		}
 		stuckThresh := config.StuckThreshold
@@ -202,32 +208,32 @@ func (r *Runner) prepareRound(
 			stuckThresh = config.ExploreStuckThreshold
 		}
 		reflPrompts, resetF, resetNag, resetStuck, triggered := r.reflection.Eval(
-			r.turn.consecutiveFails, r.turn.lastFailedTool,
+			r.turn.failure.Consecutive, r.turn.failure.LastTool,
 			config.MaxConsecutiveFailures,
 			r.turn.rounds, r.turn.failures,
-			r.turn.roundsSinceComplete, r.turn.roundsWithoutTodo,
+			r.turn.failure.RoundsSinceComplete, r.turn.planning.RoundsWithoutTodo,
 			stuckThresh, config.ReflectInterval,
-			r.turn.hasOpenItems, r.turn.lastTriggered,
+			r.turn.planning.HasOpenItems, r.turn.planning.LastTriggered,
 			taskCount, progressSummary,
 		)
 		if resetF {
-			r.turn.consecutiveFails = 0
+			r.turn.failure.clearConsecutive()
 		}
 		if resetNag {
-			r.turn.roundsWithoutTodo = 0
+			r.turn.planning.clearRoundsWithoutTodo()
 		}
 		if resetStuck {
-			r.turn.roundsSinceComplete = 0
+			r.turn.failure.clearRoundsSinceComplete()
 		}
 		for _, k := range triggered {
-			r.turn.lastTriggered[k] = r.turn.rounds
+			r.turn.planning.markTriggered(k, r.turn.rounds)
 			r.emit(event.Event{
 				Type:    event.ReflectionTriggered,
 				TraceID: traceID,
 				Payload: map[string]string{
 					"kind":                  k,
-					"consecutive_fails":     fmt.Sprintf("%d", r.turn.consecutiveFails),
-					"rounds_since_complete": fmt.Sprintf("%d", r.turn.roundsSinceComplete),
+					"consecutive_fails":     fmt.Sprintf("%d", r.turn.failure.Consecutive),
+					"rounds_since_complete": fmt.Sprintf("%d", r.turn.failure.RoundsSinceComplete),
 					"prompt_count":          fmt.Sprintf("%d", len(reflPrompts)),
 				},
 			})
@@ -267,17 +273,17 @@ func (r *Runner) callModel(
 	}
 	if r.profile.Role == "explore" {
 		estimatedPrompt := int64(llm.EstimateRequestTokens(messages, toolDefs))
-		if r.turn.promptTokensUsed > 0 {
-			frac := float64(r.turn.promptTokensUsed) / float64(config.SubagentPromptTokenBudget)
-			if !r.turn.budgetWarnInjected && frac >= config.ExploreBudgetWarnFrac {
+		if r.turn.tokens.PromptUsed > 0 {
+			frac := float64(r.turn.tokens.PromptUsed) / float64(config.SubagentPromptTokenBudget)
+			if !r.turn.tokens.BudgetWarnInjected && frac >= config.ExploreBudgetWarnFrac {
 				messages = append(messages, llm.UserMessage(
 					"<budget-warn>You have used most of your prompt budget. "+
 						"Prefer synthesizing a summary now. At most one more targeted "+
 						"read/search if a critical fact is still missing — then stop.</budget-warn>"))
-				r.turn.budgetWarnInjected = true
+				r.turn.tokens.BudgetWarnInjected = true
 			}
 		}
-		if r.turn.promptTokensUsed > 0 && r.turn.promptTokensUsed+estimatedPrompt > config.SubagentPromptTokenBudget {
+		if r.turn.tokens.PromptUsed > 0 && r.turn.tokens.PromptUsed+estimatedPrompt > config.SubagentPromptTokenBudget {
 			// Turn in a summary instead of tearing the investigation
 			// (master soft-deadline spirit applied to prompt budget).
 			done := r.finalizeWithoutTools(ctx, messages, modelID, traceID, out,
@@ -288,7 +294,7 @@ func (r *Runner) callModel(
 					"verified explicitly. Partial answers beat an incomplete stub.</limit>")
 			return messages, nil, &done
 		}
-		r.turn.promptTokensUsed += estimatedPrompt
+		r.turn.tokens.PromptUsed += estimatedPrompt
 	}
 
 	started := time.Now()
@@ -342,9 +348,9 @@ func (r *Runner) handleTruncation(messages []llm.Message, sr *llm.StreamResult, 
 		messages = append(messages, llm.ToolMessage(result.ToToolMessage(), tc.ID))
 	}
 	return append(messages, llm.UserMessage(
-		"<system>Your previous response was truncated due to output length limits. "+
+		"<response-truncated>Your previous response was truncated due to output length limits. "+
 			"Some tool calls may have been lost. Please continue from where you left off. "+
-			"Do NOT repeat tool calls that already succeeded above.</system>"))
+			"Do NOT repeat tool calls that already succeeded above.</response-truncated>"))
 }
 
 // handleNoToolCalls runs lesson/judge wrap-up when the model returns plain text.
@@ -362,24 +368,24 @@ func (r *Runner) handleNoToolCalls(
 	// Only for agents with memory capability (lead agent).
 	// Subagents (explore/teammate) have CanMemory=false and
 	// would fail trying to call memory_write.
-	if r.profile.CanMemory && r.turn.rounds >= config.LessonThreshold && !r.turn.lessonWritten && r.lessonWriter != nil {
-		r.turn.lessonWritten = true
-		r.turn.lessonRoundsRemaining = config.LessonRoundsLimit
+	if r.profile.CanMemory && r.turn.rounds >= config.LessonThreshold && !r.turn.lesson.Written && r.lessonWriter != nil {
+		r.turn.lesson.Written = true
+		r.turn.lesson.RoundsRemaining = config.LessonRoundsLimit
 		r.emit(event.Event{
 			Type:    event.MemoryDecision,
 			TraceID: traceID,
 			Payload: map[string]string{"rounds": fmt.Sprintf("%d", r.turn.rounds)},
 		})
 		r.lessonWriter.RecordFailure(ctx, messages)
-		if !r.turn.lessonPromptInjected {
-			r.turn.lessonPromptInjected = true
+		if !r.turn.lesson.PromptInjected {
+			r.turn.lesson.PromptInjected = true
 			messages = append(messages, llm.UserMessage(
 				"<auto-lesson>Record any lessons, preferences, or patterns learned in this session to long-term memory using memory_write.</auto-lesson>"))
 		}
 		return messages, true, TurnOutcome{}
 	}
 
-	if r.judge != nil && r.judge.IsEnabled() && r.turn.judgeRetryInjects < config.JudgeMaxRetryInjects {
+	if r.judge != nil && r.judge.IsEnabled() && r.turn.judge.RetryInjects < config.JudgeMaxRetryInjects {
 		taskText := lastUserMessage(messages)
 		judgeResults := make([]JudgeToolResult, 0, len(out.ToolResults))
 		for _, tr := range out.ToolResults {
@@ -406,7 +412,7 @@ func (r *Runner) handleNoToolCalls(
 		if jerr != nil {
 			// Soft-fail open on judge errors (matches original).
 		} else if verdict != nil && !(verdict.Approved && !verdict.ShouldRetry) {
-			r.turn.judgeRetryInjects++
+			r.turn.judge.RetryInjects++
 			messages = append(messages, llm.UserMessage(verdict.FormatFeedback()))
 			if verdict.Score <= 3 {
 				messages = append(messages, llm.UserMessage(
@@ -451,6 +457,7 @@ func (r *Runner) executeToolBatch(
 	var turnToolCount, turnFailCount int
 	var manualCompress bool
 	var pendingNudges []string
+	hooks := defaultToolInterceptors()
 
 	for _, tc := range toolCalls {
 		if tc.Arguments != "" && !strings.HasPrefix(tc.Arguments, "{") {
@@ -464,36 +471,9 @@ func (r *Runner) executeToolBatch(
 		}
 
 		key := tc.Name + "\x00" + tc.Arguments
-		r.turn.toolCallCounts[key]++
-		// Track per-file reads to detect convergence failures.
-		// Defer the nudge until AFTER every tool result for this turn is
-		// appended: OpenAI/DeepSeek reject any non-tool message between an
-		// assistant(tool_calls) and its tool responses.
-		switch tc.Name {
-		case "read_file", "list_dir":
-			filePath := extractFilePath(tc.Arguments)
-			if filePath != "" {
-				r.turn.readCounts[filePath]++
-				// Explore: nudge on the 2nd hit and hard-fail the 3rd so
-				// re-reads cannot burn the prompt budget (lead keeps the
-				// softer 3rd-hit nudge).
-				if r.profile.Role == "explore" {
-					if r.turn.readCounts[filePath] == 2 {
-						pendingNudges = append(pendingNudges,
-							"<convergence-nudge>You already read/list-dir '"+filePath+
-								"'. Do NOT re-read it — use the prior result, or "+
-								"search_content for a specific fact.</convergence-nudge>")
-					}
-				} else if r.turn.readCounts[filePath] == 3 {
-					pendingNudges = append(pendingNudges,
-						"<convergence-nudge>You have read/list-dir '"+filePath+
-							"' 3 times. STOP re-reading it. "+
-							"Either you have enough information already, or "+
-							"you need a different approach (grep/search_content for specifics, "+
-							"or delegate to explore).</convergence-nudge>")
-				}
-			}
-		}
+		r.turn.tools.bump(key)
+		env := &toolCallEnv{role: r.profile.Role, turn: &r.turn, key: key}
+
 		toolStart := time.Now()
 		r.emit(event.Event{
 			Type:       event.ToolStarted,
@@ -501,30 +481,22 @@ func (r *Runner) executeToolBatch(
 			ToolCallID: tc.ID,
 			ToolName:   tc.Name,
 		})
+
+		// Before hooks: deferred nudges always collected; first non-continue wins.
+		var decision beforeDecision
 		var result tool.Result
-		if r.profile.Role == "explore" && (tc.Name == "read_file" || tc.Name == "list_dir") {
-			if filePath := extractFilePath(tc.Arguments); filePath != "" && r.turn.readCounts[filePath] >= 3 {
-				result = tool.Failed(fmt.Sprintf(
-					"repeated %s of %q blocked; use the earlier result or search_content", tc.Name, filePath))
-				out.ToolResults = append(out.ToolResults, ToolResultRecord{
-					Name: tc.Name, Args: tc.Arguments, Status: result.Status, Output: result.Output,
-				})
-				messages = append(messages, llm.ToolMessage(result.ToToolMessage(), tc.ID))
-				r.turn.failures++
-				turnFailCount++
-				turnToolCount++
-				r.emit(event.Event{
-					Type: event.ToolFinished, TraceID: traceID,
-					ToolCallID: tc.ID, ToolName: tc.Name,
-					Duration: time.Since(toolStart), Status: string(result.Status), Output: result.Output,
-				})
-				continue
+		for _, h := range hooks {
+			br := h.Before(env, tc)
+			pendingNudges = append(pendingNudges, br.nudges...)
+			if br.decision != beforeContinue {
+				decision = br.decision
+				result = br.result
+				break
 			}
 		}
-		// Lead: after a successful explore, cap further tree-walking so the
-		// model cannot burn the context re-reading what explore already summarized.
-		if postExploreBlocked, why := r.postExploreBlock(tc); postExploreBlocked {
-			result = tool.Failed(why)
+
+		switch decision {
+		case beforeDenyEarly:
 			out.ToolResults = append(out.ToolResults, ToolResultRecord{
 				Name: tc.Name, Args: tc.Arguments, Status: result.Status, Output: result.Output,
 			})
@@ -538,21 +510,8 @@ func (r *Runner) executeToolBatch(
 				Duration: time.Since(toolStart), Status: string(result.Status), Output: result.Output,
 			})
 			continue
-		}
-		switch {
-		case r.turn.toolCallCounts[key] > config.MaxRepeatedToolCalls:
-			result = tool.Failed(fmt.Sprintf("repeated tool call blocked: %s. Use a different path, offset, limit, or query.", tc.Name))
-		case tc.Name == "explore":
-			r.turn.exploreDelegations++
-			if r.turn.exploreDelegations > config.MaxExploreDelegations {
-				result = tool.Failed("explore delegation budget exhausted for this turn; synthesize the findings already collected")
-			} else if r.snapshot != nil && r.snapshot.ShouldWrap(tc.Name) {
-				result = r.snapshot.WithSnapshot(tc.Name, func() tool.Result {
-					return r.executor.Execute(ctx, r.scope, tc)
-				})
-			} else {
-				result = r.executor.Execute(ctx, r.scope, tc)
-			}
+		case beforeOverride:
+			// synthetic failure; fall through to after-hooks
 		default:
 			if r.snapshot != nil && r.snapshot.ShouldWrap(tc.Name) {
 				result = r.snapshot.WithSnapshot(tc.Name, func() tool.Result {
@@ -584,53 +543,13 @@ func (r *Runner) executeToolBatch(
 		if !result.Succeeded() {
 			r.turn.failures++
 			turnFailCount++
-			if tc.Name == r.turn.lastFailedTool {
-				r.turn.consecutiveFails++
-			} else {
-				r.turn.consecutiveFails = 1
-				r.turn.lastFailedTool = tc.Name
-			}
-		} else {
-			r.turn.consecutiveFails = 0
-			r.turn.lastFailedTool = ""
-			r.turn.roundsSinceComplete++
 		}
-
-		// Track todo interaction
-		// --- Track planning/thinking flags ---
-		switch tc.Name {
-		case "think", "thinking", "reason":
-			r.turn.usedThink = true
-		case "explore":
-			r.turn.usedExplore = true
-			if result.Succeeded() {
-				r.turn.exploreSucceeded = true
-				pendingNudges = append(pendingNudges, postExploreNudge)
+		for _, h := range hooks {
+			ar := h.After(env, tc, result)
+			pendingNudges = append(pendingNudges, ar.nudges...)
+			if ar.manualCompress {
+				manualCompress = true
 			}
-		case "TodoWrite", "task_create", "task_list", "task_dag", "task_ready":
-			r.turn.usedPlanning = true
-		case "compress":
-			manualCompress = true
-		}
-
-		// Count every allowed lead read/list after explore (including path
-		// errors) so recovery walks cannot bypass the budget.
-		if r.turn.exploreSucceeded && r.profile.Role != "explore" &&
-			(tc.Name == "read_file" || tc.Name == "list_dir") {
-			r.turn.readsAfterExplore++
-		}
-
-		if tc.Name == "TodoWrite" {
-			r.turn.roundsWithoutTodo = 0
-			r.turn.hasOpenItems = false
-			for _, item := range parseArgsItems(tc.Arguments) {
-				if item["status"] != "completed" {
-					r.turn.hasOpenItems = true
-					break
-				}
-			}
-		} else {
-			r.turn.roundsWithoutTodo++
 		}
 		turnToolCount++
 	}
@@ -663,14 +582,14 @@ func (r *Runner) afterTools(
 	// (matching original).
 	if batch.manualCompress && r.compress != nil {
 		messages = r.compress.AutoCompact(ctx, messages, r.profile.SystemPrompt)
-		r.turn.cachedTokens = 0
+		r.turn.tokens.invalidateCache()
 	}
 
 	// Lesson stage budget: if the model was given a lesson prompt, limit
 	// how many extra rounds it can use before we force a wrap-up.
-	if r.turn.lessonWritten {
-		r.turn.lessonRoundsRemaining--
-		if r.turn.lessonRoundsRemaining <= 0 {
+	if r.turn.lesson.Written {
+		r.turn.lesson.RoundsRemaining--
+		if r.turn.lesson.RoundsRemaining <= 0 {
 			out.Rounds = r.turn.rounds
 			out.ToolFailures = r.turn.failures
 			out.Messages = messages

@@ -144,7 +144,7 @@ func (j *Judge) buildPrompt(originalTask string, conversation []llm.Message, too
 		toolResultsBlock = tr.String()
 	}
 
-	tmpl := j.promptLoader.Load("judge_system")
+	tmpl := j.promptLoader.MustLoad("judge_system")
 	return prompt.Render(tmpl, map[string]string{
 		"min_score":           fmt.Sprintf("%d", j.minScore),
 		"original_task":       utils.Truncate(originalTask, 2000),

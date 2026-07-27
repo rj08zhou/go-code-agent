@@ -71,64 +71,82 @@ func (p *OpenAIProvider) Stream(ctx context.Context, params llm.CallParams, sink
 		req.MaxTokens = param.NewOpt(int64(params.MaxTokens))
 	}
 
-	result := &llm.StreamResult{}
-	toolCalls := map[int64]*llm.ToolCall{}
-
+	accum := newOpenAIStreamAccum()
 	stream := p.client.Chat.Completions.NewStreaming(ctx, req)
 	for stream.Next() {
-		evt := stream.Current()
-		for _, choice := range evt.Choices {
-			result.Content += choice.Delta.Content
-			// Forward text immediately for real-time UX. DSML markup may
-			// appear in output for legacy DeepSeek models that lack native
-			// function calling — an acceptable tradeoff vs. complete
-			// silence during long tool-call generation.
-			if choice.Delta.Content != "" {
-				sink.OnTextDelta(choice.Delta.Content)
-			}
-			for _, tc := range choice.Delta.ToolCalls {
-				idx := tc.Index
-				if _, ok := toolCalls[idx]; !ok {
-					toolCalls[idx] = &llm.ToolCall{}
-				}
-				if tc.ID != "" {
-					toolCalls[idx].ID = tc.ID
-				}
-				if tc.Function.Name != "" {
-					toolCalls[idx].Name = tc.Function.Name
-				}
-				toolCalls[idx].Arguments += tc.Function.Arguments
-			}
-			if choice.FinishReason != "" {
-				result.FinishReason = string(choice.FinishReason)
-			}
-		}
-		if evt.JSON.Usage.Valid() || evt.Usage.TotalTokens > 0 {
-			result.Usage = mapOpenAIUsage(evt.Usage)
-		}
+		accum.apply(stream.Current(), sink)
 	}
-
 	streamErr := stream.Err()
-	if clean, dsmlCalls, parsed := parseDSMLToolCalls(result.Content); parsed {
-		result.Content = clean
-		for _, tc := range dsmlCalls {
-			result.ToolCalls = append(result.ToolCalls, tc)
+	return accum.finalize(sink), streamErr
+}
+
+// openAIStreamAccum folds ChatCompletionChunk deltas into a StreamResult.
+// Extracted so golden tests can feed recorded chunk JSON without HTTP.
+type openAIStreamAccum struct {
+	result    *llm.StreamResult
+	toolCalls map[int64]*llm.ToolCall
+}
+
+func newOpenAIStreamAccum() *openAIStreamAccum {
+	return &openAIStreamAccum{
+		result:    &llm.StreamResult{},
+		toolCalls: map[int64]*llm.ToolCall{},
+	}
+}
+
+func (a *openAIStreamAccum) apply(evt openai.ChatCompletionChunk, sink model.StreamSink) {
+	for _, choice := range evt.Choices {
+		a.result.Content += choice.Delta.Content
+		// Forward text immediately for real-time UX. DSML markup may
+		// appear in output for legacy DeepSeek models that lack native
+		// function calling — an acceptable tradeoff vs. complete
+		// silence during long tool-call generation.
+		if choice.Delta.Content != "" && sink != nil {
+			sink.OnTextDelta(choice.Delta.Content)
+		}
+		for _, tc := range choice.Delta.ToolCalls {
+			idx := tc.Index
+			if _, ok := a.toolCalls[idx]; !ok {
+				a.toolCalls[idx] = &llm.ToolCall{}
+			}
+			if tc.ID != "" {
+				a.toolCalls[idx].ID = tc.ID
+			}
+			if tc.Function.Name != "" {
+				a.toolCalls[idx].Name = tc.Function.Name
+			}
+			a.toolCalls[idx].Arguments += tc.Function.Arguments
+		}
+		if choice.FinishReason != "" {
+			a.result.FinishReason = string(choice.FinishReason)
 		}
 	}
-	indices := make([]int64, 0, len(toolCalls))
-	for idx := range toolCalls {
+	if evt.JSON.Usage.Valid() || evt.Usage.TotalTokens > 0 {
+		a.result.Usage = mapOpenAIUsage(evt.Usage)
+	}
+}
+
+func (a *openAIStreamAccum) finalize(sink model.StreamSink) *llm.StreamResult {
+	if clean, dsmlCalls, parsed := parseDSMLToolCalls(a.result.Content); parsed {
+		a.result.Content = clean
+		a.result.ToolCalls = append(a.result.ToolCalls, dsmlCalls...)
+	}
+	indices := make([]int64, 0, len(a.toolCalls))
+	for idx := range a.toolCalls {
 		indices = append(indices, idx)
 	}
 	sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
 	for _, idx := range indices {
-		tc := toolCalls[idx]
+		tc := a.toolCalls[idx]
 		if tc.ID == "" {
 			tc.ID = fmt.Sprintf("call_%d", idx)
 		}
-		result.ToolCalls = append(result.ToolCalls, *tc)
+		a.result.ToolCalls = append(a.result.ToolCalls, *tc)
 	}
-	sink.OnDone()
-	return result, streamErr
+	if sink != nil {
+		sink.OnDone()
+	}
+	return a.result
 }
 
 func toOpenAIMessages(msgs []llm.Message) []openai.ChatCompletionMessageParamUnion {

@@ -3,7 +3,10 @@ package event
 
 import (
 	"encoding/json"
+	"fmt"
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/logging"
+	"sync/atomic"
 	"time"
 )
 
@@ -90,8 +93,14 @@ type Sink interface {
 }
 
 // MultiSink broadcasts events to all registered sinks.
+//
+// Emit is fire-and-forget: a panic or blocking in any single sink must never
+// take down the caller (the agent loop). Each sink is therefore invoked inside
+// its own recovery scope; a failing sink is skipped, counted, and logged, and
+// broadcasting continues to the remaining sinks.
 type MultiSink struct {
-	sinks []Sink
+	sinks    []Sink
+	failures atomic.Int64
 }
 
 func NewMultiSink(sinks ...Sink) *MultiSink {
@@ -101,8 +110,24 @@ func NewMultiSink(sinks ...Sink) *MultiSink {
 func (m *MultiSink) Emit(ev Event) {
 	ev.Timestamp = time.Now()
 	for _, s := range m.sinks {
-		s.Emit(ev)
+		func(s Sink) {
+			defer func() {
+				if r := recover(); r != nil {
+					m.failures.Add(1)
+					logging.Default().Warn(
+						fmt.Sprintf("event sink panicked and was skipped: %v", r))
+				}
+			}()
+			s.Emit(ev)
+		}(s)
 	}
+}
+
+// Failures returns the number of sink invocations that panicked since the
+// MultiSink was created. It is a coarse health signal: a non-zero value means
+// at least one sink is misbehaving.
+func (m *MultiSink) Failures() int64 {
+	return m.failures.Load()
 }
 
 func (m *MultiSink) Add(s Sink) {

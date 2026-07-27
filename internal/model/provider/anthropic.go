@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
+	"sort"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -80,71 +81,104 @@ func (p *AnthropicProvider) Stream(ctx context.Context, params llm.CallParams, s
 		req.Temperature = param.NewOpt(params.Temperature)
 	}
 
-	result := &llm.StreamResult{}
-
-	type toolAccum struct {
-		ID       string
-		Name     string
-		ArgsJSON strings.Builder
-	}
-	blocks := map[int64]*toolAccum{}
-
+	accum := newAnthropicStreamAccum()
 	stream := p.client.Messages.NewStreaming(ctx, req)
 	for stream.Next() {
-		ev := stream.Current()
-		switch ev.Type {
-		case "message_start":
-			ms := ev.AsMessageStart()
-			result.Usage.PromptTokens = ms.Message.Usage.InputTokens
-			result.Usage.CachedReadTokens = ms.Message.Usage.CacheReadInputTokens
-			result.Usage.CacheCreateTokens = ms.Message.Usage.CacheCreationInputTokens
-		case "content_block_start":
-			cb := ev.ContentBlock
-			if cb.Type == "tool_use" {
-				blocks[ev.Index] = &toolAccum{ID: cb.ID, Name: cb.Name}
-				if cb.Input != nil {
-					if data, err := json.Marshal(cb.Input); err == nil {
-						blocks[ev.Index].ArgsJSON.Write(data)
+		accum.apply(stream.Current(), sink)
+	}
+	return accum.finalize(sink), stream.Err()
+}
+
+type anthropicToolAccum struct {
+	ID       string
+	Name     string
+	ArgsJSON strings.Builder
+}
+
+// anthropicStreamAccum folds MessageStreamEventUnion events into a StreamResult.
+// Extracted so golden tests can feed recorded SSE data payloads without HTTP.
+type anthropicStreamAccum struct {
+	result *llm.StreamResult
+	blocks map[int64]*anthropicToolAccum
+}
+
+func newAnthropicStreamAccum() *anthropicStreamAccum {
+	return &anthropicStreamAccum{
+		result: &llm.StreamResult{},
+		blocks: map[int64]*anthropicToolAccum{},
+	}
+}
+
+func (a *anthropicStreamAccum) apply(ev anthropic.MessageStreamEventUnion, sink model.StreamSink) {
+	switch ev.Type {
+	case "message_start":
+		ms := ev.AsMessageStart()
+		a.result.Usage.PromptTokens = ms.Message.Usage.InputTokens
+		a.result.Usage.CachedReadTokens = ms.Message.Usage.CacheReadInputTokens
+		a.result.Usage.CacheCreateTokens = ms.Message.Usage.CacheCreationInputTokens
+	case "content_block_start":
+		cb := ev.ContentBlock
+		if cb.Type == "tool_use" {
+			a.blocks[ev.Index] = &anthropicToolAccum{ID: cb.ID, Name: cb.Name}
+			// Streaming tool_use starts with input:{} ; the real JSON arrives
+			// via input_json_delta. Do not marshal the empty placeholder or
+			// arguments become "{}{\"path\":...}".
+			if cb.Input != nil {
+				if data, err := json.Marshal(cb.Input); err == nil {
+					if s := string(data); s != "{}" && s != "null" {
+						a.blocks[ev.Index].ArgsJSON.Write(data)
 					}
 				}
 			}
-		case "content_block_delta":
-			d := ev.Delta
-			switch d.Type {
-			case "text_delta":
-				if d.Text != "" {
+		}
+	case "content_block_delta":
+		d := ev.Delta
+		switch d.Type {
+		case "text_delta":
+			if d.Text != "" {
+				if sink != nil {
 					sink.OnTextDelta(d.Text)
-					result.Content += d.Text
 				}
-			case "input_json_delta":
-				if acc, ok := blocks[ev.Index]; ok {
-					acc.ArgsJSON.WriteString(d.PartialJSON)
-				}
+				a.result.Content += d.Text
 			}
-		case "message_delta":
-			if sr := ev.Delta.StopReason; sr != "" {
-				result.FinishReason = mapAnthropicStop(anthropic.StopReason(sr))
-			}
-			if ev.Usage.OutputTokens > 0 {
-				result.Usage.CompletionTokens = ev.Usage.OutputTokens
-				result.Usage.TotalTokens = result.Usage.PromptTokens + ev.Usage.OutputTokens
+		case "input_json_delta":
+			if acc, ok := a.blocks[ev.Index]; ok {
+				acc.ArgsJSON.WriteString(d.PartialJSON)
 			}
 		}
+	case "message_delta":
+		if sr := ev.Delta.StopReason; sr != "" {
+			a.result.FinishReason = mapAnthropicStop(anthropic.StopReason(sr))
+		}
+		if ev.Usage.OutputTokens > 0 {
+			a.result.Usage.CompletionTokens = ev.Usage.OutputTokens
+			a.result.Usage.TotalTokens = a.result.Usage.PromptTokens + ev.Usage.OutputTokens
+		}
 	}
-	sink.OnDone()
+}
 
-	for _, acc := range blocks {
+func (a *anthropicStreamAccum) finalize(sink model.StreamSink) *llm.StreamResult {
+	indices := make([]int64, 0, len(a.blocks))
+	for idx := range a.blocks {
+		indices = append(indices, idx)
+	}
+	sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
+	for _, idx := range indices {
+		acc := a.blocks[idx]
 		args := acc.ArgsJSON.String()
 		if args == "" {
 			args = "{}"
 		}
-		result.ToolCalls = append(result.ToolCalls, llm.ToolCall{
+		a.result.ToolCalls = append(a.result.ToolCalls, llm.ToolCall{
 			ID:        acc.ID,
 			Name:      acc.Name,
 			Arguments: args,
 		})
 	}
-	return result, stream.Err()
+	if sink != nil {
+		sink.OnDone()
+	}
+	return a.result
 }
 
 func buildAnthropicMessages(msgs []llm.Message) ([]anthropic.TextBlockParam, []anthropic.MessageParam) {

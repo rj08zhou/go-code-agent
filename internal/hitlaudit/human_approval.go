@@ -72,8 +72,6 @@ type HITLManager struct {
 	mode                   HITLMode
 	nonTTYFallback         HITLDecision
 	toolsRequiringReview   map[string]bool
-	dangerousBashPrefixes  []string
-	safeBashPrefixes       []string
 	criticalPathSubstrings []string
 	mu                     sync.RWMutex
 	promptLoader           *prompt.Loader
@@ -91,20 +89,6 @@ func NewHITLManager(pl *prompt.Loader) *HITLManager {
 		promptLoader:   pl,
 		toolsRequiringReview: map[string]bool{
 			"delete_file": true, "bash": true, "execute_command": true, "background_run": true,
-		},
-		dangerousBashPrefixes: []string{
-			"rm -rf", "rm -r", "rm /", "git push --force", "git push -f",
-			"git reset --hard", "git clean -f", "docker rm", "docker rmi",
-			"npm publish", "cargo publish", "kubectl delete", "terraform apply", "terraform destroy",
-		},
-		safeBashPrefixes: []string{
-			"ls", "ll", "la", "pwd", "cd",
-			"cat", "head", "tail", "less", "more",
-			"grep", "egrep", "fgrep", "rg", "ag",
-			"find", "locate", "which", "whereis",
-			"echo", "printf", "date", "whoami", "hostname", "uname",
-			"go test", "go build", "go vet", "go run", "go list", "go doc", "go mod",
-			"wc", "stat", "file", "du", "df", "env", "printenv",
 		},
 		criticalPathSubstrings: []string{
 			".env", ".env.local", ".env.production", "credentials", "secrets",
@@ -129,13 +113,17 @@ func (h *HITLManager) NeedsReview(toolName, arguments string) (bool, string, str
 	isShellTool := toolName == "bash" || toolName == "execute_command" || toolName == "background_run"
 
 	if isShellTool && h.toolsRequiringReview[toolName] {
-		if prefix := h.matchBashPrefix(arguments); prefix != "" {
-			return true, "high", fmt.Sprintf("bash matches dangerous prefix '%s'", prefix)
+		// Risk classification is delegated to the single source of truth in
+		// the security package; HITL only maps verdicts to review decisions.
+		c := security.ClassifyCommand(extractBashCommand(arguments))
+		switch c.Verdict {
+		case security.VerdictDeny, security.VerdictDanger:
+			return true, "high", c.Reason
+		case security.VerdictSafe:
+			return false, "low", c.Reason
+		default: // VerdictCaution
+			return true, "medium", fmt.Sprintf("shell execution via '%s' requires review: %s", toolName, c.Reason)
 		}
-		if h.allSubCommandsSafe(arguments) {
-			return false, "low", "bash command is read-only/inspection-only"
-		}
-		return true, "medium", fmt.Sprintf("shell execution via '%s' requires review", toolName)
 	}
 
 	if h.toolsRequiringReview[toolName] {
@@ -150,196 +138,6 @@ func (h *HITLManager) NeedsReview(toolName, arguments string) (bool, string, str
 		}
 	}
 	return false, "", ""
-}
-
-func (h *HITLManager) matchBashPrefix(arguments string) string {
-	cmd := extractBashCommand(arguments)
-	if cmd == "" {
-		return ""
-	}
-	lower := strings.ToLower(cmd)
-	for _, p := range h.dangerousBashPrefixes {
-		if strings.Contains(lower, strings.ToLower(p)) {
-			return p
-		}
-	}
-	return ""
-}
-
-func (h *HITLManager) allSubCommandsSafe(arguments string) bool {
-	cmd := extractBashCommand(arguments)
-	if strings.TrimSpace(cmd) == "" {
-		return false
-	}
-	parts := splitShellPipeline(cmd)
-	if len(parts) == 0 {
-		return false
-	}
-	for _, p := range parts {
-		if !h.isSafeSingleCommand(p) {
-			return false
-		}
-	}
-	return true
-}
-
-func splitShellPipeline(cmd string) []string {
-	var out []string
-	var cur strings.Builder
-	var quote byte
-	flush := func() {
-		s := strings.TrimSpace(cur.String())
-		if s != "" {
-			out = append(out, s)
-		}
-		cur.Reset()
-	}
-	for i := 0; i < len(cmd); i++ {
-		c := cmd[i]
-		if quote != 0 {
-			cur.WriteByte(c)
-			if c == quote {
-				quote = 0
-			}
-			continue
-		}
-		switch c {
-		case '\\':
-			cur.WriteByte(c)
-			if i+1 < len(cmd) {
-				i++
-				cur.WriteByte(cmd[i])
-			}
-		case '\'', '"':
-			quote = c
-			cur.WriteByte(c)
-		case '&':
-			prev := byte(0)
-			if cur.Len() > 0 {
-				prev = []byte(cur.String())[cur.Len()-1]
-			}
-			if prev == '>' || prev == '<' {
-				cur.WriteByte(c)
-				continue
-			}
-			if i+1 < len(cmd) && cmd[i+1] == '&' {
-				flush()
-				i++
-			} else {
-				flush()
-			}
-		case '|':
-			if i+1 < len(cmd) && cmd[i+1] == '|' {
-				flush()
-				i++
-			} else {
-				flush()
-			}
-		case ';', '\n':
-			flush()
-		default:
-			cur.WriteByte(c)
-		}
-	}
-	flush()
-	return out
-}
-
-func (h *HITLManager) isSafeSingleCommand(cmd string) bool {
-	tokens := tokenizeShellWords(cmd)
-	if len(tokens) == 0 {
-		return false
-	}
-	for len(tokens) > 0 && isEnvAssignment(tokens[0]) {
-		tokens = tokens[1:]
-	}
-	if len(tokens) == 0 {
-		return false
-	}
-	exe := tokens[0]
-	if exe == "sed" {
-		for _, t := range tokens[1:] {
-			if t == "-n" || strings.HasPrefix(t, "-n") {
-				return true
-			}
-		}
-		return false
-	}
-	for _, p := range h.safeBashPrefixes {
-		pTokens := strings.Fields(p)
-		if len(pTokens) == 0 || len(tokens) < len(pTokens) {
-			continue
-		}
-		match := true
-		for i, pt := range pTokens {
-			if tokens[i] != pt {
-				match = false
-				break
-			}
-		}
-		if match {
-			return true
-		}
-	}
-	return false
-}
-
-func isEnvAssignment(tok string) bool {
-	if tok == "" {
-		return false
-	}
-	eq := strings.IndexByte(tok, '=')
-	if eq <= 0 {
-		return false
-	}
-	for i := 0; i < eq; i++ {
-		c := tok[i]
-		if !(c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (i > 0 && c >= '0' && c <= '9')) {
-			return false
-		}
-	}
-	return true
-}
-
-func tokenizeShellWords(cmd string) []string {
-	var out []string
-	var cur strings.Builder
-	var quote byte
-	flush := func() {
-		if cur.Len() > 0 {
-			out = append(out, cur.String())
-			cur.Reset()
-		}
-	}
-	for i := 0; i < len(cmd); i++ {
-		c := cmd[i]
-		if quote != 0 {
-			if c == quote {
-				quote = 0
-			} else if c == '\\' && quote == '"' && i+1 < len(cmd) {
-				i++
-				cur.WriteByte(cmd[i])
-			} else {
-				cur.WriteByte(c)
-			}
-			continue
-		}
-		switch c {
-		case ' ', '\t', '\n', '\r':
-			flush()
-		case '\'', '"':
-			quote = c
-		case '\\':
-			if i+1 < len(cmd) {
-				i++
-				cur.WriteByte(cmd[i])
-			}
-		default:
-			cur.WriteByte(c)
-		}
-	}
-	flush()
-	return out
 }
 
 func (h *HITLManager) matchCriticalPath(path string) string {
@@ -498,20 +296,24 @@ func indent(text, prefix string) string {
 }
 
 func FormatRejectMessage(toolName, reason string, pl *prompt.Loader) string {
-	tmpl := ""
-	if pl != nil {
-		tmpl = pl.Load("human_reject")
+	if pl == nil {
+		pl = prompt.NewLoader()
 	}
-	return prompt.Render(tmpl, map[string]string{"tool": toolName, "reason": reason})
+	return prompt.Render(pl.MustLoad("human_reject"), map[string]string{
+		"tool":   toolName,
+		"reason": reason,
+	})
 }
 
 func FormatModifyMessage(toolName, feedback string, pl *prompt.Loader) string {
 	if feedback == "" {
 		feedback = "(no additional feedback)"
 	}
-	tmpl := ""
-	if pl != nil {
-		tmpl = pl.Load("human_modify")
+	if pl == nil {
+		pl = prompt.NewLoader()
 	}
-	return prompt.Render(tmpl, map[string]string{"tool": toolName, "feedback": feedback})
+	return prompt.Render(pl.MustLoad("human_modify"), map[string]string{
+		"tool":     toolName,
+		"feedback": feedback,
+	})
 }
