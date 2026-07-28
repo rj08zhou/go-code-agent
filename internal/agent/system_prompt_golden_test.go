@@ -36,13 +36,15 @@ func TestSystemPromptGolden(t *testing.T) {
 		"Skills: demo-skill",
 		"## Output Style",
 		"## Coding Conventions",
+		"## Scope Discipline",
+		"## Verify & Report",
 		"## Safety & Untrusted Content",
 		"## Exploration Strategy",
 		"## Planning",
 		"## Multi-Agent",
 		"<example>",
 		"Incorrect: `explore` or `list_dir`",
-		"Incorrect: `task_create` a 5-node DAG",
+		"live in each tool's description",
 		"demo-skill: a fixture skill summary",
 		"Model: test-model",
 	} {
@@ -50,9 +52,12 @@ func TestSystemPromptGolden(t *testing.T) {
 			t.Errorf("golden candidate missing %q", want)
 		}
 	}
-	for _, banned := range []string{"(CRITICAL", "NEVER invent", "CRITICAL for parallel"} {
+	for _, banned := range []string{
+		"(CRITICAL", "NEVER invent", "CRITICAL for parallel",
+		"Incorrect: `task_create` a 5-node DAG", // moved to TodoWrite tool description
+	} {
 		if strings.Contains(got, banned) {
-			t.Errorf("tone inflation remnant %q still present", banned)
+			t.Errorf("unwanted remnant %q still present in system prompt", banned)
 		}
 	}
 

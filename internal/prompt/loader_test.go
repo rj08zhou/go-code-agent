@@ -39,6 +39,9 @@ func TestRequiredTemplatesPresent(t *testing.T) {
 		"dag_required",
 		"human_reject",
 		"human_modify",
+		"compaction",
+		"post_explore",
+		"response_truncated",
 	}
 	l := NewLoader()
 	for _, name := range required {
