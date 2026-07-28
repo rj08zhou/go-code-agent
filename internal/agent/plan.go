@@ -44,18 +44,10 @@ func (g *PlanGate) checkPlanningGate(toolRounds int, usedPlanning, usedThink, us
 		return ""
 	}
 	if usedPlanning && !usedThink && !usedExplore {
-		tmpl := g.promptLoader.Load("think_required")
-		if tmpl == "" {
-			return "<think-first>Before jumping into tools, think about what needs to be done and make a plan.</think-first>"
-		}
-		return tmpl
+		return g.promptLoader.MustLoad("think_required")
 	}
 	if !usedPlanning {
-		tmpl := g.promptLoader.Load("planning_required")
-		if tmpl == "" {
-			return "<planning-required>You've started exploring but haven't created a plan yet. Use task_create to break down the work into tasks.</planning-required>"
-		}
-		return tmpl
+		return g.promptLoader.MustLoad("planning_required")
 	}
 	return ""
 }
@@ -70,14 +62,9 @@ func (g *PlanGate) checkDAGDependency(toolRounds int) string {
 	taskCount := g.taskSvc.TaskCount()
 	edgeCount := g.taskSvc.EdgeCount()
 	if taskCount > 1 && edgeCount == 0 {
-		return fmt.Sprintf(
-			`<planning-required>You created %d tasks but NO dependencies. Before executing any task, you MUST:
-1. Think: what is the execution order? Which task must finish before another can start?
-2. Call task_add_dep(from, to) to define at least one dependency edge.
-3. Call task_dag to review the DAG.
-4. Only then start working on ready tasks.
-If tasks can run in parallel, that's fine — but you must still call task_dag to confirm.</planning-required>`,
-			taskCount)
+		return prompt.Render(g.promptLoader.MustLoad("dag_required"), map[string]string{
+			"count": fmt.Sprintf("%d", taskCount),
+		})
 	}
 	return ""
 }

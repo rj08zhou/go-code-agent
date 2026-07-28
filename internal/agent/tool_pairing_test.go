@@ -51,7 +51,7 @@ func TestEnsureToolCallPairing_FillsMissing(t *testing.T) {
 			},
 		},
 		llm.ToolMessage("ra", "a"),
-		llm.UserMessage("<system>truncated</system>"),
+		llm.UserMessage("<response-truncated>truncated</response-truncated>"),
 	}
 	out, filled := ensureToolCallPairing(msgs)
 	if filled != 1 {

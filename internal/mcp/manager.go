@@ -332,12 +332,11 @@ func (a *ToolCatalogAdapter) RegisterMCPTools(serverName string, tools []ToolInf
 			Schema:      schema,
 			Timeout:     30 * time.Second,
 			Handler: func(scope *tool.ToolScope, args json.RawMessage) tool.Result {
-				ctx := context.Background()
-				if scope != nil && scope.Context != nil {
-					ctx = scope.Context
-				}
+				// Must use Executor-injected scope.Context so tool Timeout /
+				// Ctrl-C cancel the stdio RPC (not a detached Background ctx).
+				ctx := tool.ScopeContext(scope)
 				var argMap map[string]any
-				json.Unmarshal(args, &argMap)
+				_ = json.Unmarshal(args, &argMap)
 				result, err := a.mcpMgr.CallTool(ctx, fullName, argMap)
 				if err != nil {
 					return tool.Failed(fmt.Sprintf("MCP error: %v", err))

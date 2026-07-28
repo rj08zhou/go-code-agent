@@ -74,9 +74,7 @@ func SecurePath(root, rel string, allowWrite bool) (string, error) {
 // IsReadOnlyBash reports whether a command is read-only/inspection-only
 // under the default hard policy (no user permission rules).
 func IsReadOnlyBash(cmd string) bool {
-	p := NewDefaultBashPolicy()
-	allowed, needConfirm, _ := p.Validate(cmd, nil)
-	return allowed && !needConfirm
+	return ClassifyCommand(cmd).Verdict == VerdictSafe
 }
 
 // ---------- Approval ----------
@@ -243,77 +241,45 @@ var confirmRegexps = []*regexp.Regexp{
 	regexp.MustCompile(`>(\s*)/`),
 }
 
-// BashPolicy validates shell commands against an allow/deny/confirm model.
-type BashPolicy struct {
-	denyPatterns    []string
-	confirmPatterns []string
+// defaultDenyPatterns / defaultConfirmPatterns are the string-based pattern
+// lists consumed by ClassifyCommand (classify.go), the single source of
+// command-risk truth.
+var defaultDenyPatterns = []string{
+	"| sh", "| bash",
+	"rm -r /",
+	"base64 -d |",
+	"docker run", "mkfs.", "dd if=",
+	"> /dev/sd", "shutdown", "chmod 777 /",
+	"/etc/shadow", "/etc/passwd",
 }
 
-func NewDefaultBashPolicy() *BashPolicy {
-	return &BashPolicy{
-		denyPatterns: []string{
-			"| sh", "| bash",
-			"rm -r /",
-			"base64 -d |",
-			"docker run", "mkfs.", "dd if=",
-			"> /dev/sd", "shutdown", "chmod 777 /",
-			"/etc/shadow", "/etc/passwd",
-		},
-		confirmPatterns: []string{
-			"git push --force", "git push -f",
-			"git reset --hard", "git clean -f",
-		},
-	}
+var defaultConfirmPatterns = []string{
+	"git push --force", "git push -f",
+	"git reset --hard", "git clean -f",
 }
 
-// Validate checks the command against the allow/deny/confirm lists.
-// perms is optional session-scoped user rules (may be nil); hard deny
-// patterns always win before user allow/confirm rules are considered.
+// BashPolicy is the policy gate for shell commands. Risk classification is
+// fully delegated to ClassifyCommand; this type only layers session-scoped
+// user permission rules on top of the intrinsic verdict.
+type BashPolicy struct{}
+
+func NewDefaultBashPolicy() *BashPolicy { return &BashPolicy{} }
+
+// Validate maps the ClassifyCommand verdict onto the (allowed, needConfirm)
+// contract and then applies optional session-scoped user rules (may be nil).
+// Hard deny verdicts always win before user rules are considered.
 func (p *BashPolicy) Validate(command string, perms *Permissions) (allowed bool, needConfirm bool, reason string) {
-	cmd := strings.TrimSpace(command)
-	lower := strings.ToLower(cmd)
-
-	// 1. Extract base command and check against whitelist
-	base := extractBaseCommand(cmd)
-	if base != "" && !allowedCommands[strings.ToLower(base)] {
-		if strings.HasPrefix(cmd, "./") || strings.HasPrefix(cmd, "/") {
-			// Path-based executables: allow if they look like project tools
-		} else {
-			return false, false, fmt.Sprintf("command %q is not in the allowed list", base)
-		}
+	c := ClassifyCommand(command)
+	switch c.Verdict {
+	case VerdictDeny:
+		return false, false, c.Reason
+	case VerdictDanger:
+		return true, true, c.Reason
 	}
 
-	// 2. Check regex-based dangerous patterns
-	for _, re := range dangerousRegexps {
-		if re.MatchString(lower) {
-			return false, false, fmt.Sprintf("dangerous command blocked: %q", cmd)
-		}
-	}
-
-	// 3. Check string-based deny patterns (backward compatibility)
-	for _, pat := range p.denyPatterns {
-		if strings.Contains(lower, strings.ToLower(pat)) {
-			return false, false, fmt.Sprintf("dangerous command pattern blocked: %q", pat)
-		}
-	}
-
-	// 4. Check regex-based confirm patterns
-	for _, re := range confirmRegexps {
-		if re.MatchString(lower) {
-			return true, true, fmt.Sprintf("potentially dangerous: %q", cmd)
-		}
-	}
-
-	// 5. Check string-based confirm patterns
-	for _, pat := range p.confirmPatterns {
-		if strings.Contains(lower, strings.ToLower(pat)) {
-			return true, true, fmt.Sprintf("potentially dangerous: %q", pat)
-		}
-	}
-
-	// 6. Session-scoped user permission rules (injected by the composition root).
+	// Session-scoped user permission rules (injected by the composition root).
 	if perms != nil {
-		switch perms.Match("bash", cmd) {
+		switch perms.Match("bash", strings.TrimSpace(command)) {
 		case "block":
 			return false, false, "blocked by user permission rule"
 		case "confirm":
@@ -322,30 +288,6 @@ func (p *BashPolicy) Validate(command string, perms *Permissions) (allowed bool,
 	}
 
 	return true, false, ""
-}
-
-func matchPattern(cmd, pattern string) bool {
-	return strings.Contains(strings.ToLower(cmd), strings.ToLower(strings.TrimSpace(pattern)))
-}
-
-// extractBaseCommand returns the first word of a shell command after stripping pipes and redirects.
-func extractBaseCommand(cmd string) string {
-	cmd = strings.TrimSpace(cmd)
-	if cmd == "" {
-		return ""
-	}
-	// Handle compound commands
-	if strings.HasPrefix(cmd, "cd ") || strings.HasPrefix(cmd, "export ") {
-		return cmd[:strings.Index(cmd, " ")]
-	}
-	// Split on first space
-	first := cmd
-	if idx := strings.IndexByte(cmd, ' '); idx > 0 {
-		first = cmd[:idx]
-	} else if idx := strings.IndexByte(cmd, ';'); idx > 0 {
-		first = strings.TrimSpace(cmd[:idx])
-	}
-	return first
 }
 
 // ReadLine reads a line from stdin. Replaceable for testing via SetReadLine.

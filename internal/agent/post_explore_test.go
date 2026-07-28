@@ -38,8 +38,8 @@ func TestIsRepoWalkBash(t *testing.T) {
 func TestPostExploreBlock_BudgetAndBash(t *testing.T) {
 	r := &Runner{profile: NewLeadProfile("test")}
 	r.turn = newTurnState()
-	r.turn.exploreSucceeded = true
-	r.turn.readsAfterExplore = config.MaxReadsAfterExplore
+	r.turn.explore.Succeeded = true
+	r.turn.explore.ReadsAfter = config.MaxReadsAfterExplore
 
 	if blocked, why := r.postExploreBlock(llm.ToolCall{Name: "read_file", Arguments: `{"path":"a.go"}`}); !blocked {
 		t.Fatal("expected read_file blocked after budget exhausted")
@@ -47,7 +47,7 @@ func TestPostExploreBlock_BudgetAndBash(t *testing.T) {
 		t.Fatalf("unexpected reason: %s", why)
 	}
 
-	r.turn.readsAfterExplore = 0
+	r.turn.explore.ReadsAfter = 0
 	if blocked, _ := r.postExploreBlock(llm.ToolCall{Name: "read_file", Arguments: `{"path":"a.go"}`}); blocked {
 		t.Fatal("expected read_file allowed within budget")
 	}
@@ -72,7 +72,7 @@ func TestPostExploreBlock_BudgetAndBash(t *testing.T) {
 
 	// Explore-role runners are never gated.
 	r.profile.Role = "explore"
-	r.turn.readsAfterExplore = config.MaxReadsAfterExplore
+	r.turn.explore.ReadsAfter = config.MaxReadsAfterExplore
 	if blocked, _ := r.postExploreBlock(llm.ToolCall{Name: "read_file", Arguments: `{"path":"a.go"}`}); blocked {
 		t.Fatal("explore role must not hit post-explore budget")
 	}
@@ -163,7 +163,7 @@ func TestExecuteToolBatch_InjectsPostExploreNudge(t *testing.T) {
 	if !found {
 		t.Fatal("expected <post-explore> nudge after successful explore")
 	}
-	if !runner.turn.exploreSucceeded {
+	if !runner.turn.explore.Succeeded {
 		t.Fatal("exploreSucceeded should be set")
 	}
 }

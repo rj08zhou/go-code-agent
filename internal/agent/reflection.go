@@ -68,16 +68,10 @@ func (r *Reflection) Eval(
 
 	// 2) Strategy change after repeated failures.
 	if consecutiveFailures >= maxConsecutiveFailures && !onCooldown(reflectKindStrategy, strategyChangeCooldown) {
-		tmpl := r.promptLoader.Load("strategy_change")
-		if tmpl == "" {
-			tmpl = "<strategy-change>Tool '{{tool}}' has failed {{count}} times in a row. " +
-				"STOP retrying the same approach. Re-read the error, then either: " +
-				"(a) try a different tool, (b) gather more context first, or " +
-				"(c) ask the user for clarification.</strategy-change>"
-		}
-		msg := strings.Replace(strings.Replace(tmpl,
-			"{{tool}}", lastFailedTool, 1),
-			"{{count}}", fmt.Sprintf("%d", consecutiveFailures), 1)
+		msg := prompt.Render(r.promptLoader.MustLoad("strategy_change"), map[string]string{
+			"tool":  lastFailedTool,
+			"count": fmt.Sprintf("%d", consecutiveFailures),
+		})
 		prompts = append(prompts, msg)
 		resetFailures = true
 		triggered = append(triggered, reflectKindStrategy)
@@ -148,11 +142,7 @@ func (r *Reflection) Eval(
 		prompts = append(prompts, rb.String())
 		triggered = append(triggered, reflectKindPeriodic)
 	} else if needNag {
-		tmpl := r.promptLoader.Load("todo_nag")
-		if tmpl == "" {
-			tmpl = "<task-nag>You have open task items. Update them via TodoWrite before continuing.</task-nag>"
-		}
-		prompts = append(prompts, tmpl)
+		prompts = append(prompts, r.promptLoader.MustLoad("todo_nag"))
 		resetTodoNag = true
 		triggered = append(triggered, reflectKindTodoNag)
 	}
