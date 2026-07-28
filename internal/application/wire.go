@@ -136,7 +136,7 @@ func wireTeam(
 ) (*agent.SubagentRunner, *agent.TeammateManager) {
 	cfg := params.Config
 	subagentRunner := agent.NewSubagentRunner(rt.gateway, rt.catalog, cfg, params.PromptLoader)
-	subagentRunner.SetCompression(agent.NewCompression(rt.gateway, nil, sessionDir, cfg.ModelID))
+	subagentRunner.SetCompression(agent.NewCompression(rt.gateway, nil, sessionDir, cfg.ModelID, params.PromptLoader))
 	subagentRunner.SetApproval(hitlApproval)
 
 	teamMgr := agent.NewTeammateManager(
@@ -242,7 +242,8 @@ func wireAgent(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionI
 		return agent.BuildSessionContext(evergreen, strings.Join(taskParts, "\n"), mcp)
 	})
 
-	runner.SetCompression(agent.NewCompression(rt.gateway, wb.histStore, rt.sessionRepo.SessionDir(sessionID), cfg.ModelID))
+	runner.SetCompression(agent.NewCompression(rt.gateway, wb.histStore, rt.sessionRepo.SessionDir(sessionID), cfg.ModelID, params.PromptLoader))
+	runner.SetPromptLoader(params.PromptLoader)
 	runner.SetReflection(agent.NewReflection(params.PromptLoader))
 	runner.SetSnapshot(agent.NewSnapshotManager(cfg.SnapshotEnabled, rt.workdir))
 	runner.SetSubagentRunner(wb.subagent)

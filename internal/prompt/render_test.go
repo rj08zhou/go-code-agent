@@ -69,6 +69,7 @@ func TestAllTemplatesRenderWithKnownKeys(t *testing.T) {
 		"session_to_memory": {"session_history": "hist"},
 		"human_reject":      {"tool": "bash", "reason": "no"},
 		"human_modify":      {"tool": "bash", "feedback": "edit args"},
+		"compaction":        {"conversation": "dummy conversation text"},
 	}
 	l := NewLoader()
 

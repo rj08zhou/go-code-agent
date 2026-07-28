@@ -8,9 +8,15 @@ func taskTools(d builtinDeps) []ToolDefinition {
 	var defs []ToolDefinition
 
 	defs = append(defs, ToolDefinition{
-		Name:        "TodoWrite",
-		Description: "Update task tracking list.",
-		RiskLevel:   RiskSafe,
+		Name: "TodoWrite",
+		Description: `Update the session todo checklist. Pass items: an array of {content, status} where status is pending|in_progress|completed. Advance work by updating status — do not invent task_id or sort by id (this tool has no task_id).
+
+When to use: short linear checklists (about 3+ concrete steps you will execute); user gave a list of items; local work that benefits from progress tracking.
+When NOT to use: a single trivial step (just do it); pure Q&A/analysis with no edits; work with real dependencies or that must survive restart → use task_create + DAG; do not use todos as an investigation plan ("read A, read B") → use explore.
+
+Example — rename a symbol in one file + update its test: TodoWrite with 2–3 items, then edit. Incorrect: task_create a 5-node DAG for a local rename.
+Example — README typo: edit directly (or one TodoWrite item). Incorrect: task_create planning ceremony for a one-line change.`,
+		RiskLevel: RiskSafe,
 		Effects:     Effects(EffectSessionMutation),
 		Schema: MustMarshalJSON(map[string]any{
 			"type": "object", "required": []string{"items"},
@@ -64,8 +70,15 @@ func makeTaskTool(name string, taskSvc TaskService) ToolDefinition {
 	switch name {
 	case "task_create":
 		return ToolDefinition{
-			Name:        "task_create",
-			Description: "Create a persistent task with optional DAG dependencies. The returned task ID is authoritative; use it in later task_update calls.",
+			Name: "task_create",
+			Description: `Create a persistent task (optional depends_on: array of numeric task IDs). The returned numeric ID is authoritative — use it in task_update/task_get/task_add_dep; never use 0 or invent IDs.
+
+When to use: multi-step work where order/deps matter, or the plan should survive restart/handoff.
+When NOT to use: local rename / one-file fix → TodoWrite or just edit; read-only investigation → explore.
+
+If you create multiple related tasks, set depends_on (or call task_add_dep) and review with task_dag before executing. Runtime stops you if multiple tasks have no edges.
+
+Example — auth middleware + wire into server + migrate handlers + integration tests (later steps depend on earlier): task_create with depends_on / task_add_dep, then task_dag, then execute in order. Incorrect: TodoWrite with unordered bullets and hope sequencing works.`,
 			Schema: MustMarshalJSON(map[string]any{
 				"type": "object", "required": []string{"subject"},
 				"properties": map[string]any{
@@ -93,8 +106,8 @@ func makeTaskTool(name string, taskSvc TaskService) ToolDefinition {
 		}
 	case "task_get":
 		return ToolDefinition{
-			Name:        "task_get",
-			Description: "Get task details by ID. Use the numeric ID returned by task_create.",
+			Name: "task_get",
+			Description: `Get task details by numeric task_id from task_create (e.g. 1). Never pass 0 or omit task_id. See task_create for when to use the DAG task system vs TodoWrite.`,
 			Schema: MustMarshalJSON(map[string]any{
 				"type": "object", "required": []string{"task_id"},
 				"properties": map[string]any{"task_id": map[string]any{"type": "integer", "minimum": 1}},
@@ -116,8 +129,8 @@ func makeTaskTool(name string, taskSvc TaskService) ToolDefinition {
 		}
 	case "task_update":
 		return ToolDefinition{
-			Name:        "task_update",
-			Description: "Update a task's status. You MUST pass the numeric task_id returned by task_create; do not use 0 or omit it.",
+			Name: "task_update",
+			Description: `Update a task's status only (pending|in_progress|completed|deleted) — does not change subject/description. Pass the numeric task_id returned by task_create (e.g. 1); never use 0, omit it, or invent an ID. If unsure of IDs, call task_list first.`,
 			Schema: MustMarshalJSON(map[string]any{
 				"type": "object", "required": []string{"task_id", "status"},
 				"properties": map[string]any{
@@ -151,7 +164,7 @@ func makeTaskTool(name string, taskSvc TaskService) ToolDefinition {
 	case "task_list":
 		return ToolDefinition{
 			Name:        "task_list",
-			Description: "List all tasks.",
+			Description: "List all persistent tasks and their numeric IDs. Use before task_update/task_get if you are unsure of an ID. See task_create for when to use this task system vs TodoWrite.",
 			RiskLevel:   RiskAuto,
 			Effects:     Effects(),
 			Handler: func(scope *ToolScope, args json.RawMessage) Result {
@@ -164,7 +177,7 @@ func makeTaskTool(name string, taskSvc TaskService) ToolDefinition {
 	case "task_add_dep":
 		return ToolDefinition{
 			Name:        "task_add_dep",
-			Description: "Add a DAG dependency edge. Use numeric task IDs returned by task_create.",
+			Description: "Add a DAG edge from→to using numeric IDs from task_create. Prefer depends_on at create time when known; use this to fix missing edges. See task_create for when DAG planning is appropriate.",
 			Schema: MustMarshalJSON(map[string]any{
 				"type": "object", "required": []string{"from", "to"},
 				"properties": map[string]any{
@@ -188,7 +201,7 @@ func makeTaskTool(name string, taskSvc TaskService) ToolDefinition {
 	case "task_remove_dep":
 		return ToolDefinition{
 			Name:        "task_remove_dep",
-			Description: "Remove a DAG dependency edge. Use numeric task IDs returned by task_create.",
+			Description: "Remove a DAG edge. Use numeric task IDs from task_create (never 0).",
 			Schema: MustMarshalJSON(map[string]any{
 				"type": "object", "required": []string{"from", "to"},
 				"properties": map[string]any{
@@ -212,7 +225,7 @@ func makeTaskTool(name string, taskSvc TaskService) ToolDefinition {
 	case "task_ready":
 		return ToolDefinition{
 			Name:        "task_ready",
-			Description: "List tasks whose DAG predecessors are completed.",
+			Description: "List tasks whose DAG predecessors are completed (ready to execute). Pair with task_dag after task_create. See task_create for planning guidance.",
 			RiskLevel:   RiskAuto,
 			Effects:     Effects(),
 			Handler: func(scope *ToolScope, args json.RawMessage) Result {
@@ -225,7 +238,7 @@ func makeTaskTool(name string, taskSvc TaskService) ToolDefinition {
 	case "task_dag":
 		return ToolDefinition{
 			Name:        "task_dag",
-			Description: "Show topological execution order.",
+			Description: "Show topological execution order for the task DAG. Call after creating multiple tasks/deps before executing. See task_create for when to use the DAG family.",
 			RiskLevel:   RiskAuto,
 			Effects:     Effects(),
 			Handler: func(scope *ToolScope, args json.RawMessage) Result {
@@ -238,7 +251,7 @@ func makeTaskTool(name string, taskSvc TaskService) ToolDefinition {
 	case "claim_task":
 		return ToolDefinition{
 			Name:        "claim_task",
-			Description: "Claim a task from the board. Use the numeric task ID returned by task_create.",
+			Description: "Claim a board task by numeric task_id from task_create (never 0). See task_create for ID conventions.",
 			Schema: MustMarshalJSON(map[string]any{
 				"type": "object", "required": []string{"task_id"},
 				"properties": map[string]any{"task_id": map[string]any{"type": "integer", "minimum": 1}},

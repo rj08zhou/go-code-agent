@@ -130,6 +130,26 @@ func TestTaskTools(t *testing.T) {
 		}
 	})
 
+	t.Run("tool descriptions carry usage guidance", func(t *testing.T) {
+		defs := taskTools(builtinDeps{})
+		cases := map[string][]string{
+			"TodoWrite":   {"items", "When NOT to use", "5-node DAG", "status"},
+			"task_create": {"depends_on", "When to use", "numeric ID", "task_dag"},
+			"task_update": {"task_id", "never use 0", "status only"},
+			"task_get":    {"numeric task_id", "Never pass 0"},
+			"task_list":   {"task_create"},
+			"task_dag":    {"task_create"},
+		}
+		for name, needles := range cases {
+			desc := mustTool(t, defs, name).Description
+			for _, n := range needles {
+				if !strings.Contains(desc, n) {
+					t.Errorf("%s description missing %q\n%s", name, n, desc)
+				}
+			}
+		}
+	})
+
 	t.Run("TodoWrite nil service", func(t *testing.T) {
 		tool := mustTool(t, taskTools(builtinDeps{}), "TodoWrite")
 		got := tool.Handler(scope, json.RawMessage(`{"items":[{"content":"x","status":"pending"}]}`))
