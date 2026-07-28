@@ -8,6 +8,7 @@ import (
 
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/tool"
 )
@@ -214,9 +215,10 @@ func TestRunner_PostExploreBlocksBashFind(t *testing.T) {
 }
 
 func TestDropConsumedNudges_PostExplore(t *testing.T) {
+	nudge := prompt.Render(prompt.NewLoader().MustLoad("post_explore"), map[string]string{})
 	msgs := []llm.Message{
 		llm.UserMessage("task"),
-		llm.UserMessage(postExploreNudge),
+		llm.UserMessage(nudge),
 		llm.AssistantMessage("answered"),
 	}
 	out, removed := dropConsumedNudges(msgs)

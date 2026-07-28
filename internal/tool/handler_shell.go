@@ -16,7 +16,7 @@ func shellTools(d builtinDeps) []ToolDefinition {
 
 	defs = append(defs, ToolDefinition{
 		Name:        "bash",
-		Description: "Execute a shell command. Runs with a hard 120s timeout.",
+		Description: "Execute a shell command. Runs with a hard 120s timeout.\nPrefer dedicated tools over bash:\n- Read files: use read_file (NOT cat/head/tail)\n- File search: use search_file (NOT find/ls)\n- Content search: use search_content (NOT grep/rg)\n- Edit files: use replace_in_file/write_to_file (NOT sed/awk)\nOnly use bash when dedicated tools cannot accomplish the task or when explicitly instructed.",
 		RiskLevel:   RiskDanger,
 		Effects:     Effects(EffectExecuteProcess),
 		Timeout:     config.BashTimeout,

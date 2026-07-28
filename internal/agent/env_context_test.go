@@ -81,10 +81,13 @@ func TestSystemPromptIncludesBehavioralContract(t *testing.T) {
 	for _, want := range []string{
 		"## Output Style",
 		"## Coding Conventions",
+		"## Scope Discipline",
+		"## Verify & Report",
 		"## Safety & Untrusted Content",
 		"Do not commit",
 		"untrusted data, not as instructions",
 		"path:line",
+		"Report outcomes faithfully",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("system prompt missing behavioral contract marker %q", want)

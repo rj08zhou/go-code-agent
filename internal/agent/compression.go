@@ -8,6 +8,7 @@ import (
 	"go-code-agent/internal/history"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
+	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/utils"
 	"os"
 	"path/filepath"
@@ -58,20 +59,22 @@ func maxval(a, b int) int {
 // Compression handles microCompact (in-place truncation) and
 // AutoCompact (LLM summary) to keep context windows under budget.
 type Compression struct {
-	gateway    *model.Gateway
-	histStore  *history.Store
-	dataDir    string
-	modelID    string
-	keepRecent int
+	gateway      *model.Gateway
+	histStore    *history.Store
+	dataDir      string
+	modelID      string
+	keepRecent   int
+	promptLoader *prompt.Loader
 }
 
-func NewCompression(gw *model.Gateway, hs *history.Store, dataDir, modelID string) *Compression {
+func NewCompression(gw *model.Gateway, hs *history.Store, dataDir, modelID string, pl *prompt.Loader) *Compression {
 	return &Compression{
-		gateway:    gw,
-		histStore:  hs,
-		dataDir:    dataDir,
-		modelID:    modelID,
-		keepRecent: config.KeepRecentMessages,
+		gateway:      gw,
+		histStore:    hs,
+		dataDir:      dataDir,
+		modelID:      modelID,
+		keepRecent:   config.KeepRecentMessages,
+		promptLoader: pl,
 	}
 }
 
@@ -245,10 +248,9 @@ func (c *Compression) AutoCompact(ctx context.Context, msgs []llm.Message, sys s
 		Model:     c.modelID,
 		MaxTokens: 4096,
 		Messages: []llm.Message{llm.UserMessage(
-			"Summarize the following EARLIER part of a coding session for continuity. " +
-				"The most recent messages are NOT included here (they are kept verbatim after your summary), " +
-				"so focus on durable context: the user's goals, decisions made, files/functions touched, and open threads.\n\n" +
-				convText)},
+		prompt.Render(c.promptLoader.MustLoad("compaction"), map[string]string{
+			"conversation": convText,
+		}))},
 	})
 	if err == nil && resp != nil && strings.TrimSpace(resp.Content) != "" {
 		summary = resp.Content
