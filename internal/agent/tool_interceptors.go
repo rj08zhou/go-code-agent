@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/tool"
 )
 
@@ -45,14 +46,15 @@ type toolCallInterceptor interface {
 }
 
 // defaultToolInterceptors is the ordered lead/explore batch chain.
-func defaultToolInterceptors() []toolCallInterceptor {
+func defaultToolInterceptors(loader *prompt.Loader) []toolCallInterceptor {
+	postExplore := prompt.Render(loader.MustLoad("post_explore"), map[string]string{})
 	return []toolCallInterceptor{
 		readConvergenceInterceptor{},
 		postExploreInterceptor{},
 		repeatCallInterceptor{},
 		exploreBudgetInterceptor{},
 		failureTrackerInterceptor{},
-		turnFlagsInterceptor{},
+		turnFlagsInterceptor{postExploreNudge: postExplore},
 	}
 }
 
@@ -198,13 +200,15 @@ func (failureTrackerInterceptor) After(env *toolCallEnv, tc llm.ToolCall, result
 
 // --- planning / explore / compress flags ---
 
-type turnFlagsInterceptor struct{}
+type turnFlagsInterceptor struct {
+	postExploreNudge string
+}
 
-func (turnFlagsInterceptor) Before(*toolCallEnv, llm.ToolCall) beforeResult {
+func (i turnFlagsInterceptor) Before(*toolCallEnv, llm.ToolCall) beforeResult {
 	return beforeResult{}
 }
 
-func (turnFlagsInterceptor) After(env *toolCallEnv, tc llm.ToolCall, result tool.Result) afterResult {
+func (i turnFlagsInterceptor) After(env *toolCallEnv, tc llm.ToolCall, result tool.Result) afterResult {
 	var out afterResult
 	switch tc.Name {
 	case "think", "thinking", "reason":
@@ -212,7 +216,7 @@ func (turnFlagsInterceptor) After(env *toolCallEnv, tc llm.ToolCall, result tool
 	case "explore":
 		if result.Succeeded() {
 			env.turn.explore.noteSuccess()
-			out.nudges = append(out.nudges, postExploreNudge)
+			out.nudges = append(out.nudges, i.postExploreNudge)
 		} else {
 			env.turn.explore.Used = true
 		}

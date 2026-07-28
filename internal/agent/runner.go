@@ -8,6 +8,7 @@ import (
 	"go-code-agent/internal/event"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
+	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/tool"
 	"strings"
 )
@@ -42,6 +43,7 @@ type Runner struct {
 	snapshot       *SnapshotManager
 	subagent       *SubagentRunner
 	planGate       *PlanGate
+	promptLoader   *prompt.Loader
 	lessonWriter   LessonWriter
 	memoryRecall   func(string) string
 	todoState      func() (bool, string)
@@ -131,6 +133,20 @@ func (r *Runner) SetSnapshot(sm *SnapshotManager) { r.snapshot = sm }
 // SetSubagentRunner wires the subagent executor.
 func (r *Runner) SetSubagentRunner(sr *SubagentRunner) { r.subagent = sr }
 func (r *Runner) SetPlanGate(pg *PlanGate)             { r.planGate = pg }
+
+// SetPromptLoader wires the template loader used for inline prompts
+// (response-truncation message, post-explore nudge).
+func (r *Runner) SetPromptLoader(pl *prompt.Loader) { r.promptLoader = pl }
+
+// loader returns the injected prompt loader, or a default one if none was set.
+// This keeps backward compatibility with code paths that don't wire a loader
+// (e.g. integration tests). Same nil-fallback pattern as LLMLessonWriter.
+func (r *Runner) loader() *prompt.Loader {
+	if r.promptLoader != nil {
+		return r.promptLoader
+	}
+	return prompt.NewLoader()
+}
 
 // SetMemoryRecall wires dynamic relevant-memory retrieval for each user turn.
 func (r *Runner) SetMemoryRecall(fn func(string) string) { r.memoryRecall = fn }
@@ -336,9 +352,8 @@ var ephemeralNudgePrefixes = []string{
 	"<response-truncated>",
 }
 
-const postExploreNudge = `<post-explore>Explore already returned a summary. Synthesize and answer the user now.
-Do not re-walk the tree with list_dir/read_file/bash find.
-If one fact is missing, use search_content/search_file or at most 1–2 targeted read_file/list_dir calls, then answer immediately.</post-explore>`
+// postExploreNudge is loaded per-session via defaultToolInterceptors
+// from the injected prompt loader — see tool_interceptors.go.
 
 // finalizeWithoutTools asks the model for one last plain-text response with
 // tools disabled (max-rounds / prompt-budget / soft-deadline wrap-up).

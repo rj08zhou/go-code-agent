@@ -6,6 +6,7 @@ import (
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/tool"
 	"go-code-agent/internal/utils"
 	"strings"
@@ -348,9 +349,7 @@ func (r *Runner) handleTruncation(messages []llm.Message, sr *llm.StreamResult, 
 		messages = append(messages, llm.ToolMessage(result.ToToolMessage(), tc.ID))
 	}
 	return append(messages, llm.UserMessage(
-		"<response-truncated>Your previous response was truncated due to output length limits. "+
-			"Some tool calls may have been lost. Please continue from where you left off. "+
-			"Do NOT repeat tool calls that already succeeded above.</response-truncated>"))
+		prompt.Render(r.loader().MustLoad("response_truncated"), map[string]string{})))
 }
 
 // handleNoToolCalls runs lesson/judge wrap-up when the model returns plain text.
@@ -457,7 +456,7 @@ func (r *Runner) executeToolBatch(
 	var turnToolCount, turnFailCount int
 	var manualCompress bool
 	var pendingNudges []string
-	hooks := defaultToolInterceptors()
+	hooks := defaultToolInterceptors(r.loader())
 
 	for _, tc := range toolCalls {
 		if tc.Arguments != "" && !strings.HasPrefix(tc.Arguments, "{") {
