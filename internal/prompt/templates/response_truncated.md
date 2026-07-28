@@ -1,0 +1,1 @@
+<response-truncated>Your previous response was truncated due to output length limits. Some tool calls may have been lost. Please continue from where you left off. Do NOT repeat tool calls that already succeeded above.</response-truncated>
