@@ -98,23 +98,23 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 
 func printBanner(b *application.BuiltRunner) {
 	judgeStatus := "off"
-	if b.JudgeEnabled {
+	if b.Runtime.JudgeEnabled {
 		judgeStatus = "on"
 	}
 
 	divider := strings.Repeat("=", 60)
 	fmt.Println(utils.Bold + utils.Cyan + divider + utils.Reset)
 	fmt.Printf("%s  go-code-agent%s\n", utils.Bold+utils.Cyan, utils.Reset)
-	fmt.Printf("  Model: %s  |  Workspace: %s\n", b.ModelID, b.Workdir)
-	fmt.Printf("  Session: %s - %s\n", b.SessionID[:13], b.SessionTitle)
+	fmt.Printf("  Model: %s  |  Workspace: %s\n", b.Session.ModelID, b.Session.Workdir)
+	fmt.Printf("  Session: %s - %s\n", b.Session.ID[:13], b.Session.Title)
 	fmt.Printf("  HITL: %s  |  Judge: %s\n", hitlStatus(b), judgeStatus)
 	fmt.Println(utils.Bold + utils.Cyan + divider + utils.Reset)
 	fmt.Println()
 }
 
 func hitlStatus(b *application.BuiltRunner) string {
-	if b.HitlMgr == nil || !b.HitlMgr.IsEnabled() {
+	if b.Security.HITL == nil || !b.Security.HITL.IsEnabled() {
 		return "off"
 	}
-	return fmt.Sprintf("on (%s)", b.HitlMgr.Mode())
+	return fmt.Sprintf("on (%s)", b.Security.HITL.Mode())
 }

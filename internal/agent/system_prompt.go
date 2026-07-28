@@ -1,82 +1,67 @@
 package agent
 
 import (
-	"go-code-agent/internal/memory"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/skill"
-	"go-code-agent/internal/task"
-	"strings"
 )
 
-// SystemPromptBuilder constructs the system prompt from context.
+// SystemPromptVars are the placeholders filled into system.md.
+// EnvContext is usually produced by buildEnvContext; tests pass a fixed value
+// for golden snapshots.
+type SystemPromptVars struct {
+	Workdir      string
+	Skills       string
+	EnvContext   string
+	SkillContext string
+}
+
+// SystemPromptBuilder constructs the static system prompt.
+// Dynamic state (evergreen memory, tasks, MCP) is injected per Run via
+// BuildSessionContext — not interpolated here — so the system prefix stays
+// stable for prompt caching.
 type SystemPromptBuilder struct {
 	promptLoader *prompt.Loader
 	skillLoader  *skill.Loader
-	memStore     *memory.Store
-	taskSvc      *task.Service
-	mcpListFn    func() string
 	embedded     []byte
 }
 
 func NewSystemPromptBuilder(
 	pl *prompt.Loader,
 	sl *skill.Loader,
-	ms *memory.Store,
-	ts *task.Service,
-	mcpFn func() string,
 	embedded []byte,
 ) *SystemPromptBuilder {
 	return &SystemPromptBuilder{
 		promptLoader: pl,
 		skillLoader:  sl,
-		memStore:     ms,
-		taskSvc:      ts,
-		mcpListFn:    mcpFn,
 		embedded:     embedded,
 	}
 }
 
-func (b *SystemPromptBuilder) Build(workdir string) string {
-	tmpl := b.promptLoader.Load("system")
-
-	memoryCtx := ""
-	if b.memStore != nil {
-		memoryCtx = b.memStore.GetEvergreen()
-	}
-
-	// Inject only a compact catalog (name + one-line description) of skills.
-	// The full body of each skill is loaded on demand via the load_skill tool,
-	// so the large skill contents stay out of the static system prompt that is
-	// re-sent (and re-billed on cache misses) every turn.
+func (b *SystemPromptBuilder) Build(workdir, modelID string) string {
 	skillCtx := ""
 	skillNames := ""
 	if b.skillLoader != nil && b.skillLoader.Len() > 0 {
 		skillCtx = b.skillLoader.Summaries()
 		skillNames = b.skillLoader.Names()
 	}
+	return b.BuildWith(SystemPromptVars{
+		Workdir:      workdir,
+		Skills:       skillNames,
+		EnvContext:   buildEnvContext(workdir, modelID),
+		SkillContext: skillCtx,
+	})
+}
 
-	taskCtx := ""
-	if b.taskSvc != nil {
-		taskCtx = b.taskSvc.ProgressSummary()
-	}
-
-	mcpCtx := ""
-	if b.mcpListFn != nil {
-		mcpCtx = b.mcpListFn()
-	}
-
-	result := strings.NewReplacer(
-		"{{workdir}}", workdir,
-		"{{skills}}", skillNames,
-		"{{memory_context}}", memoryCtx,
-		"{{skill_context}}", skillCtx,
-		"{{task_context}}", taskCtx,
-		"{{mcp_context}}", mcpCtx,
-	).Replace(tmpl)
-
+// BuildWith renders the system template from explicit vars (used by golden tests).
+func (b *SystemPromptBuilder) BuildWith(v SystemPromptVars) string {
+	result := prompt.Render(b.promptLoader.MustLoad("system"), map[string]string{
+		"workdir":       v.Workdir,
+		"skills":        v.Skills,
+		"env_context":   v.EnvContext,
+		"skill_context": v.SkillContext,
+	})
 	if len(b.embedded) > 0 {
 		result += "\n\n## Project Documentation\n" + string(b.embedded)
 	}
-
 	return result
 }

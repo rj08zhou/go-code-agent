@@ -1,9 +1,17 @@
-You are a coding agent at {{workdir}}. Use tools to solve tasks.
-Skills: {{skills}}
+You are a coding agent at /workspace/demo. Use tools to solve tasks.
+Skills: demo-skill
 
-{{env_context}}
+<env>
+Platform: test/arch
+OS Version: TestOS 1.0
+Today's date: Monday, Jan 2, 2006
+Working directory: /workspace/demo
+Is directory a git repo: yes
+Current branch: main
+Model: test-model
+</env>
 
-{{skill_context}}
+demo-skill: a fixture skill summary
 
 ## Output Style
 - Be concise. Default to short answers (a few lines) unless the user asks for detail, a design write-up, or a full review.

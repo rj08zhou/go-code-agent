@@ -112,6 +112,48 @@ func TestToolCatalogAdapter_CallMCPToolHandler(t *testing.T) {
 	t.Logf("MCP call result (expected error): %s", result.Status)
 }
 
+func TestMCPHandlerHonorsScopeContextCancellation(t *testing.T) {
+	catalog := tool.NewToolCatalog()
+	mgr := NewManager(t.TempDir())
+	adapter := NewToolCatalogAdapter(catalog, mgr)
+	adapter.RegisterMCPTools("test", []ToolInfo{
+		{Name: "slow", Description: "hangs until cancelled", Schema: map[string]any{}},
+	})
+
+	c, requests, _ := newPipeClient(t)
+	c.config.Name = "test"
+	mgr.mu.Lock()
+	mgr.clients["test"] = c
+	mgr.mu.Unlock()
+
+	go func() {
+		_, _ = requests.ReadBytes('\n') // consume request, never respond
+	}()
+
+	handler := catalog.Load().Handlers["mcp__test__slow"]
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	result := handler(&tool.ToolScope{
+		Context:    ctx,
+		Role:       "lead",
+		CanNetwork: true,
+	}, []byte(`{}`))
+	elapsed := time.Since(start)
+
+	if result.Succeeded() {
+		t.Fatalf("expected failure on cancel, got %#v", result)
+	}
+	if !strings.Contains(result.Output, context.DeadlineExceeded.Error()) &&
+		!strings.Contains(result.Output, "context deadline exceeded") {
+		t.Fatalf("result = %q, want deadline exceeded", result.Output)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("handler ignored scope.Context cancel: took %s", elapsed)
+	}
+}
+
 // --- IsMCPTool ---
 
 func TestIsMCPTool(t *testing.T) {

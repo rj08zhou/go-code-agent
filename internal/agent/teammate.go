@@ -8,6 +8,7 @@ import (
 	"go-code-agent/internal/event"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
+	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/task"
 	"go-code-agent/internal/team"
 	"go-code-agent/internal/tool"
@@ -46,11 +47,12 @@ type TeammateManager struct {
 	protocols *team.ProtocolStore
 	worktrees *worktree.Service
 
-	catalog     *tool.ToolCatalog
-	modelID     string
-	diffPreview tool.DiffPreview
-	approval    tool.ApprovalChecker
-	eventSink   event.Sink
+	catalog      *tool.ToolCatalog
+	modelID      string
+	promptLoader *prompt.Loader
+	diffPreview  tool.DiffPreview
+	approval     tool.ApprovalChecker
+	eventSink    event.Sink
 
 	spawnMu   sync.Mutex
 	lastSpawn time.Time
@@ -78,18 +80,20 @@ func NewTeammateManager(
 	worktrees *worktree.Service,
 	catalog *tool.ToolCatalog,
 	modelID string,
+	pl *prompt.Loader,
 ) *TeammateManager {
 	os.MkdirAll(dir, 0o755)
 	tm := &TeammateManager{
-		dir:        dir,
-		configPath: filepath.Join(dir, "config.json"),
-		gateway:    gw,
-		bus:        bus,
-		taskSvc:    taskSvc,
-		protocols:  protocols,
-		worktrees:  worktrees,
-		catalog:    catalog,
-		modelID:    modelID,
+		dir:          dir,
+		configPath:   filepath.Join(dir, "config.json"),
+		gateway:      gw,
+		bus:          bus,
+		taskSvc:      taskSvc,
+		protocols:    protocols,
+		worktrees:    worktrees,
+		catalog:      catalog,
+		modelID:      modelID,
+		promptLoader: pl,
 	}
 	if data, err := os.ReadFile(tm.configPath); err == nil {
 		json.Unmarshal(data, &tm.config)
@@ -138,7 +142,7 @@ func (tm *TeammateManager) Wait() { tm.wg.Wait() }
 
 // Spawn starts a persistent autonomous teammate with worktree isolation.
 // If worktree creation fails, fail-closed: no teammate starts and error is returned.
-func (tm *TeammateManager) Spawn(ctx context.Context, name, role, prompt string) string {
+func (tm *TeammateManager) Spawn(ctx context.Context, name, role, taskPrompt string) string {
 	tm.spawnMu.Lock()
 	defer tm.spawnMu.Unlock()
 	if !tm.lastSpawn.IsZero() {
@@ -183,23 +187,23 @@ func (tm *TeammateManager) Spawn(ctx context.Context, name, role, prompt string)
 	tm.wg.Add(1)
 	go func() {
 		defer tm.wg.Done()
-		tm.autonomousLoop(lifetimeCtx, name, role, prompt, lease.WorktreeDir)
+		tm.autonomousLoop(lifetimeCtx, name, role, taskPrompt, lease.WorktreeDir)
 	}()
 	return fmt.Sprintf("Spawned '%s' (role: %s, workdir: %s)", name, role, lease.WorktreeDir)
 }
 
 // autonomousLoop runs a WORK → IDLE → WORK cycle within the assigned worktree.
-func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, prompt, worktreePath string) {
+func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, taskPrompt, worktreePath string) {
 	teamName := tm.config.TeamName
 
-	sys := fmt.Sprintf(
-		"You are '%s' (role: %s) on team '%s'. "+
-			"Use tools to complete your task. Send messages to coordinate with the team. "+
-			"Use `idle` when you have completed your work. "+
-			"Use `claim_task` to pick up tasks. "+
-			"For write operations, submit a plan first using `submit_plan`.", name, role, teamName)
+	sys := prompt.Render(tm.promptLoader.MustLoad("teammate"), map[string]string{
+		"name":    name,
+		"role":    role,
+		"team":    teamName,
+		"workdir": worktreePath,
+	})
 
-	msgs := []llm.Message{llm.SystemMessage(sys), llm.UserMessage(prompt)}
+	msgs := []llm.Message{llm.SystemMessage(sys), llm.UserMessage(taskPrompt)}
 
 	for {
 		if tm.workPhase(ctx, name, worktreePath, &msgs) == "shutdown" {
