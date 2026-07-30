@@ -355,12 +355,18 @@ func (r *Runner) handleNoToolCalls(
 ) (msgs []llm.Message, cont bool, done TurnOutcome) {
 	out.Completed = true
 
-	// Auto-Lesson: after enough rounds, inject a prompt asking
-	// the model to record lessons, then continue the loop.
+	// Auto-Lesson: after enough rounds with real tool failures, inject a
+	// prompt asking the model to record lessons, then continue the loop.
 	// Only for agents with memory capability (lead agent).
 	// Subagents (explore/teammate) have CanMemory=false and
 	// would fail trying to call memory_write.
-	if r.profile.CanMemory && r.turn.rounds >= config.LessonThreshold && !r.turn.lesson.Written && r.lessonWriter != nil {
+	//
+	// A run that completed without any tool execution failure does not need
+	// a lesson: there is nothing to learn from success. Planning-gate denials
+	// (beforeDenyEarly) are excluded from the failure count, so a run that was
+	// merely told to plan first also does not trigger a lesson.
+	if r.profile.CanMemory && r.turn.rounds >= config.LessonThreshold &&
+		r.turn.failures > 0 && !r.turn.lesson.Written && r.lessonWriter != nil {
 		r.turn.lesson.Written = true
 		r.turn.lesson.RoundsRemaining = config.LessonRoundsLimit
 		r.emit(event.Event{
@@ -539,8 +545,10 @@ func (r *Runner) executeToolBatch(
 				Name: tc.Name, Args: tc.Arguments, Status: result.Status, Output: result.Output,
 			})
 			messages = append(messages, llm.ToolMessage(result.ToToolMessage(), tc.ID))
-			r.turn.failures++
-			turnFailCount++
+			// Planning-gate denials are not execution failures: the tool never
+			// ran. Counting them as failures would inflate lesson triggers and
+			// reflection/stuck heuristics. The model just needs to establish a
+			// plan first; that is expected flow, not a lesson to learn.
 			turnToolCount++
 			r.emit(event.Event{
 				Type: event.ToolFinished, TraceID: traceID,

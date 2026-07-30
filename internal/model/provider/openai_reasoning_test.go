@@ -138,7 +138,7 @@ func TestOpenAIReasoningStreamingIsOpaqueAndCounted(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		chunks := []string{
 			`{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"private "},"finish_reason":null}]}`,
-			`{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"analysis","reasoning_summary":"checked cache"},"finish_reason":null}]}`,
+			`{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"analysis"},"finish_reason":null}]}`,
 			`{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"checking","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":null}]}`,
 			`{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 			`{"id":"c","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":5,"total_tokens":13,"completion_tokens_details":{"reasoning_tokens":3}}}`,
@@ -155,6 +155,7 @@ func TestOpenAIReasoningStreamingIsOpaqueAndCounted(t *testing.T) {
 	result, err := p.Stream(context.Background(), llm.CallParams{
 		Model:     "reasoner-test",
 		Messages:  []llm.Message{llm.UserMessage("inspect")},
+		MaxTokens: 4096,
 		Reasoning: &llm.ReasoningRequest{Enabled: true, Effort: "medium"},
 	}, sink)
 	if err != nil {
@@ -166,7 +167,8 @@ func TestOpenAIReasoningStreamingIsOpaqueAndCounted(t *testing.T) {
 	if result.Content != "checking" || result.Usage.ReasoningTokens != 3 {
 		t.Fatalf("stream result = %#v", result)
 	}
-	if result.Reasoning == nil || result.Reasoning.Summary != "checked cache" || result.Reasoning.State == nil {
+	// Chat Completions exposes no reasoning summary; only opaque state.
+	if result.Reasoning == nil || result.Reasoning.Summary != "" || result.Reasoning.State == nil {
 		t.Fatalf("stream reasoning = %#v", result.Reasoning)
 	}
 	request := <-requestCh
@@ -176,6 +178,13 @@ func TestOpenAIReasoningStreamingIsOpaqueAndCounted(t *testing.T) {
 	}
 	if request["reasoning_effort"] != "medium" {
 		t.Fatalf("reasoning_effort = %#v", request["reasoning_effort"])
+	}
+	// Reasoning models reject the legacy max_tokens field with HTTP 400.
+	if request["max_completion_tokens"] != float64(4096) {
+		t.Fatalf("max_completion_tokens = %#v", request["max_completion_tokens"])
+	}
+	if _, legacy := request["max_tokens"]; legacy {
+		t.Fatal("reasoning request must not send legacy max_tokens")
 	}
 }
 
@@ -188,16 +197,45 @@ func TestOpenAIReasoningRejectsInvalidEffortBeforeHTTP(t *testing.T) {
 	defer srv.Close()
 
 	p := NewOpenAI("test-key", srv.URL+"/v1")
-	_, err := p.Call(context.Background(), llm.CallParams{
-		Model:     "reasoner-test",
-		Messages:  []llm.Message{llm.UserMessage("task")},
-		Reasoning: &llm.ReasoningRequest{Enabled: true, Effort: "untrusted-value"},
-	})
-	if err == nil || !strings.Contains(err.Error(), "unsupported OpenAI reasoning effort") {
-		t.Fatalf("error = %v", err)
+	// "xhigh" must be rejected too: it is not an official Chat Completions
+	// value, and whitelisting it would forward a guaranteed HTTP 400.
+	for _, effort := range []string{"untrusted-value", "xhigh", "max"} {
+		_, err := p.Call(context.Background(), llm.CallParams{
+			Model:     "reasoner-test",
+			Messages:  []llm.Message{llm.UserMessage("task")},
+			Reasoning: &llm.ReasoningRequest{Enabled: true, Effort: effort},
+		})
+		if err == nil || !strings.Contains(err.Error(), "unsupported OpenAI reasoning effort") {
+			t.Fatalf("effort %q: error = %v", effort, err)
+		}
 	}
 	if requests.Load() != 0 {
 		t.Fatalf("invalid request reached HTTP server %d times", requests.Load())
+	}
+}
+
+func TestOpenAINonReasoningKeepsLegacyMaxTokens(t *testing.T) {
+	requestCh := make(chan map[string]any, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCh <- decodeRequestBody(t, r)
+		writeJSON(t, w, `{"id":"c","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	p := NewOpenAI("test-key", srv.URL+"/v1")
+	if _, err := p.Call(context.Background(), llm.CallParams{
+		Model:     "gpt-4o",
+		Messages:  []llm.Message{llm.UserMessage("hi")},
+		MaxTokens: 512,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := <-requestCh
+	if request["max_tokens"] != float64(512) {
+		t.Fatalf("non-reasoning request must keep max_tokens, got %#v", request["max_tokens"])
+	}
+	if _, newer := request["max_completion_tokens"]; newer {
+		t.Fatal("non-reasoning request must not switch to max_completion_tokens")
 	}
 }
 
