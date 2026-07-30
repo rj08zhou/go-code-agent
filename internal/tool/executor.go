@@ -75,6 +75,15 @@ func NewExecutor(catalog *ToolCatalog, approval ApprovalChecker, network Network
 	}
 }
 
+// Definition returns the current immutable definition for a registered tool.
+func (e *Executor) Definition(name string) (ToolDefinition, bool) {
+	if e == nil || e.catalog == nil {
+		return ToolDefinition{}, false
+	}
+	definition, ok := e.catalog.Load().Definitions[name]
+	return definition, ok
+}
+
 // Execute runs a single tool call through the full security+execution pipeline.
 func (e *Executor) Execute(ctx context.Context, scope *ToolScope, tc llm.ToolCall) Result {
 	started := time.Now()

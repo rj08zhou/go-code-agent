@@ -23,6 +23,9 @@ type fakeProvider struct {
 	content      string
 	finishReason string
 	callErr      error
+	usage        llm.Usage
+	reasoning    bool
+	instanceID   string
 
 	// oneShot: if true, toolCalls are cleared after the first invocation
 	// so the model stops returning tool calls, simulating a real conversation.
@@ -37,6 +40,21 @@ type fakeProvider struct {
 }
 
 func (f *fakeProvider) Name() string { return f.name }
+func (f *fakeProvider) InstanceID() string {
+	if f.instanceID != "" {
+		return f.instanceID
+	}
+	return f.name
+}
+
+func (f *fakeProvider) Capabilities() model.ProviderCapabilities {
+	return model.ProviderCapabilities{
+		StructuredOutput: true,
+		ToolCalling:      true,
+		Streaming:        true,
+		Reasoning:        f.reasoning,
+	}
+}
 
 func (f *fakeProvider) nextTools() []llm.ToolCall {
 	if f.callScript != nil {
@@ -66,6 +84,7 @@ func (f *fakeProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Co
 		Content:      f.content,
 		ToolCalls:    f.nextTools(),
 		FinishReason: f.finishReason,
+		Usage:        f.usage,
 	}, nil
 }
 
@@ -82,6 +101,7 @@ func (f *fakeProvider) Stream(ctx context.Context, params llm.CallParams, sink m
 		Content:      f.content,
 		ToolCalls:    tc,
 		FinishReason: f.finishReason,
+		Usage:        f.usage,
 	}, nil
 }
 
@@ -173,7 +193,10 @@ func TestRunner_Integration_ExecutesToolAndCollectsResult(t *testing.T) {
 	fakeModel.content = "I wrote the file"
 	fakeModel.withOneShot()
 
-	outcome := runner.Run(context.Background(), []llm.Message{llm.UserMessage("write test.txt")}, "trace-2")
+	// This test exercises the tool-execution pipeline itself; use a trivial
+	// task text so the planning hard-guard (tested separately in
+	// runner_controls_test.go) does not intercept the unplanned write.
+	outcome := runner.Run(context.Background(), []llm.Message{llm.UserMessage("hello")}, "trace-2")
 
 	if outcome.Error != nil {
 		t.Fatalf("unexpected error: %v", outcome.Error)

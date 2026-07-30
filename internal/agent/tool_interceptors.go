@@ -211,8 +211,6 @@ func (i turnFlagsInterceptor) Before(*toolCallEnv, llm.ToolCall) beforeResult {
 func (i turnFlagsInterceptor) After(env *toolCallEnv, tc llm.ToolCall, result tool.Result) afterResult {
 	var out afterResult
 	switch tc.Name {
-	case "think", "thinking", "reason":
-		env.turn.planning.noteThink()
 	case "explore":
 		if result.Succeeded() {
 			env.turn.explore.noteSuccess()
@@ -221,9 +219,13 @@ func (i turnFlagsInterceptor) After(env *toolCallEnv, tc llm.ToolCall, result to
 			env.turn.explore.Used = true
 		}
 	case "TodoWrite":
-		env.turn.planning.noteTodoWrite(tc.Arguments)
-	case "task_create", "task_list", "task_dag", "task_ready":
-		env.turn.planning.notePlanning()
+		if result.Succeeded() {
+			env.turn.planning.noteTodoWrite(tc.Arguments)
+		}
+	case "task_create":
+		if result.Succeeded() {
+			env.turn.planning.establishPlan()
+		}
 	case "compress":
 		out.manualCompress = true
 	}

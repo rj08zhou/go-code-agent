@@ -108,6 +108,13 @@ const (
 	EffectSessionMutation
 	EffectMemoryMutation
 	EffectTeamMutation
+	// EffectUnclassified marks dynamically discovered tools whose behavior
+	// cannot be classified confidently enough for pre-plan execution.
+	EffectUnclassified
+	// EffectDelegation marks tools that create or authorize other agents
+	// capable of side effects (e.g. spawning a teammate, approving its plan).
+	// Delegation must not be usable to bypass the lead's own planning gate.
+	EffectDelegation
 )
 
 // SnapshotPolicy controls git snapshot creation.
@@ -148,11 +155,15 @@ func (td ToolDefinition) HasEffect(e Effect) bool {
 }
 
 type EffectSet struct {
-	bitmask int
+	bitmask  int
+	declared bool
 }
 
+// Effects declares a tool's effects. Calling Effects() with no arguments
+// explicitly classifies a tool as having no relevant effects; the zero value
+// remains undeclared so newly registered tools fail closed before planning.
 func Effects(es ...Effect) EffectSet {
-	var s EffectSet
+	s := EffectSet{declared: true}
 	for _, e := range es {
 		s.bitmask |= int(e)
 	}
@@ -161,6 +172,10 @@ func Effects(es ...Effect) EffectSet {
 
 func (es EffectSet) Has(e Effect) bool {
 	return es.bitmask&int(e) != 0
+}
+
+func (es EffectSet) Declared() bool {
+	return es.declared
 }
 
 // ToolHandler is the unified signature: receives ToolScope, returns structured Result.

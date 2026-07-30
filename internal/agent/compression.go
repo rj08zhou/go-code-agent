@@ -9,8 +9,8 @@ import (
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
+	"go-code-agent/internal/store"
 	"go-code-agent/internal/utils"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -215,11 +215,11 @@ func (c *Compression) AutoCompact(ctx context.Context, msgs []llm.Message, sys s
 	origCount := len(msgs)
 	origTokens := llm.EstimateRequestTokens(msgs, nil)
 
-	// Save full transcript
+	// Save full transcript (agent-private: raw conversation content)
 	tDir := filepath.Join(c.dataDir, "transcripts")
-	os.MkdirAll(tDir, 0o755)
+	store.EnsurePrivateDir(tDir)
 	tPath := filepath.Join(tDir, fmt.Sprintf("transcript_%d.jsonl", time.Now().Unix()))
-	if f, err := os.Create(tPath); err == nil {
+	if f, err := store.OpenPrivateAppend(tPath); err == nil {
 		enc := json.NewEncoder(f)
 		for _, m := range msgs {
 			enc.Encode(m)
@@ -248,9 +248,9 @@ func (c *Compression) AutoCompact(ctx context.Context, msgs []llm.Message, sys s
 		Model:     c.modelID,
 		MaxTokens: 4096,
 		Messages: []llm.Message{llm.UserMessage(
-		prompt.Render(c.promptLoader.MustLoad("compaction"), map[string]string{
-			"conversation": convText,
-		}))},
+			prompt.Render(c.promptLoader.MustLoad("compaction"), map[string]string{
+				"conversation": convText,
+			}))},
 	})
 	if err == nil && resp != nil && strings.TrimSpace(resp.Content) != "" {
 		summary = resp.Content

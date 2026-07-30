@@ -9,7 +9,7 @@ import (
 )
 
 func TestExploreToolNames(t *testing.T) {
-	base := exploreToolNames("explore")
+	base := exploreToolNames("explore", true)
 	for _, name := range []string{"write_file", "delete_file", "spawn_teammate", "memory_write", "web_fetch"} {
 		for _, got := range base {
 			if got == name {
@@ -17,7 +17,7 @@ func TestExploreToolNames(t *testing.T) {
 			}
 		}
 	}
-	web := exploreToolNames("web_fetch")
+	web := exploreToolNames("web_fetch", true)
 	want := map[string]bool{"web_fetch": true, "web_search": true}
 	if len(web) != len(want) {
 		t.Fatalf("web_fetch tools = %v, want exactly %v", web, []string{"web_fetch", "web_search"})
@@ -52,7 +52,7 @@ func TestExploreCatalogHidesWriteToolsAndUsesApproval(t *testing.T) {
 	})
 
 	approval := &recordingApproval{}
-	exploreCatalog := parent.Subset(exploreToolNames("explore")...)
+	exploreCatalog := parent.Subset(exploreToolNames("explore", true)...)
 	exec := tool.NewExecutor(exploreCatalog, approval, nil)
 
 	if exploreCatalog.IsKnown("write_file") {

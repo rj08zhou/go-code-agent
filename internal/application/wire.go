@@ -147,6 +147,7 @@ func wireTeam(
 	teamMgr.SetSessionCtx(rt.Ctx)
 	teamMgr.SetDiffPreview(params.DiffPreview)
 	teamMgr.SetApproval(hitlApproval)
+	teamMgr.SetReasoningConfig(cfg)
 	return subagentRunner, teamMgr
 }
 
@@ -169,13 +170,9 @@ func wireTools(rt *SessionRuntime, params RunnerParams, wb *wireBundle) {
 }
 
 func wireSystemPrompt(rt *SessionRuntime, params RunnerParams) string {
-	modelID := ""
-	if params.Config != nil {
-		modelID = params.Config.ModelID
-	}
 	return agent.NewSystemPromptBuilder(
 		params.PromptLoader, params.SkillLoader, nil,
-	).Build(rt.workdir, modelID)
+	).Build(rt.workdir)
 }
 
 func wireHistory(rt *SessionRuntime, sessionDir string) *history.Store {

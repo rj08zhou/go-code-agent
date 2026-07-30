@@ -2,6 +2,7 @@ package tool
 
 import (
 	"encoding/json"
+	"strings"
 )
 
 func taskTools(d builtinDeps) []ToolDefinition {
@@ -9,7 +10,7 @@ func taskTools(d builtinDeps) []ToolDefinition {
 
 	defs = append(defs, ToolDefinition{
 		Name: "TodoWrite",
-		Description: `Update the session todo checklist. Pass items: an array of {content, status} where status is pending|in_progress|completed. Advance work by updating status — do not invent task_id or sort by id (this tool has no task_id).
+		Description: `Update the session todo checklist. Pass items: an array of {content, status, activeForm} where status is pending|in_progress|completed and activeForm describes the action in progress. Advance work by updating status — do not invent task_id or sort by id (this tool has no task_id).
 
 When to use: short linear checklists (about 3+ concrete steps you will execute); user gave a list of items; local work that benefits from progress tracking.
 When NOT to use: a single trivial step (just do it); pure Q&A/analysis with no edits; work with real dependencies or that must survive restart → use task_create + DAG; do not use todos as an investigation plan ("read A, read B") → use explore.
@@ -17,17 +18,18 @@ When NOT to use: a single trivial step (just do it); pure Q&A/analysis with no e
 Example — rename a symbol in one file + update its test: TodoWrite with 2–3 items, then edit. Incorrect: task_create a 5-node DAG for a local rename.
 Example — README typo: edit directly (or one TodoWrite item). Incorrect: task_create planning ceremony for a one-line change.`,
 		RiskLevel: RiskSafe,
-		Effects:     Effects(EffectSessionMutation),
+		Effects:   Effects(EffectSessionMutation),
 		Schema: MustMarshalJSON(map[string]any{
 			"type": "object", "required": []string{"items"},
 			"properties": map[string]any{
 				"items": map[string]any{
 					"type": "array",
 					"items": map[string]any{
-						"type": "object", "required": []string{"content", "status"},
+						"type": "object", "required": []string{"content", "status", "activeForm"},
 						"properties": map[string]any{
-							"content": map[string]any{"type": "string", "description": "Task description."},
-							"status":  map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}, "description": "Task status."},
+							"content":    map[string]any{"type": "string", "description": "Task description."},
+							"status":     map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}, "description": "Task status."},
+							"activeForm": map[string]any{"type": "string", "description": "Present-continuous action label, for example: Running tests."},
 						},
 					},
 				},
@@ -99,14 +101,18 @@ Example — auth middleware + wire into server + migrate handlers + integration 
 					return Failed(e)
 				}
 				if taskSvc != nil {
+					if strings.TrimSpace(a.Subject) == "" {
+						return Failed("subject is required")
+					}
 					return Succeeded(taskSvc.Create(a.Subject, a.Description, a.DependsOn))
 				}
+
 				return Failed("task service unavailable")
 			},
 		}
 	case "task_get":
 		return ToolDefinition{
-			Name: "task_get",
+			Name:        "task_get",
 			Description: `Get task details by numeric task_id from task_create (e.g. 1). Never pass 0 or omit task_id. See task_create for when to use the DAG task system vs TodoWrite.`,
 			Schema: MustMarshalJSON(map[string]any{
 				"type": "object", "required": []string{"task_id"},
@@ -129,7 +135,7 @@ Example — auth middleware + wire into server + migrate handlers + integration 
 		}
 	case "task_update":
 		return ToolDefinition{
-			Name: "task_update",
+			Name:        "task_update",
 			Description: `Update a task's status only (pending|in_progress|completed|deleted) — does not change subject/description. Pass the numeric task_id returned by task_create (e.g. 1); never use 0, omit it, or invent an ID. If unsure of IDs, call task_list first.`,
 			Schema: MustMarshalJSON(map[string]any{
 				"type": "object", "required": []string{"task_id", "status"},

@@ -19,6 +19,12 @@ type stubProvider struct{}
 
 func (stubProvider) Name() string { return "openai" }
 
+func (stubProvider) Capabilities() model.ProviderCapabilities {
+	return model.ProviderCapabilities{
+		Streaming: true,
+	}
+}
+
 func (stubProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Completion, error) {
 	return &llm.Completion{Content: "ok", FinishReason: "stop"}, nil
 }

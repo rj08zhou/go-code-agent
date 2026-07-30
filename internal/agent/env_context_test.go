@@ -14,7 +14,7 @@ import (
 
 func TestBuildEnvContextBasics(t *testing.T) {
 	dir := t.TempDir()
-	got := buildEnvContext(dir, "gpt-test")
+	got := buildEnvContext(dir)
 
 	for _, want := range []string{
 		"<env>",
@@ -23,7 +23,6 @@ func TestBuildEnvContextBasics(t *testing.T) {
 		"Today's date: " + time.Now().Format("Monday, Jan 2, 2006"),
 		"Working directory: " + dir,
 		"Is directory a git repo: no",
-		"Model: gpt-test",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("env context missing %q\n%s", want, got)
@@ -36,7 +35,7 @@ func TestBuildEnvContextGitRepo(t *testing.T) {
 		t.Skip("git not available")
 	}
 	dir := findGitRoot(t)
-	got := buildEnvContext(dir, "m")
+	got := buildEnvContext(dir)
 	if !strings.Contains(got, "Is directory a git repo: yes") {
 		t.Fatalf("expected git repo yes:\n%s", got)
 	}
@@ -67,8 +66,8 @@ func findGitRoot(t *testing.T) string {
 
 func TestSystemPromptIncludesEnvContext(t *testing.T) {
 	b := NewSystemPromptBuilder(prompt.NewLoader(), nil, nil)
-	got := b.Build(t.TempDir(), "model-x")
-	if !strings.Contains(got, "<env>") || !strings.Contains(got, "Model: model-x") {
+	got := b.Build(t.TempDir())
+	if !strings.Contains(got, "<env>") {
 		t.Fatalf("system prompt missing env block:\n%s", got)
 	}
 	if strings.Contains(got, "{{env_context}}") {
@@ -77,7 +76,7 @@ func TestSystemPromptIncludesEnvContext(t *testing.T) {
 }
 
 func TestSystemPromptIncludesBehavioralContract(t *testing.T) {
-	got := NewSystemPromptBuilder(prompt.NewLoader(), nil, nil).Build(t.TempDir(), "m")
+	got := NewSystemPromptBuilder(prompt.NewLoader(), nil, nil).Build(t.TempDir())
 	for _, want := range []string{
 		"## Output Style",
 		"## Coding Conventions",

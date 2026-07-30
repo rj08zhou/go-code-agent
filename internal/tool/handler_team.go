@@ -32,7 +32,7 @@ func teamTools(d builtinDeps) []ToolDefinition {
 		Name:        "spawn_teammate",
 		Description: "Spawn a persistent autonomous teammate that runs in its own worktree. For code changes that need isolation. For read-only investigation, use explore instead.",
 		RiskLevel:   RiskSafe,
-		Effects:     Effects(EffectTeamMutation),
+		Effects:     Effects(EffectTeamMutation, EffectDelegation),
 		Schema: MustMarshalJSON(map[string]any{
 			"type": "object", "required": []string{"name", "prompt"},
 			"properties": map[string]any{

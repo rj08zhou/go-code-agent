@@ -26,6 +26,12 @@ type Config struct {
 	AnthropicAPIKey  string
 	AnthropicBaseURL string
 
+	// ReasoningEnabled opts agent execution calls into provider-native
+	// reasoning. ReasoningEffort is a provider-interpreted hint; the OpenAI
+	// adapter validates and maps it to reasoning_effort.
+	ReasoningEnabled bool
+	ReasoningEffort  string
+
 	LLMMaxQPS         float64
 	LLMMaxBurst       int
 	LLMMaxConcurrency int
@@ -57,6 +63,8 @@ func Load() *Config {
 		OpenAIBaseURL:         strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
 		AnthropicAPIKey:       strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
 		AnthropicBaseURL:      strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")),
+		ReasoningEnabled:      envBool("REASONING_ENABLED"),
+		ReasoningEffort:       firstNonEmptyEnv("REASONING_EFFORT", "medium"),
 		LLMMaxQPS:             envFloat("LLM_MAX_QPS", 4.0),
 		LLMMaxBurst:           envInt("LLM_MAX_BURST", 8),
 		LLMMaxConcurrency:     envInt("LLM_MAX_CONCURRENCY", 4),
