@@ -232,7 +232,7 @@ Session Switch / New / Archive
 | `OPENAI_API_KEY` | — | Required for OpenAI / compatible models |
 | `OPENAI_BASE_URL` | SDK default | Proxy/local model endpoint |
 | `REASONING_ENABLED` | off | Opt into provider-native reasoning for agent calls; raw reasoning is never displayed or persisted |
-| `REASONING_EFFORT` | `medium` | OpenAI-compatible effort hint: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` |
+| `REASONING_EFFORT` | `medium` | OpenAI-compatible effort hint: `minimal` \| `low` \| `medium` \| `high` |
 | `LLM_MAX_QPS` | `4.0` | Process-wide LLM requests/sec |
 | `LLM_MAX_BURST` | `8` | Token-bucket burst |
 | `LLM_MAX_CONCURRENCY` | `4` | Max in-flight LLM calls |

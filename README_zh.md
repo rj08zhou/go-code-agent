@@ -234,7 +234,7 @@ REPL 将新消息追加到 HistoryStore
 | `OPENAI_API_KEY` | — | OpenAI / 兼容接口必需 |
 | `OPENAI_BASE_URL` | SDK 默认 | 代理或本地模型端点 |
 | `REASONING_ENABLED` | 关闭 | 为 Agent 调用启用 Provider 原生推理；原始推理不会展示或持久化 |
-| `REASONING_EFFORT` | `medium` | OpenAI 兼容推理强度：`minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` |
+| `REASONING_EFFORT` | `medium` | OpenAI 兼容推理强度：`minimal` \| `low` \| `medium` \| `high` |
 | `LLM_MAX_QPS` | `4.0` | 进程级 LLM 请求/秒 |
 | `LLM_MAX_BURST` | `8` | 令牌桶突发容量 |
 | `LLM_MAX_CONCURRENCY` | `4` | 最大并发 LLM 调用 |

@@ -502,7 +502,8 @@ func TestRunner_Integration_AutoLessonSkipsSubagent(t *testing.T) {
 }
 
 // TestRunner_Integration_AutoLessonFiresForLead verifies that auto-lesson
-// DOES fire for lead agent (CanMemory=true) after enough rounds.
+// DOES fire for lead agent (CanMemory=true) after enough rounds WITH real
+// tool failures. A run that completed without failures does not need a lesson.
 func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake"}
 	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
@@ -513,7 +514,7 @@ func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
 			Description: "No-op",
 			Effects:     tool.Effects(),
 			Handler: func(scope *tool.ToolScope, args json.RawMessage) tool.Result {
-				return tool.Succeeded("ok")
+				return tool.Failed("simulated failure to trigger lesson")
 			},
 		},
 	})
@@ -542,7 +543,46 @@ func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
 	}
 }
 
-// spyLessonWriter records whether RecordFailure was called.
+// TestRunner_Integration_AutoLessonSkipsOnSuccess verifies that auto-lesson
+// does NOT fire when the run completed without any tool execution failure.
+// A successful run has nothing to learn; injecting a lesson prompt would
+// waste a model round.
+func TestRunner_Integration_AutoLessonSkipsOnSuccess(t *testing.T) {
+	fakeModel := &fakeProvider{name: "fake"}
+	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	catalog := tool.NewToolCatalog()
+	catalog.RegisterAll([]tool.ToolDefinition{
+		{
+			Name:        "noop",
+			Description: "No-op",
+			Effects:     tool.Effects(),
+			Handler: func(scope *tool.ToolScope, args json.RawMessage) tool.Result {
+				return tool.Succeeded("ok")
+			},
+		},
+	})
+
+	exec := tool.NewExecutor(catalog, nil, nil)
+	scope := &tool.ToolScope{Role: "lead", CanRead: true, CanMemory: true}
+	profile := NewLeadProfile("You are a test agent.")
+	runner := NewRunner(profile, gw, exec, scope, nil)
+
+	spy := &spyLessonWriter{}
+	runner.SetLessonWriter(spy)
+
+	fakeModel.toolCalls = []llm.ToolCall{{ID: "call_1", Name: "noop", Arguments: `{}`}}
+	fakeModel.multiShot = 3
+
+	outcome := runner.Run(context.Background(), []llm.Message{llm.UserMessage("test")}, "trace-no-lesson")
+
+	if spy.called {
+		t.Fatal("auto-lesson must NOT fire when all tools succeeded")
+	}
+	if outcome.Error != nil {
+		t.Fatalf("expected no error, got %v", outcome.Error)
+	}
+}
+
 type spyLessonWriter struct {
 	called bool
 }

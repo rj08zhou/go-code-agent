@@ -48,13 +48,14 @@ func (p *OpenAIProvider) Capabilities() model.ProviderCapabilities {
 
 const openAIReasoningContentKind = "openai.chat.reasoning_content"
 
+// openAIReasoningEfforts mirrors the values accepted by the official Chat
+// Completions API (GPT-5 series: minimal/low/medium/high). Values outside
+// this list are rejected locally instead of becoming a guaranteed HTTP 400.
 var openAIReasoningEfforts = map[string]struct{}{
 	"minimal": {},
 	"low":     {},
 	"medium":  {},
 	"high":    {},
-	"xhigh":   {},
-	"max":     {},
 }
 
 // setOpenAIReasoningEffort validates and maps the provider-neutral effort
@@ -73,6 +74,22 @@ func setOpenAIReasoningEffort(req *openai.ChatCompletionNewParams, reasoning *ll
 	}
 	req.SetExtraFields(map[string]any{"reasoning_effort": effort})
 	return nil
+}
+
+// setOpenAIMaxTokens maps the neutral cap onto the request. Reasoning models
+// (o-series, GPT-5.x) reject the legacy max_tokens field with HTTP 400, so an
+// enabled reasoning opt-in switches to max_completion_tokens. Non-reasoning
+// calls keep the historical field for full backward compatibility with older
+// compatible gateways that may not know the newer name.
+func setOpenAIMaxTokens(req *openai.ChatCompletionNewParams, params llm.CallParams) {
+	if params.MaxTokens <= 0 {
+		return
+	}
+	if params.Reasoning != nil && params.Reasoning.Enabled {
+		req.MaxCompletionTokens = param.NewOpt(int64(params.MaxTokens))
+		return
+	}
+	req.MaxTokens = param.NewOpt(int64(params.MaxTokens))
 }
 
 func toOpenAIProviderError(err error) error {
@@ -121,9 +138,7 @@ func (p *OpenAIProvider) Call(ctx context.Context, params llm.CallParams) (*llm.
 	if responseFormat, ok := toOpenAIResponseFormat(params.StructuredOutput); ok {
 		req.ResponseFormat = responseFormat
 	}
-	if params.MaxTokens > 0 {
-		req.MaxTokens = param.NewOpt(int64(params.MaxTokens))
-	}
+	setOpenAIMaxTokens(&req, params)
 	if err := setOpenAIReasoningEffort(&req, params.Reasoning); err != nil {
 		return nil, err
 	}
@@ -152,9 +167,7 @@ func (p *OpenAIProvider) Stream(ctx context.Context, params llm.CallParams, sink
 	if responseFormat, ok := toOpenAIResponseFormat(params.StructuredOutput); ok {
 		req.ResponseFormat = responseFormat
 	}
-	if params.MaxTokens > 0 {
-		req.MaxTokens = param.NewOpt(int64(params.MaxTokens))
-	}
+	setOpenAIMaxTokens(&req, params)
 	if err := setOpenAIReasoningEffort(&req, params.Reasoning); err != nil {
 		return nil, err
 	}
@@ -174,7 +187,6 @@ type openAIStreamAccum struct {
 	result             *llm.StreamResult
 	toolCalls          map[int64]*llm.ToolCall
 	reasoningContent   strings.Builder
-	reasoningSummary   strings.Builder
 	providerInstanceID string
 	model              string
 }
@@ -188,45 +200,42 @@ func newOpenAIStreamAccum(providerInstanceID, modelID string) *openAIStreamAccum
 	}
 }
 
-// parseOpenAIReasoningFields reads compatible response extensions without
+// parseOpenAIReasoningContent reads the compatible response extension without
 // depending on a specific SDK release. reasoning_content is private model
-// rationale and therefore becomes opaque state, never a visible Summary.
-func parseOpenAIReasoningFields(raw string) (content, summary string) {
+// rationale and therefore becomes opaque continuation state. Chat Completions
+// exposes no user-visible reasoning summary — Summary stays empty here and is
+// only populated by providers that genuinely offer one (e.g. Anthropic).
+func parseOpenAIReasoningContent(raw string) string {
 	if strings.TrimSpace(raw) == "" {
-		return "", ""
+		return ""
 	}
 	var wire struct {
 		ReasoningContent json.RawMessage `json:"reasoning_content"`
-		ReasoningSummary json.RawMessage `json:"reasoning_summary"`
 	}
 	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
-		return "", ""
+		return ""
 	}
+	var content string
 	_ = json.Unmarshal(wire.ReasoningContent, &content)
-	_ = json.Unmarshal(wire.ReasoningSummary, &summary)
-	return content, summary
+	return content
 }
 
-func newOpenAIReasoning(content, summary, providerInstanceID, modelID string, keepContent bool) *llm.Reasoning {
-	if summary == "" && (!keepContent || content == "") {
+func newOpenAIReasoning(content, providerInstanceID, modelID string, keepContent bool) *llm.Reasoning {
+	if !keepContent || content == "" || providerInstanceID == "" || modelID == "" {
 		return nil
 	}
-	reasoning := &llm.Reasoning{Summary: summary}
-	if keepContent && content != "" && providerInstanceID != "" && modelID != "" {
-		payload, err := json.Marshal(content)
-		if err == nil {
-			reasoning.State = &llm.ReasoningState{
-				Provider: providerInstanceID,
-				Model:    modelID,
-				Kind:     openAIReasoningContentKind,
-				Payload:  payload,
-			}
-		}
-	}
-	if reasoning.Summary == "" && reasoning.State == nil {
+	payload, err := json.Marshal(content)
+	if err != nil {
 		return nil
 	}
-	return reasoning
+	return &llm.Reasoning{
+		State: &llm.ReasoningState{
+			Provider: providerInstanceID,
+			Model:    modelID,
+			Kind:     openAIReasoningContentKind,
+			Payload:  payload,
+		},
+	}
 }
 
 func (a *openAIStreamAccum) apply(evt openai.ChatCompletionChunk, sink model.StreamSink) {
@@ -234,9 +243,7 @@ func (a *openAIStreamAccum) apply(evt openai.ChatCompletionChunk, sink model.Str
 		// Compatible APIs stream private rationale separately from answer text.
 		// Accumulate it for tool-loop continuation, but never forward it to the
 		// text sink (which is user-visible).
-		reasoningContent, reasoningSummary := parseOpenAIReasoningFields(choice.Delta.RawJSON())
-		a.reasoningContent.WriteString(reasoningContent)
-		a.reasoningSummary.WriteString(reasoningSummary)
+		a.reasoningContent.WriteString(parseOpenAIReasoningContent(choice.Delta.RawJSON()))
 		a.result.Content += choice.Delta.Content
 		// Forward text immediately for real-time UX. DSML markup may
 		// appear in output for legacy DeepSeek models that lack native
@@ -287,7 +294,7 @@ func (a *openAIStreamAccum) finalize(sink model.StreamSink) *llm.StreamResult {
 	// Raw reasoning_content is retained only when needed to continue a tool
 	// loop. A final answer with no tool call discards it immediately.
 	a.result.Reasoning = newOpenAIReasoning(
-		a.reasoningContent.String(), a.reasoningSummary.String(),
+		a.reasoningContent.String(),
 		a.providerInstanceID, a.model, len(a.result.ToolCalls) > 0,
 	)
 	if sink != nil {
@@ -437,9 +444,9 @@ func mapOpenAIResponse(resp *openai.ChatCompletion, providerInstanceID, modelID 
 		})
 	}
 	c.ToolCalls = append(c.ToolCalls, dsmlCalls...)
-	reasoningContent, reasoningSummary := parseOpenAIReasoningFields(choice.Message.RawJSON())
 	c.Reasoning = newOpenAIReasoning(
-		reasoningContent, reasoningSummary, providerInstanceID, modelID, len(c.ToolCalls) > 0,
+		parseOpenAIReasoningContent(choice.Message.RawJSON()),
+		providerInstanceID, modelID, len(c.ToolCalls) > 0,
 	)
 	return c
 }
