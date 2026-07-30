@@ -31,7 +31,7 @@ var openaiToolCallChunks = []string{
 }
 
 func TestOpenAIStreamAccum_ToolCallDeltasAndUsage(t *testing.T) {
-	accum := newOpenAIStreamAccum()
+	accum := newOpenAIStreamAccum("", "")
 	sink := &collectSink{}
 	for i, raw := range openaiToolCallChunks {
 		var chunk openai.ChatCompletionChunk
@@ -71,7 +71,7 @@ func TestOpenAIStreamAccum_TwoToolCallsOrdered(t *testing.T) {
 		`{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"}"}}]},"finish_reason":null}]}`,
 		`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
 	}
-	accum := newOpenAIStreamAccum()
+	accum := newOpenAIStreamAccum("", "")
 	for i, raw := range chunks {
 		var chunk openai.ChatCompletionChunk
 		if err := chunk.UnmarshalJSON([]byte(raw)); err != nil {

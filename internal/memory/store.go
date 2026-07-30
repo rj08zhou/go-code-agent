@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go-code-agent/internal/config"
+	"go-code-agent/internal/store"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -27,7 +28,7 @@ type Store struct {
 
 func NewStore(dataDir string) *Store {
 	dailyDir := filepath.Join(dataDir, "daily")
-	if err := os.MkdirAll(dailyDir, 0o755); err != nil {
+	if err := store.EnsurePrivateDir(dailyDir); err != nil {
 		fmt.Fprintf(os.Stderr, "[warn] memory: create daily dir: %v\n", err)
 	}
 	s := &Store{dataDir: dataDir, dailyDir: dailyDir}
@@ -111,10 +112,10 @@ func (s *Store) Write(content, category string) string {
 		}
 	}
 
-	if err := os.MkdirAll(s.dailyDir, 0o755); err != nil {
+	if err := store.EnsurePrivateDir(s.dailyDir); err != nil {
 		return fmt.Sprintf("Error writing memory: %v", err)
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := store.OpenPrivateAppend(path)
 	if err != nil {
 		return fmt.Sprintf("Error writing memory: %v", err)
 	}
@@ -160,7 +161,7 @@ func (s *Store) tryReplaceDuplicate(content, category string) string {
 		oldEntry["ts"] = time.Now().UTC().Format(time.RFC3339)
 		updated, _ := json.Marshal(oldEntry)
 		lines[c.Line] = string(updated)
-		os.WriteFile(c.File, []byte(strings.Join(lines, "\n")), 0o644)
+		store.AtomicWritePrivate(c.File, []byte(strings.Join(lines, "\n")))
 		s.chunks[i].Text = content
 		base := strings.TrimSuffix(filepath.Base(c.File), ".jsonl")
 		return fmt.Sprintf("Memory updated in %s.jsonl (%s) — replaced similar entry (%.0f%%)", base, category, sim*100)
@@ -229,7 +230,7 @@ func (s *Store) Delete(query, category string) string {
 	if remaining == "" {
 		os.Remove(target.File)
 	} else {
-		os.WriteFile(target.File, []byte(strings.Join(lines, "\n")), 0o644)
+		store.AtomicWritePrivate(target.File, []byte(strings.Join(lines, "\n")))
 	}
 	s.chunks = append(s.chunks[:bestIdx], s.chunks[bestIdx+1:]...)
 	for i := range s.chunks {

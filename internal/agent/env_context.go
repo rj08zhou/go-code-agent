@@ -12,7 +12,10 @@ import (
 
 // buildEnvContext returns a compact <env> block for the system prompt.
 // Values are gathered at session start; keep this block cheap and fail-soft.
-func buildEnvContext(workdir, modelID string) string {
+// Model ID is intentionally omitted: with provider fallback the actual model
+// may differ from the configured one, and a stale identity in the prompt
+// can confuse the model.
+func buildEnvContext(workdir string) string {
 	var b strings.Builder
 	b.WriteString("<env>\n")
 	b.WriteString(fmt.Sprintf("Platform: %s/%s\n", runtime.GOOS, runtime.GOARCH))
@@ -34,9 +37,6 @@ func buildEnvContext(workdir, modelID string) string {
 		b.WriteString("Is directory a git repo: no\n")
 	}
 
-	if modelID != "" {
-		b.WriteString("Model: " + modelID + "\n")
-	}
 	b.WriteString("</env>")
 	return b.String()
 }

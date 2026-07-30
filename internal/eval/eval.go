@@ -270,6 +270,14 @@ type scriptedProvider struct {
 
 func (s *scriptedProvider) Name() string { return "scripted" }
 
+func (s *scriptedProvider) Capabilities() model.ProviderCapabilities {
+	return model.ProviderCapabilities{
+		StructuredOutput: true,
+		ToolCalling:      true,
+		Streaming:        true,
+	}
+}
+
 func (s *scriptedProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Completion, error) {
 	return s.nextResponse(), nil
 }

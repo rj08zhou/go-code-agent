@@ -16,7 +16,6 @@ Today's date: Monday, Jan 2, 2006
 Working directory: /workspace/demo
 Is directory a git repo: yes
 Current branch: main
-Model: test-model
 </env>`
 
 func TestSystemPromptGolden(t *testing.T) {
@@ -46,7 +45,6 @@ func TestSystemPromptGolden(t *testing.T) {
 		"Incorrect: `explore` or `list_dir`",
 		"live in each tool's description",
 		"demo-skill: a fixture skill summary",
-		"Model: test-model",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("golden candidate missing %q", want)

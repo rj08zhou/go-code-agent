@@ -9,6 +9,7 @@ import (
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/tool"
 	"go-code-agent/internal/utils"
+	"io"
 	"strings"
 	"sync"
 )
@@ -21,6 +22,26 @@ type JudgeVerdict struct {
 	Suggestions []string `json:"suggestions"`
 	ShouldRetry bool     `json:"should_retry"`
 	Reason      string   `json:"reason"`
+}
+
+func judgeStructuredOutput() *llm.StructuredOutput {
+	return &llm.StructuredOutput{
+		Name:        "judge_verdict",
+		Description: "Quality review verdict for the coding agent's completed work.",
+		Schema: map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"approved":     map[string]any{"type": "boolean"},
+				"score":        map[string]any{"type": "integer", "minimum": 1, "maximum": 10},
+				"issues":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"suggestions":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"should_retry": map[string]any{"type": "boolean"},
+				"reason":       map[string]any{"type": "string"},
+			},
+			"required": []string{"approved", "score", "issues", "suggestions", "should_retry", "reason"},
+		},
+	}
 }
 
 // JudgeToolResult captures a single tool execution for review.
@@ -83,20 +104,22 @@ func (j *Judge) Verify(ctx context.Context, originalTask string, conversation []
 	}
 
 	comp, err := j.gateway.Call(ctx, "judge", llm.CallParams{
-		Model:       callModel,
-		Messages:    []llm.Message{llm.UserMessage(jPrompt)},
-		Temperature: 0.0,
+		Model:            callModel,
+		Messages:         []llm.Message{llm.UserMessage(jPrompt)},
+		Temperature:      0.0,
+		StructuredOutput: judgeStructuredOutput(),
 	})
 	if err != nil {
 		return permissiveVerdict("judge LLM error: " + err.Error()), err
 	}
-	if comp == nil || comp.Content == "" {
-		return permissiveVerdict("judge returned empty response"), nil
+	if comp == nil || strings.TrimSpace(comp.Content) == "" {
+		err := fmt.Errorf("judge returned empty structured response")
+		return permissiveVerdict(err.Error()), err
 	}
 
 	verdict, perr := parseJudgeResponse(comp.Content)
 	if perr != nil {
-		return permissiveVerdict("judge parse error: " + perr.Error()), perr
+		return permissiveVerdict("judge schema violation: " + perr.Error()), perr
 	}
 
 	if verdict.Score < j.minScore {
@@ -154,23 +177,50 @@ func (j *Judge) buildPrompt(originalTask string, conversation []llm.Message, too
 }
 
 func parseJudgeResponse(content string) (*JudgeVerdict, error) {
-	start := strings.Index(content, "{")
-	end := strings.LastIndex(content, "}")
-	if start < 0 || end < 0 || end <= start {
-		return nil, fmt.Errorf("no JSON object found: %s", utils.Truncate(content, 200))
+	// Pointer fields distinguish a missing required property from its valid zero
+	// value (notably false for approved/should_retry).
+	var wire struct {
+		Approved    *bool     `json:"approved"`
+		Score       *int      `json:"score"`
+		Issues      *[]string `json:"issues"`
+		Suggestions *[]string `json:"suggestions"`
+		ShouldRetry *bool     `json:"should_retry"`
+		Reason      *string   `json:"reason"`
 	}
-	raw := content[start : end+1]
-	var v JudgeVerdict
-	if err := json.Unmarshal([]byte(raw), &v); err != nil {
-		return nil, fmt.Errorf("unmarshal failed: %w", err)
+	dec := json.NewDecoder(strings.NewReader(content))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&wire); err != nil {
+		return nil, fmt.Errorf("decode structured verdict: %w", err)
 	}
-	if v.Score < 1 {
-		v.Score = 1
+	if err := ensureJSONEOF(dec); err != nil {
+		return nil, err
 	}
-	if v.Score > 10 {
-		v.Score = 10
+	if wire.Approved == nil || wire.Score == nil || wire.Issues == nil ||
+		wire.Suggestions == nil || wire.ShouldRetry == nil || wire.Reason == nil {
+		return nil, fmt.Errorf("structured verdict omitted one or more required fields")
 	}
-	return &v, nil
+	if *wire.Score < 1 || *wire.Score > 10 {
+		return nil, fmt.Errorf("structured verdict score %d is outside 1..10", *wire.Score)
+	}
+	return &JudgeVerdict{
+		Approved:    *wire.Approved,
+		Score:       *wire.Score,
+		Issues:      *wire.Issues,
+		Suggestions: *wire.Suggestions,
+		ShouldRetry: *wire.ShouldRetry,
+		Reason:      *wire.Reason,
+	}, nil
+}
+
+func ensureJSONEOF(dec *json.Decoder) error {
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("structured verdict contains trailing JSON value")
+		}
+		return fmt.Errorf("structured verdict contains trailing content: %w", err)
+	}
+	return nil
 }
 
 func permissiveVerdict(reason string) *JudgeVerdict {

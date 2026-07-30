@@ -27,11 +27,23 @@ var exploreBaseTools = []string{
 // (observed: repeated `grep -P` failures burning the whole time budget).
 var webFetchTools = []string{"web_fetch", "web_search"}
 
-func exploreToolNames(agentType string) []string {
+func exploreToolNames(agentType string, hasApproval bool) []string {
 	if agentType == "web_fetch" {
 		return append([]string(nil), webFetchTools...)
 	}
-	return append([]string(nil), exploreBaseTools...)
+	names := append([]string(nil), exploreBaseTools...)
+	if !hasApproval {
+		// bash in explore is only acceptable because HITL approval gates it.
+		// Without an approval checker, fail closed and drop process execution.
+		filtered := names[:0]
+		for _, n := range names {
+			if n != "bash" {
+				filtered = append(filtered, n)
+			}
+		}
+		names = filtered
+	}
+	return names
 }
 
 // SubagentRunner runs an isolated read-only agent loop using the unified Runner
@@ -107,7 +119,7 @@ func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir str
 	}
 
 	// Whitelist catalog: explore must not see write/team/memory tools.
-	exploreCatalog := s.catalog.Subset(exploreToolNames(agentType)...)
+	exploreCatalog := s.catalog.Subset(exploreToolNames(agentType, s.approval != nil)...)
 
 	// Create executor and runner for this subagent invocation.
 	// Subagent tool output is truncated so raw file contents don't

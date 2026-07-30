@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // Manager manages MCP server subprocesses and their tool registrations.
@@ -350,25 +351,40 @@ func (a *ToolCatalogAdapter) RegisterMCPTools(serverName string, tools []ToolInf
 
 // inferMCPEffects guesses tool effects from name and description keywords.
 // MCP tools default to NetworkAccess because they are remote calls.
-func inferMCPEffects(name, desc string, schema map[string]any) tool.EffectSet {
+func inferMCPEffects(name, desc string, _ map[string]any) tool.EffectSet {
 	combined := strings.ToLower(name + " " + desc)
-	var effects []tool.Effect
+	tokens := strings.FieldsFunc(combined, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	hasToken := func(words ...string) bool {
+		for _, token := range tokens {
+			for _, word := range words {
+				if token == word {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	effects := []tool.Effect{tool.EffectNetworkAccess} // all MCP tools are network calls
 
-	effects = append(effects, tool.EffectNetworkAccess) // all MCP tools are network calls
-
-	if strings.Contains(combined, "write") || strings.Contains(combined, "create") ||
-		strings.Contains(combined, "update") || strings.Contains(combined, "delete") ||
-		strings.Contains(combined, "insert") || strings.Contains(combined, "remove") {
+	mutating := hasToken("write", "create", "update", "delete", "insert", "remove", "set", "put", "patch", "archive", "purge", "forget")
+	readOnly := hasToken("read", "query", "search", "get", "list", "fetch", "find", "describe", "inspect")
+	executing := hasToken("exec", "execute", "run", "command", "shell")
+	if mutating {
 		effects = append(effects, tool.EffectWriteFile)
 	}
-	if strings.Contains(combined, "read") || strings.Contains(combined, "query") ||
-		strings.Contains(combined, "search") || strings.Contains(combined, "get") ||
-		strings.Contains(combined, "list") || strings.Contains(combined, "fetch") {
+	if readOnly {
 		effects = append(effects, tool.EffectReadFile)
 	}
-	if strings.Contains(combined, "exec") || strings.Contains(combined, "run") ||
-		strings.Contains(combined, "command") || strings.Contains(combined, "shell") {
+	if executing {
 		effects = append(effects, tool.EffectExecuteProcess)
+	}
+	// A read keyword is not proof that a compound remote operation is read-only.
+	// Mixed or unknown semantics stay unclassified and therefore fail closed
+	// until a plan is established.
+	if (!mutating && !readOnly && !executing) || (readOnly && (mutating || executing)) {
+		effects = append(effects, tool.EffectUnclassified)
 	}
 	return tool.Effects(effects...)
 }

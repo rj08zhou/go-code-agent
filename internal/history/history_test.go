@@ -1,6 +1,7 @@
 package history
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -33,6 +34,36 @@ func TestStore_AppendReadRoundtrip(t *testing.T) {
 	}
 	if entries[2].Kind != "tool" {
 		t.Fatalf("expected tool, got %s", entries[2].Kind)
+	}
+}
+
+func TestStore_AssistantHistoryExcludesReasoningData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	s, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// AppendAssistant deliberately accepts only final content and tool calls;
+	// native reasoning has no persistence input and cannot survive resume.
+	if err := s.AppendAssistant("final answer", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "reasoning") || strings.Contains(string(raw), "opaque") {
+		t.Fatalf("history schema unexpectedly contains reasoning data: %s", raw)
+	}
+	msgs, _, err := s.LoadRuntime("system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range msgs {
+		if msg.Reasoning != nil {
+			t.Fatalf("resumed history restored reasoning data: %#v", msg.Reasoning)
+		}
 	}
 }
 

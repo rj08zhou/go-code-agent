@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/store"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,7 +57,7 @@ type Store struct {
 }
 
 func New(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := store.EnsurePrivateDir(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
 	hs := &Store{path: path}
@@ -98,7 +99,7 @@ func (s *Store) appendEntry(e Entry) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := store.OpenPrivateAppend(s.path)
 	if err != nil {
 		return err
 	}
@@ -114,7 +115,7 @@ func (s *Store) appendEntry(e Entry) error {
 func (s *Store) Sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f, err := os.OpenFile(s.path, os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(s.path, os.O_WRONLY, 0o600)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil

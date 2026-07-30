@@ -107,19 +107,15 @@ type lessonState struct {
 // --- planning / reflection inputs ---
 
 type planningState struct {
-	UsedThink         bool
-	UsedPlanning      bool
+	PlanEstablished   bool
 	RoundsWithoutTodo int
 	HasOpenItems      bool
 	LastTriggered     map[string]int
 }
 
-func (p *planningState) noteThink() { p.UsedThink = true }
-
-func (p *planningState) notePlanning() { p.UsedPlanning = true }
+func (p *planningState) establishPlan() { p.PlanEstablished = true }
 
 func (p *planningState) noteTodoWrite(args string) {
-	p.UsedPlanning = true
 	p.RoundsWithoutTodo = 0
 	p.HasOpenItems = false
 	for _, item := range parseArgsItems(args) {
@@ -127,6 +123,9 @@ func (p *planningState) noteTodoWrite(args string) {
 			p.HasOpenItems = true
 			break
 		}
+	}
+	if p.HasOpenItems {
+		p.establishPlan()
 	}
 }
 

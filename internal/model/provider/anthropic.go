@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
 	"sort"
@@ -16,7 +17,8 @@ import (
 const anthropicDefaultMaxTokens = 16384
 
 type AnthropicProvider struct {
-	client anthropic.Client
+	client     anthropic.Client
+	instanceID string
 }
 
 func NewAnthropic(apiKey, baseURL string) model.Provider {
@@ -27,10 +29,45 @@ func NewAnthropic(apiKey, baseURL string) model.Provider {
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
 	}
-	return &AnthropicProvider{client: anthropic.NewClient(opts...)}
+	return &AnthropicProvider{
+		client:     anthropic.NewClient(opts...),
+		instanceID: model.StableProviderInstanceID("anthropic", baseURL),
+	}
 }
 
-func (p *AnthropicProvider) Name() string { return "anthropic" }
+func (p *AnthropicProvider) Name() string       { return "anthropic" }
+func (p *AnthropicProvider) InstanceID() string { return p.instanceID }
+
+func (p *AnthropicProvider) Capabilities() model.ProviderCapabilities {
+	return model.ProviderCapabilities{
+		StructuredOutput: true,
+		ToolCalling:      true,
+		Streaming:        true,
+	}
+}
+
+func toAnthropicProviderError(err error) error {
+	if err == nil {
+		return nil
+	}
+	statusCode := 0
+	code := ""
+	var apiErr *anthropic.Error
+	if errors.As(err, &apiErr) {
+		statusCode = apiErr.StatusCode
+		code = string(apiErr.Type())
+	}
+	return model.NewProviderError("anthropic", statusCode, code, err)
+}
+
+func toAnthropicOutputConfig(output *llm.StructuredOutput) (anthropic.OutputConfigParam, bool) {
+	if output == nil {
+		return anthropic.OutputConfigParam{}, false
+	}
+	return anthropic.OutputConfigParam{
+		Format: anthropic.JSONOutputFormatParam{Schema: output.Schema},
+	}, true
+}
 
 func (p *AnthropicProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Completion, error) {
 	sys, msgs := buildAnthropicMessages(params.Messages)
@@ -49,13 +86,16 @@ func (p *AnthropicProvider) Call(ctx context.Context, params llm.CallParams) (*l
 	if tools := toAnthropicTools(params.Tools); len(tools) > 0 {
 		req.Tools = tools
 	}
+	if outputConfig, ok := toAnthropicOutputConfig(params.StructuredOutput); ok {
+		req.OutputConfig = outputConfig
+	}
 	if params.Temperature != 0 {
 		req.Temperature = param.NewOpt(params.Temperature)
 	}
 
 	resp, err := p.client.Messages.New(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, toAnthropicProviderError(err)
 	}
 	return mapAnthropicResponse(resp), nil
 }
@@ -77,6 +117,9 @@ func (p *AnthropicProvider) Stream(ctx context.Context, params llm.CallParams, s
 	if tools := toAnthropicTools(params.Tools); len(tools) > 0 {
 		req.Tools = tools
 	}
+	if outputConfig, ok := toAnthropicOutputConfig(params.StructuredOutput); ok {
+		req.OutputConfig = outputConfig
+	}
 	if params.Temperature != 0 {
 		req.Temperature = param.NewOpt(params.Temperature)
 	}
@@ -86,7 +129,7 @@ func (p *AnthropicProvider) Stream(ctx context.Context, params llm.CallParams, s
 	for stream.Next() {
 		accum.apply(stream.Current(), sink)
 	}
-	return accum.finalize(sink), stream.Err()
+	return accum.finalize(sink), toAnthropicProviderError(stream.Err())
 }
 
 type anthropicToolAccum struct {

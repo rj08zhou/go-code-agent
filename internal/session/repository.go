@@ -102,7 +102,7 @@ func (r *Repository) LoadIndex() (*sessionsIndex, error) {
 // SaveIndex persists the sessions index.
 func (r *Repository) SaveIndex(idx *sessionsIndex) error {
 	data, _ := json.MarshalIndent(idx, "", "  ")
-	return store.AtomicWrite(r.indexPath(), data)
+	return store.AtomicWritePrivate(r.indexPath(), data)
 }
 
 // CreateSession creates a new session directory and meta.json.
@@ -110,17 +110,18 @@ func (r *Repository) CreateSession(st *State) error {
 	st.CreatedAt = time.Now().Unix()
 	st.UpdatedAt = st.CreatedAt
 	dir := r.sessionDir(st.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := store.EnsurePrivateDir(dir); err != nil {
 		return err
 	}
 	data, _ := json.MarshalIndent(st, "", "  ")
-	return store.AtomicWrite(filepath.Join(dir, "meta.json"), data)
+	return store.AtomicWritePrivate(filepath.Join(dir, "meta.json"), data)
 }
 
-// EnsureSessionDir creates the session directory (and sessions root) if missing.
+// EnsureSessionDir creates the session directory (and sessions root) if
+// missing, and tightens permissions of pre-existing session dirs.
 // Safe to call for both new and resumed sessions.
 func (r *Repository) EnsureSessionDir(id string) error {
-	return os.MkdirAll(r.sessionDir(id), 0o755)
+	return store.EnsurePrivateDir(r.sessionDir(id))
 }
 
 // LoadSessionMeta reads meta.json for a session.
@@ -141,7 +142,7 @@ func (r *Repository) LoadSessionMeta(id string) (*State, error) {
 func (r *Repository) SaveSessionMeta(st *State) error {
 	st.UpdatedAt = time.Now().Unix()
 	data, _ := json.MarshalIndent(st, "", "  ")
-	return store.AtomicWrite(filepath.Join(r.sessionDir(st.ID), "meta.json"), data)
+	return store.AtomicWritePrivate(filepath.Join(r.sessionDir(st.ID), "meta.json"), data)
 }
 
 // SessionDir returns the on-disk directory for a session.

@@ -47,6 +47,39 @@ func TestInferMCPEffects_NoEffect(t *testing.T) {
 	if !eff.Has(tool.EffectNetworkAccess) {
 		t.Error("all MCP tools should have EffectNetworkAccess")
 	}
+	if !eff.Has(tool.EffectUnclassified) {
+		t.Error("MCP tools without a recognized behavior must be marked unclassified")
+	}
+}
+
+func TestInferMCPEffectsAvoidsSubstringAndMixedSemanticBypasses(t *testing.T) {
+	tests := []struct {
+		name             string
+		description      string
+		wantWrite        bool
+		wantRead         bool
+		wantUnclassified bool
+	}{
+		{name: "set_budget", wantWrite: true},
+		{name: "forget_user", wantWrite: true},
+		{name: "list_and_archive", wantWrite: true, wantRead: true, wantUnclassified: true},
+		{name: "target_status", description: "return current status", wantUnclassified: true},
+		{name: "list_users", wantRead: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			eff := inferMCPEffects(tc.name, tc.description, nil)
+			if eff.Has(tool.EffectWriteFile) != tc.wantWrite {
+				t.Errorf("write effect = %v, want %v", eff.Has(tool.EffectWriteFile), tc.wantWrite)
+			}
+			if eff.Has(tool.EffectReadFile) != tc.wantRead {
+				t.Errorf("read effect = %v, want %v", eff.Has(tool.EffectReadFile), tc.wantRead)
+			}
+			if eff.Has(tool.EffectUnclassified) != tc.wantUnclassified {
+				t.Errorf("unclassified effect = %v, want %v", eff.Has(tool.EffectUnclassified), tc.wantUnclassified)
+			}
+		})
+	}
 }
 
 // --- ToolCatalogAdapter ---

@@ -9,6 +9,7 @@ import (
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
+	"go-code-agent/internal/store"
 	"go-code-agent/internal/task"
 	"go-code-agent/internal/team"
 	"go-code-agent/internal/tool"
@@ -50,6 +51,7 @@ type TeammateManager struct {
 	catalog      *tool.ToolCatalog
 	modelID      string
 	promptLoader *prompt.Loader
+	reasoning    *llm.ReasoningRequest
 	diffPreview  tool.DiffPreview
 	approval     tool.ApprovalChecker
 	eventSink    event.Sink
@@ -71,6 +73,10 @@ func (tm *TeammateManager) SetApproval(a tool.ApprovalChecker) { tm.approval = a
 
 func (tm *TeammateManager) SetEventSink(sink event.Sink) { tm.eventSink = sink }
 
+func (tm *TeammateManager) SetReasoningConfig(cfg *config.Config) {
+	tm.reasoning = reasoningRequestFromConfig(cfg)
+}
+
 func NewTeammateManager(
 	dir string,
 	gw *model.Gateway,
@@ -82,7 +88,7 @@ func NewTeammateManager(
 	modelID string,
 	pl *prompt.Loader,
 ) *TeammateManager {
-	os.MkdirAll(dir, 0o755)
+	store.EnsurePrivateDir(dir)
 	tm := &TeammateManager{
 		dir:          dir,
 		configPath:   filepath.Join(dir, "config.json"),
@@ -105,7 +111,7 @@ func NewTeammateManager(
 
 func (tm *TeammateManager) save() {
 	data, _ := json.MarshalIndent(tm.config, "", "  ")
-	os.WriteFile(tm.configPath, data, 0o644)
+	store.AtomicWritePrivate(tm.configPath, data)
 }
 
 func (tm *TeammateManager) findIndex(name string) int {
@@ -257,6 +263,7 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 			Messages:  *msgs,
 			Tools:     toolDefs,
 			MaxTokens: config.DefaultMaxOutputTokens,
+			Reasoning: tm.reasoning,
 		}, newPrefixedSink(name))
 		if tm.eventSink != nil {
 			tm.eventSink.Emit(event.Event{Type: event.ModelCalled, TraceID: traceID, AgentID: name, Duration: time.Since(modelStart)})
@@ -306,10 +313,10 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 			if tm.eventSink != nil {
 				tm.eventSink.Emit(event.Event{Type: event.ToolStarted, TraceID: traceID, AgentID: name, ToolCallID: tc.ID, ToolName: tc.Name})
 			}
-			// Gate write tools by plan approval
-			if isWriteTool(tc.Name) && !team.HasApprovedPlan(tm.protocols, name) {
+			// Gate file mutations and process execution by plan approval.
+			if requiresApprovedPlan(executor, tc.Name) && !team.HasApprovedPlan(tm.protocols, name) {
 				*msgs = append(*msgs, llm.ToolMessage(
-					"[DENIED] submit_plan approval required before write operations", tc.ID))
+					"[DENIED] submit_plan approval required before file mutations or process execution", tc.ID))
 				continue
 			}
 			result := executor.Execute(ctx, scope, tc)
@@ -466,6 +473,8 @@ func (tm *TeammateManager) ShutdownAll() {
 	}
 }
 
-func isWriteTool(name string) bool {
-	return name == "bash" || name == "write_file" || name == "edit_file" || name == "delete_file"
+func requiresApprovedPlan(executor *tool.Executor, name string) bool {
+	definition, known := executor.Definition(name)
+	_, blocked := unplannedToolBlock(definition, known)
+	return blocked
 }

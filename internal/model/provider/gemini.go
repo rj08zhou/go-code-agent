@@ -13,19 +13,44 @@ import (
 )
 
 type GeminiProvider struct {
-	apiKey  string
-	baseURL string
-	client  *http.Client
+	apiKey     string
+	baseURL    string
+	client     *http.Client
+	instanceID string
 }
 
 func NewGemini(apiKey, baseURL string) model.Provider {
 	if baseURL == "" {
 		baseURL = "https://generativelanguage.googleapis.com"
 	}
-	return &GeminiProvider{apiKey: apiKey, baseURL: baseURL, client: &http.Client{}}
+	return &GeminiProvider{
+		apiKey:     apiKey,
+		baseURL:    baseURL,
+		client:     &http.Client{},
+		instanceID: model.StableProviderInstanceID("gemini", baseURL),
+	}
 }
 
-func (p *GeminiProvider) Name() string { return "gemini" }
+func (p *GeminiProvider) Name() string       { return "gemini" }
+func (p *GeminiProvider) InstanceID() string { return p.instanceID }
+
+func (p *GeminiProvider) Capabilities() model.ProviderCapabilities {
+	return model.ProviderCapabilities{
+		StructuredOutput: true,
+		ToolCalling:      false, // Gemini REST API does not support tool_calls
+		Streaming:        false, // Only Call is implemented; no Stream method
+	}
+}
+
+func toGeminiGenerationConfig(output *llm.StructuredOutput) (map[string]any, bool) {
+	if output == nil {
+		return nil, false
+	}
+	return map[string]any{
+		"responseMimeType": "application/json",
+		"responseSchema":   output.Schema,
+	}, true
+}
 
 func (p *GeminiProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Completion, error) {
 	key := p.apiKey
@@ -48,6 +73,9 @@ func (p *GeminiProvider) Call(ctx context.Context, params llm.CallParams) (*llm.
 
 	body := map[string]any{
 		"contents": contents,
+	}
+	if generationConfig, ok := toGeminiGenerationConfig(params.StructuredOutput); ok {
+		body["generationConfig"] = generationConfig
 	}
 	data, _ := json.Marshal(body)
 

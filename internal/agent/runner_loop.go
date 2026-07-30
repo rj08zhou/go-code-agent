@@ -183,8 +183,7 @@ func (r *Runner) prepareRound(
 	// --- Planning gate (round 0 & 1 only) ---
 	if r.planGate != nil && r.turn.rounds <= 1 {
 		if planMsg := r.planGate.Eval(
-			r.turn.rounds, r.turn.planning.UsedPlanning, r.turn.planning.UsedThink, r.turn.explore.Used,
-			r.turn.originalTask,
+			r.turn.rounds, r.turn.planning.PlanEstablished, r.turn.originalTask,
 		); planMsg != "" {
 			r.emit(event.Event{
 				Type:    event.PlanningDecision,
@@ -304,21 +303,15 @@ func (r *Runner) callModel(
 		Messages:  messages,
 		Tools:     toolDefs,
 		MaxTokens: r.profile.MaxTokens,
+		Reasoning: reasoningRequestFromConfig(r.cfg),
 	}, newPrefixedSink(r.profile.Role))
 	if err != nil {
 		out.Error = fmt.Errorf("API call failed: %w", err)
 		out.Messages = messages
 		return messages, nil, out
 	}
-	// Accumulate per-round usage for turn-level summary.
-	if !sr.Usage.IsZero() {
-		r.turn.usage.PromptTokens += sr.Usage.PromptTokens
-		r.turn.usage.CompletionTokens += sr.Usage.CompletionTokens
-		r.turn.usage.TotalTokens += sr.Usage.TotalTokens
-		r.turn.usage.CachedReadTokens += sr.Usage.CachedReadTokens
-		r.turn.usage.CacheMissTokens += sr.Usage.CacheMissTokens
-		r.turn.usage.CacheCreateTokens += sr.Usage.CacheCreateTokens
-	}
+	// Accumulate every usage dimension for the turn-level summary.
+	r.turn.usage.Add(sr.Usage)
 	r.emit(event.Event{
 		Type:     event.ModelCalled,
 		TraceID:  traceID,
@@ -385,7 +378,7 @@ func (r *Runner) handleNoToolCalls(
 	}
 
 	if r.judge != nil && r.judge.IsEnabled() && r.turn.judge.RetryInjects < config.JudgeMaxRetryInjects {
-		taskText := lastUserMessage(messages)
+		taskText := r.turn.originalTask
 		judgeResults := make([]JudgeToolResult, 0, len(out.ToolResults))
 		for _, tr := range out.ToolResults {
 			judgeResults = append(judgeResults, JudgeToolResult{
@@ -397,19 +390,26 @@ func (r *Runner) handleNoToolCalls(
 		}
 		verdict, jerr := r.judge.Verify(ctx, taskText, messages, judgeResults, modelID)
 		if verdict != nil {
-			r.emit(event.Event{
+			judgeEvent := event.Event{
 				Type:    event.JudgeDecision,
 				TraceID: traceID,
+				Status:  "ok",
 				Payload: map[string]string{
 					"score":    fmt.Sprintf("%d", verdict.Score),
 					"approved": fmt.Sprintf("%v", verdict.Approved),
 					"retry":    fmt.Sprintf("%v", verdict.ShouldRetry),
 					"reason":   utils.Truncate(verdict.Reason, 200),
 				},
-			})
+			}
+			if jerr != nil {
+				judgeEvent.Status = "degraded"
+				judgeEvent.Error = utils.Truncate(jerr.Error(), 300)
+			}
+			r.emit(judgeEvent)
 		}
 		if jerr != nil {
-			// Soft-fail open on judge errors (matches original).
+			// Judge availability remains fail-open, but the degraded decision is
+			// explicit in the event stream instead of looking like an approval.
 		} else if verdict != nil && !(verdict.Approved && !verdict.ShouldRetry) {
 			r.turn.judge.RetryInjects++
 			messages = append(messages, llm.UserMessage(verdict.FormatFeedback()))
@@ -457,6 +457,16 @@ func (r *Runner) executeToolBatch(
 	var manualCompress bool
 	var pendingNudges []string
 	hooks := defaultToolInterceptors(r.loader())
+	// Planning authorization is snapshotted for the entire assistant tool-call
+	// batch. A plan created in this batch only authorizes side effects starting
+	// with the next model round.
+	//
+	// The hard guard deliberately does NOT depend on planGate being wired:
+	// planGate only supplies nudge copy, while blocking is a safety property
+	// that must hold even when the optional nudge component is missing.
+	planEstablishedAtBatchStart := r.turn.planning.PlanEstablished
+	enforcePlanning := r.profile.Role == "lead" &&
+		needsPlan(r.turn.originalTask, planEstablishedAtBatchStart)
 
 	for _, tc := range toolCalls {
 		if tc.Arguments != "" && !strings.HasPrefix(tc.Arguments, "{") {
@@ -481,16 +491,45 @@ func (r *Runner) executeToolBatch(
 			ToolName:   tc.Name,
 		})
 
-		// Before hooks: deferred nudges always collected; first non-continue wins.
+		// Before hooks: planning guard runs first, then deferred nudges are
+		// collected and the first non-continue decision wins.
 		var decision beforeDecision
 		var result tool.Result
-		for _, h := range hooks {
-			br := h.Before(env, tc)
-			pendingNudges = append(pendingNudges, br.nudges...)
-			if br.decision != beforeContinue {
-				decision = br.decision
-				result = br.result
-				break
+		if enforcePlanning {
+			definition, known := r.executor.Definition(tc.Name)
+			if classification, blocked := unplannedToolBlock(definition, known); blocked {
+				reason := fmt.Sprintf(
+					"tool %q blocked: this non-trivial run has no established plan (%s); "+
+						"successfully call TodoWrite or task_create, then retry this tool in the next model round",
+					tc.Name, classification,
+				)
+				decision = beforeDenyEarly
+				result = tool.Denied(reason)
+				r.emit(event.Event{
+					Type:       event.PlanningDecision,
+					TraceID:    traceID,
+					ToolCallID: tc.ID,
+					ToolName:   tc.Name,
+					Status:     "blocked",
+					Error:      reason,
+					Output:     fmt.Sprintf("round=%d classification=%s", r.turn.rounds, classification),
+					Payload: map[string]string{
+						"action":         "block_unplanned_side_effect",
+						"classification": classification,
+						"round":          fmt.Sprintf("%d", r.turn.rounds),
+					},
+				})
+			}
+		}
+		if decision == beforeContinue {
+			for _, h := range hooks {
+				br := h.Before(env, tc)
+				pendingNudges = append(pendingNudges, br.nudges...)
+				if br.decision != beforeContinue {
+					decision = br.decision
+					result = br.result
+					break
+				}
 			}
 		}
 

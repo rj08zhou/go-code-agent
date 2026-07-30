@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/logging"
+	"go-code-agent/internal/store"
 	"go-code-agent/internal/utils"
 	"os"
-	"path/filepath"
 	"sync"
 )
 
@@ -127,9 +127,9 @@ func (s *ConsoleSink) Emit(e Event) {
 	}
 	// Show per-turn accumulated usage.
 	if e.Type == TurnComplete && e.Usage != nil && !e.Usage.IsZero() {
-		fmt.Fprintf(os.Stderr, " %sin=%d out=%d hit=%d miss=%d hit_rate=%.1f%%%s",
+		fmt.Fprintf(os.Stderr, " %sin=%d out=%d reasoning=%d hit=%d miss=%d hit_rate=%.1f%%%s",
 			utils.Dim, e.Usage.PromptTokens, e.Usage.CompletionTokens,
-			e.Usage.CachedReadTokens, e.Usage.CacheMissTokens,
+			e.Usage.ReasoningTokens, e.Usage.CachedReadTokens, e.Usage.CacheMissTokens,
 			cacheHitRate(*e.Usage), utils.Reset)
 	}
 	fmt.Fprintln(os.Stderr)
@@ -177,9 +177,9 @@ func (s *UsageSink) Emit(e Event) {
 	// Per-round detail (every LLM call).
 	if e.Type == ModelCalled && e.Usage != nil {
 		u := e.Usage
-		logging.Default().Info(fmt.Sprintf("[usage] trace=%s agent=%s session=%s model=%s in=%d out=%d total=%d cached_read=%d cache_miss=%d cache_create=%d hit_rate=%.1f%% dur=%.2fs",
+		logging.Default().Info(fmt.Sprintf("[usage] trace=%s agent=%s session=%s model=%s in=%d out=%d reasoning=%d total=%d cached_read=%d cache_miss=%d cache_create=%d hit_rate=%.1f%% dur=%.2fs",
 			e.TraceID, e.AgentID, e.SessionID, e.ModelID,
-			u.PromptTokens, u.CompletionTokens, u.TotalTokens,
+			u.PromptTokens, u.CompletionTokens, u.ReasoningTokens, u.TotalTokens,
 			u.CachedReadTokens, u.CacheMissTokens, u.CacheCreateTokens,
 			cacheHitRate(*u), e.Duration.Seconds()))
 		return
@@ -188,10 +188,10 @@ func (s *UsageSink) Emit(e Event) {
 	// Per-turn summary (one user conversation).
 	if e.Type == TurnComplete && e.Usage != nil && !e.Usage.IsZero() {
 		u := e.Usage
-		logging.Default().Info(fmt.Sprintf("[usage:turn] trace=%s agent=%s session=%s %s in=%d out=%d total=%d cached_read=%d cache_miss=%d cache_create=%d hit_rate=%.1f%%",
+		logging.Default().Info(fmt.Sprintf("[usage:turn] trace=%s agent=%s session=%s %s in=%d out=%d reasoning=%d total=%d cached_read=%d cache_miss=%d cache_create=%d hit_rate=%.1f%%",
 			e.TraceID, e.AgentID, e.SessionID,
 			e.Payload.(map[string]string)["summary"],
-			u.PromptTokens, u.CompletionTokens, u.TotalTokens,
+			u.PromptTokens, u.CompletionTokens, u.ReasoningTokens, u.TotalTokens,
 			u.CachedReadTokens, u.CacheMissTokens, u.CacheCreateTokens,
 			cacheHitRate(*u)))
 	}
@@ -213,10 +213,7 @@ func NewSessionLogSink(path string) (*SessionLogSink, error) {
 }
 
 func (s *SessionLogSink) reopen() error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := store.OpenPrivateAppend(s.path)
 	if err != nil {
 		return err
 	}
