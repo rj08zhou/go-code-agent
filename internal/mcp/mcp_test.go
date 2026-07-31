@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent/internal/tool"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"go-code-agent/internal/tool"
 )
 
 // --- inferMCPEffects ---
@@ -216,6 +219,216 @@ func TestManager_ShutdownIdempotent(t *testing.T) {
 	mgr.Shutdown() // should not panic
 }
 
+func TestManagerLoadAndStartReturnsAndRecordsFailure(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-mcp-server")
+	config, err := json.Marshal([]map[string]any{{"name": "auto-broken", "command": missing}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MCP_SERVERS", string(config))
+	mgr := NewManager(t.TempDir())
+
+	if err := mgr.LoadAndStart(context.Background()); err == nil {
+		t.Fatal("LoadAndStart returned nil error for a missing executable")
+	}
+	if mgr.Count() != 0 || mgr.FailedCount() != 1 {
+		t.Fatalf("counts after auto-start failure: active=%d failed=%d", mgr.Count(), mgr.FailedCount())
+	}
+}
+
+func TestManagerConnectReportsStartFailure(t *testing.T) {
+	mgr := NewManager(t.TempDir())
+	missing := filepath.Join(t.TempDir(), "missing-mcp-server")
+
+	if _, err := mgr.Connect(context.Background(), "broken", missing, nil); err == nil {
+		t.Fatal("Connect returned nil error for a missing executable")
+	}
+	if got := mgr.Count(); got != 0 {
+		t.Fatalf("active server count = %d, want 0", got)
+	}
+	if got := mgr.FailedCount(); got != 1 {
+		t.Fatalf("failed server count = %d, want 1", got)
+	}
+	status := mgr.Status()
+	if !strings.Contains(status, "failed:") || !strings.Contains(status, "broken") {
+		t.Fatalf("status does not expose failed server: %q", status)
+	}
+}
+
+func TestManagerConnectHonorsContextCancellation(t *testing.T) {
+	mgr, _ := newHelperManager(t, "initialize-hang")
+	command, args := helperCommand()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	if _, err := mgr.Connect(ctx, "cancelled", command, args); err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("Connect error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("cancelled Connect took %s", elapsed)
+	}
+	if mgr.Count() != 0 || mgr.FailedCount() != 1 {
+		t.Fatalf("counts after cancellation: active=%d failed=%d", mgr.Count(), mgr.FailedCount())
+	}
+}
+
+func TestManagerConnectInitializationFailureRollsBack(t *testing.T) {
+	mgr, catalog := newHelperManager(t, "initialize-error")
+	command, args := helperCommand()
+
+	if _, err := mgr.Connect(context.Background(), "init-fails", command, args); err == nil {
+		t.Fatal("Connect returned nil error when initialize failed")
+	}
+	if got := mgr.Count(); got != 0 {
+		t.Fatalf("active server count = %d, want 0", got)
+	}
+	if got := mgr.FailedCount(); got != 1 {
+		t.Fatalf("failed server count = %d, want 1", got)
+	}
+	if catalog.IsKnown("mcp__init-fails__echo") {
+		t.Fatal("initialization failure registered a tool")
+	}
+}
+
+func TestManagerConnectDiscoveryFailureRollsBack(t *testing.T) {
+	mgr, catalog := newHelperManager(t, "discover-error")
+	command, args := helperCommand()
+
+	if _, err := mgr.Connect(context.Background(), "discover-fails", command, args); err == nil {
+		t.Fatal("Connect returned nil error when tools/list failed")
+	}
+	if got := mgr.Count(); got != 0 {
+		t.Fatalf("active server count = %d, want 0", got)
+	}
+	if got := mgr.FailedCount(); got != 1 {
+		t.Fatalf("failed server count = %d, want 1", got)
+	}
+	if catalog.IsKnown("mcp__discover-fails__echo") {
+		t.Fatal("failed server tool remained registered")
+	}
+	if status := mgr.Status(); !strings.Contains(status, "discover-fails") || !strings.Contains(status, "failed:") {
+		t.Fatalf("status does not expose discovery failure: %q", status)
+	}
+}
+
+func TestManagerApproveFailureRemainsRetryable(t *testing.T) {
+	mgr, catalog := newHelperManager(t, "success")
+	name := "approval-retry"
+	mgr.mu.Lock()
+	mgr.pendingServers[name] = ServerConfig{
+		Name: name, Command: filepath.Join(t.TempDir(), "missing-mcp-server"), Env: os.Environ(),
+	}
+	mgr.mu.Unlock()
+
+	if _, err := mgr.Approve(context.Background(), name); err == nil {
+		t.Fatal("Approve returned nil error for a missing executable")
+	}
+	status := mgr.Status()
+	if !strings.Contains(status, "failed:") || !strings.Contains(status, "Retry: /mcp approve "+name) {
+		t.Fatalf("failed approval is not shown as retryable: %q", status)
+	}
+
+	command, args := helperCommand()
+	mgr.mu.Lock()
+	cfg := mgr.pendingServers[name]
+	cfg.Command = command
+	cfg.Args = args
+	cfg.Env = os.Environ()
+	mgr.pendingServers[name] = cfg
+	mgr.mu.Unlock()
+
+	toolCount, err := mgr.Approve(context.Background(), name)
+	if err != nil {
+		t.Fatalf("Approve retry: %v", err)
+	}
+	if toolCount != 1 {
+		t.Fatalf("registered tool count = %d, want 1", toolCount)
+	}
+	if mgr.FailedCount() != 0 || mgr.Count() != 1 {
+		t.Fatalf("counts after retry: active=%d failed=%d", mgr.Count(), mgr.FailedCount())
+	}
+	if !catalog.IsKnown("mcp__" + name + "__echo") {
+		t.Fatal("successful retry did not register discovered tool")
+	}
+}
+
+func TestManagerConcurrentConnectPublishesOnlyOneServer(t *testing.T) {
+	mgr, catalog := newHelperManager(t, "success")
+	command, args := helperCommand()
+
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := mgr.Connect(context.Background(), "single", command, args)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	successes := 0
+	failures := 0
+	for err := range errs {
+		if err == nil {
+			successes++
+		} else {
+			failures++
+		}
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("connect results: successes=%d failures=%d, want 1/1", successes, failures)
+	}
+	if mgr.Count() != 1 || !catalog.IsKnown("mcp__single__echo") {
+		t.Fatalf("concurrent connection did not publish exactly one usable server")
+	}
+}
+
+func TestManagerDisconnectUnregistersTools(t *testing.T) {
+	mgr, catalog := newHelperManager(t, "success")
+	command, args := helperCommand()
+
+	toolCount, err := mgr.Connect(context.Background(), "healthy", command, args)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if toolCount != 1 || !catalog.IsKnown("mcp__healthy__echo") {
+		t.Fatalf("successful connection did not register one tool")
+	}
+	status := mgr.Status()
+	if !strings.Contains(status, "active:") || !strings.Contains(status, "healthy (healthy, 1 tool)") {
+		t.Fatalf("active status missing health and tool count: %q", status)
+	}
+
+	if err := mgr.Disconnect("healthy"); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if mgr.Count() != 0 {
+		t.Fatalf("active server count after disconnect = %d, want 0", mgr.Count())
+	}
+	if catalog.IsKnown("mcp__healthy__echo") {
+		t.Fatal("disconnected server tool remained registered")
+	}
+}
+
+func newHelperManager(t *testing.T, mode string) (*Manager, *tool.ToolCatalog) {
+	t.Helper()
+	t.Setenv("GO_WANT_MCP_HELPER", "1")
+	t.Setenv("MCP_HELPER_MODE", mode)
+	mgr := NewManager(t.TempDir())
+	catalog := tool.NewToolCatalog()
+	mgr.SetRegistry(NewToolCatalogAdapter(catalog, mgr))
+	t.Cleanup(mgr.Shutdown)
+	return mgr, catalog
+}
+
+func helperCommand() (string, []string) {
+	return os.Args[0], []string{"-test.run=^TestMCPHelperProcess$"}
+}
+
 // --- Manager CallTool with no server ---
 
 func TestManager_CallTool_NoServer(t *testing.T) {
@@ -269,6 +482,32 @@ func TestClientCallToolHonorsContextCancellation(t *testing.T) {
 	}
 }
 
+func TestClientCallToolMapsMCPErrorToFailure(t *testing.T) {
+	c, requests, responses := newPipeClient(t)
+	go func() {
+		line, err := requests.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		var req rpcRequest
+		if json.Unmarshal(line, &req) != nil {
+			return
+		}
+		_, _ = fmt.Fprintf(responses,
+			`{"jsonrpc":"2.0","id":%d,"result":{"content":[{"type":"text","text":"denied"}],"isError":true}}`+"\n",
+			req.ID,
+		)
+	}()
+
+	output, err := c.CallTool(context.Background(), "fails", nil)
+	if err == nil {
+		t.Fatalf("CallTool returned nil error for isError response: output=%q", output)
+	}
+	if !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("CallTool error = %q, want server error content", err)
+	}
+}
+
 func TestClientConcurrentCallsRemainFramed(t *testing.T) {
 	c, requests, responses := newPipeClient(t)
 	go func() {
@@ -310,6 +549,67 @@ func TestClientConcurrentCallsRemainFramed(t *testing.T) {
 	for err := range errs {
 		if err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+// TestMCPHelperProcess runs as a subprocess for Manager lifecycle tests.
+func TestMCPHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_MCP_HELPER") != "1" {
+		return
+	}
+
+	mode := os.Getenv("MCP_HELPER_MODE")
+	scanner := bufio.NewScanner(os.Stdin)
+	encoder := json.NewEncoder(os.Stdout)
+	for scanner.Scan() {
+		var req rpcRequest
+		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			os.Exit(2)
+		}
+		switch req.Method {
+		case "initialize":
+			if mode == "initialize-hang" {
+				time.Sleep(10 * time.Second)
+				return
+			}
+			if mode == "initialize-error" {
+				_ = encoder.Encode(map[string]any{
+					"jsonrpc": "2.0", "id": req.ID,
+					"error": map[string]any{"code": -32000, "message": "initialize rejected"},
+				})
+				return
+			}
+			_ = encoder.Encode(map[string]any{
+				"jsonrpc": "2.0", "id": req.ID,
+				"result": map[string]any{
+					"protocolVersion": "2024-11-05",
+					"capabilities":    map[string]any{},
+					"serverInfo":      map[string]any{"name": "test-helper", "version": "1.0.0"},
+					"instructions":    "test helper instructions",
+				},
+			})
+		case "notifications/initialized":
+			// Notifications have no response.
+		case "tools/list":
+			if mode == "discover-error" {
+				_ = encoder.Encode(map[string]any{
+					"jsonrpc": "2.0", "id": req.ID,
+					"error": map[string]any{"code": -32001, "message": "tool discovery rejected"},
+				})
+				return
+			}
+			_ = encoder.Encode(map[string]any{
+				"jsonrpc": "2.0", "id": req.ID,
+				"result": map[string]any{"tools": []map[string]any{{
+					"name": "echo", "description": "Echo input", "inputSchema": map[string]any{"type": "object"},
+				}}},
+			})
+		default:
+			_ = encoder.Encode(map[string]any{
+				"jsonrpc": "2.0", "id": req.ID,
+				"error": map[string]any{"code": -32601, "message": "method not found"},
+			})
 		}
 	}
 }

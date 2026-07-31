@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,34 @@ import (
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/store"
 )
+
+func approvedMutationFor(scope *ToolScope, path, resolvedPath string, deleting bool) (*PreviewRequest, error) {
+	if scope == nil || scope.approvedMutation == nil {
+		return nil, nil
+	}
+	mutation := scope.approvedMutation
+	if filepath.Clean(mutation.Path) != filepath.Clean(path) || mutation.Delete != deleting {
+		return nil, fmt.Errorf("approved mutation does not match %s", path)
+	}
+
+	current, err := os.ReadFile(resolvedPath)
+	if mutation.Existed {
+		if err != nil {
+			return nil, fmt.Errorf("file changed since preview; review again: %w", err)
+		}
+		if !bytes.Equal(current, mutation.OriginalContent) {
+			return nil, fmt.Errorf("file changed since preview; review again")
+		}
+	} else {
+		if err == nil {
+			return nil, fmt.Errorf("file was created after preview; review again")
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("verify file since preview: %w", err)
+		}
+	}
+	return mutation, nil
+}
 
 func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 	var defs []ToolDefinition
@@ -42,19 +71,31 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			if err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
+			mutation, err := approvedMutationFor(scope, a.Path, fp, false)
+			if err != nil {
+				return Failed(err.Error())
+			}
+			content := []byte(a.Content)
+			if mutation != nil {
+				content = mutation.Content
+			}
 			if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
 			previewText := ""
-			if scope.DiffPreview != nil {
-				if preview, previewErr := scope.DiffPreview.Preview(a.Path, []byte(a.Content)); previewErr == nil && preview != "(no changes)" {
+			if scope.DiffPreview != nil && mutation != nil {
+				if preview, previewErr := scope.DiffPreview.PreviewChange(
+					a.Path,
+					mutation.OriginalContent,
+					content,
+				); previewErr == nil && preview != "(no changes)" {
 					previewText = "\nDiff preview:\n" + preview
 				}
 			}
-			if err := store.AtomicWrite(fp, []byte(a.Content)); err != nil {
+			if err := store.AtomicWrite(fp, content); err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
-			return Succeeded(fmt.Sprintf("Wrote %d bytes to %s%s", len(a.Content), a.Path, previewText))
+			return Succeeded(fmt.Sprintf("Wrote %d bytes to %s%s", len(content), a.Path, previewText))
 		},
 	})
 
@@ -86,6 +127,16 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			fp, err := security.SecurePath(scope.Workdir, a.Path, true)
 			if err != nil {
 				return Failed(fmt.Sprintf("%v", err))
+			}
+			mutation, err := approvedMutationFor(scope, a.Path, fp, false)
+			if err != nil {
+				return Failed(err.Error())
+			}
+			if mutation != nil {
+				if err := store.AtomicWrite(fp, mutation.Content); err != nil {
+					return Failed(fmt.Sprintf("write: %v", err))
+				}
+				return Succeeded(fmt.Sprintf("Edited %s", a.Path))
 			}
 			data, err := os.ReadFile(fp)
 			if err != nil {
@@ -143,6 +194,9 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			if err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
+			if _, err := approvedMutationFor(scope, a.Path, fp, true); err != nil {
+				return Failed(err.Error())
+			}
 			if err := os.Remove(fp); err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
@@ -176,6 +230,16 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			fp, err := security.SecurePath(scope.Workdir, a.Path, true)
 			if err != nil {
 				return Failed(fmt.Sprintf("%v", err))
+			}
+			mutation, err := approvedMutationFor(scope, a.Path, fp, false)
+			if err != nil {
+				return Failed(err.Error())
+			}
+			if mutation != nil {
+				if err := store.AtomicWrite(fp, mutation.Content); err != nil {
+					return Failed(fmt.Sprintf("write: %v", err))
+				}
+				return Succeeded(fmt.Sprintf("Inserted at line %d in %s", a.InsertAt, a.Path))
 			}
 			data, err := os.ReadFile(fp)
 			if err != nil {

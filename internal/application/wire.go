@@ -2,6 +2,8 @@ package application
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,13 +61,12 @@ type wireBundle struct {
 }
 
 // BuildRunner wires a single session run via staged helpers.
-func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
+func (rt *SessionRuntime) BuildRunner(params RunnerParams, sessionDir string) *BuiltRunner {
 	st := rt.SessionState
 	cfg := params.Config
 	if cfg == nil {
 		cfg = &config.Config{ModelID: "default"}
 	}
-	sessionDir := rt.sessionRepo.SessionDir(st.ID)
 
 	wb := &wireBundle{catalog: rt.catalog}
 	wb.executor, wb.hitlAdpt = wireSecurity(rt, params)
@@ -73,9 +74,10 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 	wireTools(rt, params, wb)
 	wb.sysPrompt = wireSystemPrompt(rt, params)
 	wb.histStore = wireHistory(rt, sessionDir)
-	wb.runner, wb.judge = wireAgent(rt, params, wb, st.ID)
+	wb.runner, wb.judge = wireAgent(rt, params, wb, st.ID, sessionDir)
 	wireObservability(rt, params, wb, sessionDir)
 
+	providerName := rt.gateway.ProviderName("lead")
 	return &BuiltRunner{
 		Session: SessionFacade{
 			ID:        st.ID,
@@ -109,18 +111,62 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams) *BuiltRunner {
 			Memory:  params.MemoryStore,
 		},
 		Runtime: RuntimeFacade{
-			Runner:       wb.runner,
-			Subagent:     wb.subagent,
-			Judge:        wb.judge,
-			JudgeEnabled: cfg.JudgeEnabled,
-			Web:          params.WebService,
+			Runner:             wb.runner,
+			Subagent:           wb.subagent,
+			Judge:              wb.judge,
+			JudgeEnabled:       cfg.JudgeEnabled,
+			Web:                params.WebService,
+			ProviderName:       providerName,
+			EndpointHost:       providerEndpointHost(cfg, providerName),
+			ReasoningRequested: cfg.ReasoningEnabled,
+			ReasoningAvailable: rt.gateway.ReasoningAvailable("lead"),
+			ReasoningEffort:    strings.ToLower(strings.TrimSpace(cfg.ReasoningEffort)),
 		},
 	}
 }
 
+func providerEndpointHost(cfg *config.Config, providerName string) string {
+	if cfg == nil {
+		return "unknown"
+	}
+	switch strings.ToLower(strings.TrimSpace(providerName)) {
+	case "openai":
+		return safeEndpointHost(cfg.OpenAIBaseURL, "api.openai.com")
+	case "anthropic":
+		return safeEndpointHost(cfg.AnthropicBaseURL, "api.anthropic.com")
+	case "gemini":
+		return "generativelanguage.googleapis.com"
+	default:
+		return "unknown"
+	}
+}
+
+func safeEndpointHost(rawURL, defaultHost string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return defaultHost
+	}
+	candidate := rawURL
+	if !strings.Contains(candidate, "://") {
+		candidate = "https://" + candidate
+	}
+	parsed, err := url.Parse(candidate)
+	if err != nil || parsed.Hostname() == "" {
+		return "invalid"
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "invalid"
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if port := parsed.Port(); port != "" {
+		return net.JoinHostPort(host, port)
+	}
+	return host
+}
+
 func wireSecurity(rt *SessionRuntime, params RunnerParams) (*tool.Executor, *hitlaudit.HITLApprovalAdapter) {
 	hitlApproval := hitlaudit.NewHITLApprovalAdapter(params.HITLMgr)
-	hitlApproval.SetWorkdir(rt.workdir)
 	hitlApproval.SetApproval(params.Approval)
 	exec := tool.NewExecutor(rt.catalog, hitlApproval, nil).
 		WithSanitizer(security.NewSecretsSanitizer()).
@@ -166,7 +212,9 @@ func wireTools(rt *SessionRuntime, params RunnerParams, wb *wireBundle) {
 	// Order stays stable for prompt-prefix caching.
 	mcpAdapter := mcp.NewToolCatalogAdapter(wb.catalog, params.MCPMgr)
 	params.MCPMgr.SetRegistry(mcpAdapter)
-	params.MCPMgr.LoadAndStart(rt.Ctx)
+	if err := params.MCPMgr.LoadAndStart(rt.Ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "[warn] MCP startup: %v\n", err)
+	}
 }
 
 func wireSystemPrompt(rt *SessionRuntime, params RunnerParams) string {
@@ -183,7 +231,7 @@ func wireHistory(rt *SessionRuntime, sessionDir string) *history.Store {
 	return histStore
 }
 
-func wireAgent(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionID string) (*agent.Runner, *agent.Judge) {
+func wireAgent(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionID, sessionDir string) (*agent.Runner, *agent.Judge) {
 	cfg := params.Config
 	profile := agent.NewLeadProfile(wb.sysPrompt)
 	scope := &tool.ToolScope{
@@ -239,7 +287,7 @@ func wireAgent(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionI
 		return agent.BuildSessionContext(evergreen, strings.Join(taskParts, "\n"), mcp)
 	})
 
-	runner.SetCompression(agent.NewCompression(rt.gateway, wb.histStore, rt.sessionRepo.SessionDir(sessionID), cfg.ModelID, params.PromptLoader))
+	runner.SetCompression(agent.NewCompression(rt.gateway, wb.histStore, sessionDir, cfg.ModelID, params.PromptLoader))
 	runner.SetPromptLoader(params.PromptLoader)
 	runner.SetReflection(agent.NewReflection(params.PromptLoader))
 	runner.SetSnapshot(agent.NewSnapshotManager(cfg.SnapshotEnabled, rt.workdir))

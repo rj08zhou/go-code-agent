@@ -151,6 +151,38 @@ func TestGateway_NoFallbackReturnsOriginalError(t *testing.T) {
 	}
 }
 
+func TestGatewayInvalidCallResponsesFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(context.Context, llm.CallParams) (*llm.Completion, error)
+	}{
+		{name: "nil", call: func(context.Context, llm.CallParams) (*llm.Completion, error) {
+			return nil, nil
+		}},
+		{name: "empty", call: func(context.Context, llm.CallParams) (*llm.Completion, error) {
+			return &llm.Completion{FinishReason: "stop"}, nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := &capsProvider{name: "primary", callFn: tc.call}
+			fallback := &capsProvider{name: "fallback"}
+			gateway := NewGateway(primary, NewRoleThrottle(4))
+			gateway.SetFallbacks("lead", fallback)
+
+			response, err := gateway.Call(context.Background(), "lead", llm.CallParams{Model: "test"})
+			if err != nil {
+				t.Fatalf("Call: %v", err)
+			}
+			if response == nil || response.Content != "ok" {
+				t.Fatalf("fallback response = %#v", response)
+			}
+			if primary.callCount != 1 || fallback.callCount != 1 {
+				t.Fatalf("call counts primary=%d fallback=%d, want 1/1", primary.callCount, fallback.callCount)
+			}
+		})
+	}
+}
+
 func TestGateway_TransientErrorFallsBackAfterRetriesExhausted(t *testing.T) {
 	primary := &capsProvider{
 		name: "primary",
@@ -304,6 +336,64 @@ func TestTrackingSink_BasicBehavior(t *testing.T) {
 	ts.reset()
 	if ts.emitted {
 		t.Fatal("emitted not cleared after reset")
+	}
+}
+
+func TestGatewayInvalidStreamResponseFallsBack(t *testing.T) {
+	primary := &capsProvider{
+		name: "primary",
+		streamFn: func(_ context.Context, _ llm.CallParams, sink StreamSink) (*llm.StreamResult, error) {
+			sink.OnTextDelta("")
+			sink.OnDone()
+			return &llm.StreamResult{FinishReason: "stop"}, nil
+		},
+	}
+	fallback := &capsProvider{name: "fallback"}
+	gateway := NewGateway(primary, NewRoleThrottle(4))
+	gateway.SetFallbacks("lead", fallback)
+
+	sink := &collectTestSink{}
+	result, err := gateway.Stream(context.Background(), "lead", llm.CallParams{Model: "test"}, sink)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if result == nil || result.Content != "ok" {
+		t.Fatalf("fallback result = %#v", result)
+	}
+	if primary.callCount != 1 || fallback.callCount != 1 {
+		t.Fatalf("call counts primary=%d fallback=%d, want 1/1", primary.callCount, fallback.callCount)
+	}
+	if sink.text != "ok" || sink.doneCount != 1 {
+		t.Fatalf("sink text=%q done=%d", sink.text, sink.doneCount)
+	}
+}
+
+func TestGatewayPartialStreamWithNilResultDoesNotRetryOrFallback(t *testing.T) {
+	primary := &capsProvider{
+		name: "primary",
+		streamFn: func(_ context.Context, _ llm.CallParams, sink StreamSink) (*llm.StreamResult, error) {
+			sink.OnTextDelta("partial")
+			return nil, NewProviderError("primary", 500, "server_error", errors.New("mid-stream failure"))
+		},
+	}
+	fallback := &capsProvider{name: "fallback"}
+	gateway := NewGateway(primary, NewRoleThrottle(4))
+	gateway.retry = fastRetryPolicy(2, 0)
+	gateway.SetFallbacks("lead", fallback)
+
+	sink := &collectTestSink{}
+	result, err := gateway.Stream(context.Background(), "lead", llm.CallParams{Model: "test"}, sink)
+	if err == nil {
+		t.Fatal("expected partial stream error")
+	}
+	if result != nil {
+		t.Fatalf("result = %#v, want nil partial result", result)
+	}
+	if primary.callCount != 1 || fallback.callCount != 0 {
+		t.Fatalf("call counts primary=%d fallback=%d, want 1/0", primary.callCount, fallback.callCount)
+	}
+	if sink.text != "partial" || sink.doneCount != 1 {
+		t.Fatalf("sink text=%q done=%d", sink.text, sink.doneCount)
 	}
 }
 

@@ -71,9 +71,14 @@ type TaskFacade struct {
 
 // RuntimeFacade covers the lead runner and related execution helpers.
 type RuntimeFacade struct {
-	Runner       *agent.Runner
-	Subagent     *agent.SubagentRunner
-	Judge        *agent.Judge
-	JudgeEnabled bool
-	Web          tool.WebService
+	Runner             *agent.Runner
+	Subagent           *agent.SubagentRunner
+	Judge              *agent.Judge
+	JudgeEnabled       bool
+	Web                tool.WebService
+	ProviderName       string
+	EndpointHost       string
+	ReasoningRequested bool
+	ReasoningAvailable bool
+	ReasoningEffort    string
 }

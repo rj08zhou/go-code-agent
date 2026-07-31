@@ -43,7 +43,7 @@ func TestHarness_NegativeTest(t *testing.T) {
 	h := Harness{
 		Tasks: []Task{{
 			Name: "negative-test", Category: "negative", ExpectFail: true,
-			Script: []ScriptStep{{Done: true}},
+			Script: []ScriptStep{{Text: "done", Done: true}},
 			Setup: func(workdir string) (string, error) {
 				os.WriteFile(workdir+"/f.txt", []byte("unchanged"), 0o644)
 				return "created f.txt", nil

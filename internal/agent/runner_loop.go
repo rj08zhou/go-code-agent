@@ -59,7 +59,7 @@ func (r *Runner) injectMemoryRecall(messages []llm.Message) []llm.Message {
 	if recalled == "" || recalled == "No memories found." {
 		return messages
 	}
-	return append(messages, llm.UserMessage("Relevant memory:\n"+recalled))
+	return append(messages, llm.UserMessage("<memory-recall>\n"+recalled+"\n</memory-recall>"))
 }
 
 // prepareRound runs pre-LLM housekeeping for one loop iteration.
@@ -380,6 +380,7 @@ func (r *Runner) handleNoToolCalls(
 			messages = append(messages, llm.UserMessage(
 				"<auto-lesson>Record any lessons, preferences, or patterns learned in this session to long-term memory using memory_write.</auto-lesson>"))
 		}
+		out.Completed = false
 		return messages, true, TurnOutcome{}
 	}
 
@@ -631,13 +632,14 @@ func (r *Runner) afterTools(
 		r.turn.tokens.invalidateCache()
 	}
 
-	// Lesson stage budget: if the model was given a lesson prompt, limit
-	// how many extra rounds it can use before we force a wrap-up.
+	// Lesson stage budget: stop cleanly if lesson collection keeps calling
+	// tools beyond its bounded extra rounds.
 	if r.turn.lesson.Written {
 		r.turn.lesson.RoundsRemaining--
 		if r.turn.lesson.RoundsRemaining <= 0 {
 			out.Rounds = r.turn.rounds
 			out.ToolFailures = r.turn.failures
+			out.StoppedReason = "lesson_budget"
 			out.Messages = messages
 			r.emit(event.Event{
 				Type:    event.TurnComplete,

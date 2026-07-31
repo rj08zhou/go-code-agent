@@ -47,6 +47,26 @@ func reasoningMessages(provider, model string) []llm.Message {
 	}
 }
 
+func TestGatewayExposesPrimaryProviderReasoningStatus(t *testing.T) {
+	available := &capsProvider{
+		name:       "reasoner",
+		instanceID: "reasoner:endpoint",
+		caps:       ProviderCapabilities{Reasoning: true},
+	}
+	gateway := NewGateway(available, NewRoleThrottle(10))
+	if got := gateway.ProviderName("lead"); got != "reasoner" {
+		t.Fatalf("ProviderName = %q, want reasoner", got)
+	}
+	if !gateway.ReasoningAvailable("lead") {
+		t.Fatal("reasoning provider with endpoint identity reported unavailable")
+	}
+
+	withoutIdentity := NewGateway(&reasoningProviderWithoutIdentity{}, NewRoleThrottle(10))
+	if withoutIdentity.ReasoningAvailable("lead") {
+		t.Fatal("reasoning provider without endpoint identity reported available")
+	}
+}
+
 func TestGatewayStripsReasoningOptInForUnsupportedProvider(t *testing.T) {
 	var seen llm.CallParams
 	p := &capsProvider{

@@ -39,6 +39,12 @@ func (d *DiffPreview) PreviewDelete(relPath string) (string, error) {
 	return generateUnifiedDiff(string(oldContent), "", relPath)
 }
 
+// PreviewChange generates a diff from content already resolved in the actual
+// ToolScope. It is independent of the workdir attached to this service.
+func (d *DiffPreview) PreviewChange(path string, oldContent, newContent []byte) (string, error) {
+	return generateUnifiedDiff(string(oldContent), string(newContent), path)
+}
+
 func generateUnifiedDiff(oldContent, newContent, filename string) (string, error) {
 	oldTmp, _ := os.CreateTemp("", "diff-old-*")
 	defer os.Remove(oldTmp.Name())
@@ -126,12 +132,25 @@ func colorizeDiff(diff string) string {
 // Preview and confirm — dispatch
 // --------------------------------------------------------------------------
 
-// PreviewAndConfirm shows the diff and asks for confirmation.
+// PreviewCreateAndConfirm reviews a newly-created file as one operation.
+func PreviewCreateAndConfirm(path, newContent, diff string) (string, bool) {
+	printReviewHeader("Proposed new file", path)
+	if previewWholeChange(diff, false) {
+		return newContent, true
+	}
+	return "", false
+}
+
+// PreviewDeleteAndConfirm reviews deletion of the entire file as one operation.
+func PreviewDeleteAndConfirm(path, diff string) bool {
+	printReviewHeader("Proposed deletion of", path)
+	return previewWholeChange(diff, true)
+}
+
+// PreviewAndConfirm reviews edits to an existing file, including per-hunk review.
 // Returns (finalContent, ok). ok=true means apply the returned content.
 func PreviewAndConfirm(path, oldContent, newContent, diff string) (string, bool) {
-	fmt.Println()
-	fmt.Println(utils.Bold + "─── Proposed changes to " + path + " ───" + utils.Reset)
-	fmt.Println()
+	printReviewHeader("Proposed changes to", path)
 
 	hunks := parseHunks(diff)
 	if len(hunks) == 0 {
@@ -145,6 +164,53 @@ func PreviewAndConfirm(path, oldContent, newContent, diff string) (string, bool)
 		return "", false
 	}
 	return previewChunkByChunk(path, oldContent, newContent, hunks)
+}
+
+func printReviewHeader(action, path string) {
+	fmt.Println()
+	fmt.Printf("%s─── %s %s ───%s\n", utils.Bold, action, path, utils.Reset)
+	fmt.Println()
+}
+
+func previewWholeChange(diff string, deleting bool) bool {
+	display := colorizeDiff(diff)
+	if strings.TrimSpace(diff) == "" {
+		display = "  (empty file)"
+	}
+	for {
+		fmt.Println(display)
+		fmt.Println()
+		prompt := "  [A]pply all  [R]eject  [V]iew diff again  [Q]uit: "
+		if deleting {
+			prompt = "  [D]elete file  [R]eject  [V]iew diff again  [Q]uit: "
+		}
+		line, _ := ReadLine(prompt)
+		answer := strings.ToLower(strings.TrimSpace(line))
+		switch answer {
+		case "y", "yes":
+			return true
+		case "a", "apply", "all":
+			if !deleting {
+				return true
+			}
+			fmt.Println("  Invalid option, rejecting changes")
+			return false
+		case "d", "delete":
+			if deleting {
+				return true
+			}
+			fmt.Println("  Invalid option, rejecting changes")
+			return false
+		case "r", "reject", "n", "no", "q", "quit":
+			fmt.Println("  Changes rejected")
+			return false
+		case "v", "view", "diff":
+			continue
+		default:
+			fmt.Println("  Invalid option, rejecting changes")
+			return false
+		}
+	}
 }
 
 func previewSingleHunk(path string, hunk diffHunk, fullDiff string) bool {

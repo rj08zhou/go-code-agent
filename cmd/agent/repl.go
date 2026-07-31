@@ -38,11 +38,7 @@ func (r *repl) run() {
 		fmt.Fprintf(os.Stderr, "Failed to load history: %v\n", err)
 		return
 	}
-	if restored > 0 {
-		fmt.Printf("[restored %d conversation entries]\n", restored)
-	}
-
-	r.printBanner()
+	r.printBanner(restored)
 
 	ctx, cancel := context.WithCancel(r.rtCtx)
 	defer cancel()
@@ -122,26 +118,68 @@ func (r *repl) run() {
 	}
 }
 
-func (r *repl) printBanner() {
-	fmt.Printf("go-code-agent | session: %s\n", r.built.Session.ID)
-	fmt.Printf("workdir: %s | model: %s | HITL: %s", r.built.Session.Workdir, r.built.Session.ModelID, hitlStatus(r.built))
-	if r.built.Runtime.JudgeEnabled {
-		fmt.Print(" | judge: on")
+func (r *repl) printBanner(restored int) {
+	fmt.Print(renderBanner(r.built, restored))
+}
+
+func renderBanner(b *application.BuiltRunner, restored int) string {
+	judgeStatus := "off"
+	if b.Runtime.JudgeEnabled {
+		judgeStatus = "on"
 	}
-	perms := r.built.Security.Permissions
-	if perms != nil && perms.Count() > 0 {
-		fmt.Printf(" | permissions: %d rules", perms.Count())
+
+	providerName := strings.TrimSpace(b.Runtime.ProviderName)
+	if providerName == "" {
+		providerName = "unknown"
 	}
-	mcpCount := r.built.Team.MCP.Count()
-	pending := r.built.Team.MCP.ListPending()
-	if mcpCount > 0 {
-		fmt.Printf(" | mcp: %d active", mcpCount)
+	endpointHost := strings.TrimSpace(b.Runtime.EndpointHost)
+	if endpointHost == "" {
+		endpointHost = "unknown"
 	}
-	if len(pending) > 0 {
-		fmt.Printf(" | mcp: %d pending", len(pending))
+
+	var out strings.Builder
+	divider := strings.Repeat("=", 60)
+	fmt.Fprintf(&out, "%s%s%s\n", utils.Bold+utils.Cyan, divider, utils.Reset)
+	fmt.Fprintf(&out, "%s  go-code-agent%s\n", utils.Bold+utils.Cyan, utils.Reset)
+	fmt.Fprintf(&out, "  Provider: %s  |  Model: %s\n", providerName, b.Session.ModelID)
+	fmt.Fprintf(&out, "  Endpoint: %s  |  Reasoning: %s\n", endpointHost, reasoningStatus(b.Runtime))
+	fmt.Fprintf(&out, "  Workspace: %s\n", b.Session.Workdir)
+	fmt.Fprintf(&out, "  Session: %s", b.Session.ID)
+	if b.Session.Title != "" {
+		fmt.Fprintf(&out, " - %s", b.Session.Title)
 	}
-	fmt.Println()
-	fmt.Println("Type a message, /help for commands, Ctrl-D to exit.")
+	if restored > 0 {
+		fmt.Fprintf(&out, "  |  Restored: %d conversation entries", restored)
+	}
+	out.WriteByte('\n')
+	fmt.Fprintf(&out, "  Approval: %s  |  Judge: %s", effectiveApprovalMode(b), judgeStatus)
+	if perms := b.Security.Permissions; perms != nil && perms.Count() > 0 {
+		fmt.Fprintf(&out, "  |  Permissions: %d rules", perms.Count())
+	}
+	out.WriteByte('\n')
+	if b.Team.MCP != nil {
+		active := b.Team.MCP.Count()
+		pending := len(b.Team.MCP.ListPending())
+		failed := b.Team.MCP.FailedCount()
+		fmt.Fprintf(&out, "  MCP: %d active  |  %d pending  |  %d failed\n", active, pending, failed)
+	}
+	fmt.Fprintf(&out, "%s%s%s\n\n", utils.Bold+utils.Cyan, divider, utils.Reset)
+	out.WriteString("Type a message, /help for commands, Ctrl-D to exit.\n")
+	return out.String()
+}
+
+func reasoningStatus(runtime application.RuntimeFacade) string {
+	if !runtime.ReasoningRequested {
+		return "off"
+	}
+	effort := strings.ToLower(strings.TrimSpace(runtime.ReasoningEffort))
+	if effort == "" {
+		effort = "provider-default"
+	}
+	if !runtime.ReasoningAvailable {
+		return fmt.Sprintf("degraded (unsupported; effort=%s)", effort)
+	}
+	return fmt.Sprintf("on (effort=%s)", effort)
 }
 
 func (r *repl) drainBackground() {
@@ -174,6 +212,69 @@ func (r *repl) checkInbox(messages *[]llm.Message) {
 	}
 }
 
+func renderHelp() string {
+	return strings.TrimSpace(`
+Commands:
+  Tasks and memory
+    /tasks                              Show short-term todos
+    /dag                                Show the persistent task DAG and progress
+    /task clear                         Hide completed persistent tasks
+    /task reset                         Remove all persistent tasks
+    /memory                             Show memory statistics
+
+  Sessions and context
+    /session                            Show the active session
+    /session list                       List sessions
+    /session switch <id>                Switch session and rebuild the runtime
+    /session new                        Start a fresh session
+    /session rename <title>             Rename the active session
+    /session archive                    Archive the active session and start a new one
+    /compact                            Compact the current conversation now
+
+  Security and approval
+    /approval                           Show the effective approval mode
+    /approval manual                    Prompt for review-required operations
+    /approval safe-auto                 Auto-approve lower-risk reviews; prompt for high risk
+    /approval all-auto confirm          Skip approval prompts and diff previews (unsafe)
+    /approval reject                    Auto-reject review-required operations
+    /approval notify-only               Report reviews without blocking execution
+    /approve ...                        Compatibility alias for legacy presets
+    /hitl ...                           Compatibility alias for legacy HITL modes
+    /permissions                        Show loaded permission rules
+    /permissions reload                 Reload permissions.json
+    /security                           Show security controls
+    /security test-bash <command>       Dry-run Bash policy without executing the command
+    /decisions                          Show recent approval decisions
+
+  MCP and web
+    /mcp                                Show active, pending, and failed MCP servers
+    /mcp pending                        List MCP servers awaiting approval
+    /mcp approve <name>                 Approve and start a pending MCP server
+    /mcp connect <name> <cmd> [args...] Connect an MCP server for this runtime
+    /mcp disconnect <name>              Disconnect an MCP server
+    /search <query>                     Run a one-shot web search
+
+  Team
+    /team                               List teammates
+    /team spawn <name> <role> <prompt>  Spawn a teammate
+    /team shutdown <name>               Shut down a teammate
+    /team message <name> <content>      Send a message to a teammate
+    /team inbox                         Read the lead inbox
+    /inbox                              Read the current agent inbox
+
+  Runtime
+    /judge                              Toggle LLM-as-Judge
+    /usage                              Show token usage
+    /help                               Show this help
+    /exit, /quit                        Exit
+
+Notes:
+  Text without a leading slash is sent to the current agent.
+  Approval starts in safe-auto mode; use /approval to inspect the effective mode.
+  all-auto requires an explicit "confirm"; hard Bash deny rules and permissions.json still apply.
+`)
+}
+
 func (r *repl) handleCommand(ctx context.Context, cmd string, messages *[]llm.Message) bool {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
@@ -181,26 +282,7 @@ func (r *repl) handleCommand(ctx context.Context, cmd string, messages *[]llm.Me
 	}
 	switch parts[0] {
 	case "/help":
-		fmt.Println(strings.TrimSpace(`
-Commands:
-  /tasks           - List tasks
-  /dag             - Show DAG topology
-  /memory          - Memory stats
-  /mcp             - MCP server list
-  /team            - List teammates
-  /session         - Session info
-  /judge           - Toggle judge
-  /approve [mode]  - off|safe|danger (default startup: safe)
-  /hitl [mode]     - off|on|safe-only|interactive|auto-approve|...
-  /compact         - Trigger manual compaction
-  /exit /quit      - Exit
-
-HITL defaults to on (safe-only): safe tools auto-approved, danger tools prompt.
-  /approve off|safe|danger  — quick presets (also syncs HITL mode)
-  /hitl off                 — disable approval prompts entirely
-  /hitl on                  — re-enable HITL at the current mode
-Bash deny-list and permissions.json still apply when HITL is off.
-`))
+		fmt.Println(renderHelp())
 	case "/task":
 		if len(parts) < 2 {
 			fmt.Println("Usage: /task clear|reset")
@@ -232,22 +314,43 @@ Bash deny-list and permissions.json still apply when HITL is off.
 	case "/memory":
 		fmt.Println(r.built.Tasks.Memory.Stats())
 	case "/mcp":
-		if len(parts) >= 2 && parts[1] == "pending" {
+		if r.built.Team.MCP == nil {
+			fmt.Println("MCP is unavailable.")
+			break
+		}
+		switch {
+		case len(parts) == 1:
+			fmt.Println(r.built.Team.MCP.Status())
+		case parts[1] == "pending" && len(parts) == 2:
 			pending := r.built.Team.MCP.ListPending()
 			if len(pending) == 0 {
-				fmt.Println("No pending MCP servers.")
+				fmt.Println("No pending MCP servers. Run /mcp to view failures.")
 			} else {
 				fmt.Printf("Pending MCP servers: %v\n", pending)
 				fmt.Println("Use /mcp approve <name> to start a server.")
 			}
-		} else if len(parts) >= 3 && parts[1] == "approve" {
-			fmt.Println(r.built.Team.MCP.Approve(context.Background(), parts[2]))
-		} else if len(parts) >= 4 && parts[1] == "connect" {
-			fmt.Println(r.built.Team.MCP.Connect(context.Background(), parts[2], parts[3], parts[4:]))
-		} else if len(parts) >= 3 && parts[1] == "disconnect" {
-			fmt.Println(r.built.Team.MCP.Disconnect(parts[2]))
-		} else {
-			fmt.Println("MCP servers: " + r.built.Team.MCP.List())
+		case parts[1] == "approve" && len(parts) == 3:
+			toolCount, err := r.built.Team.MCP.Approve(ctx, parts[2])
+			if err != nil {
+				fmt.Printf("Failed to approve MCP server %q: %v\n", parts[2], err)
+			} else {
+				fmt.Printf("Approved and started MCP server %q (%d tools).\n", parts[2], toolCount)
+			}
+		case parts[1] == "connect" && len(parts) >= 4:
+			toolCount, err := r.built.Team.MCP.Connect(ctx, parts[2], parts[3], parts[4:])
+			if err != nil {
+				fmt.Printf("Failed to connect MCP server %q: %v\n", parts[2], err)
+			} else {
+				fmt.Printf("MCP server %q connected (%d tools).\n", parts[2], toolCount)
+			}
+		case parts[1] == "disconnect" && len(parts) == 3:
+			if err := r.built.Team.MCP.Disconnect(parts[2]); err != nil {
+				fmt.Printf("Failed to disconnect MCP server %q: %v\n", parts[2], err)
+			} else {
+				fmt.Printf("MCP server %q disconnected.\n", parts[2])
+			}
+		default:
+			fmt.Println("Usage: /mcp [pending|approve <name>|connect <name> <cmd> [args...]|disconnect <name>]")
 		}
 	case "/team":
 		if len(parts) == 1 {
@@ -290,8 +393,8 @@ Bash deny-list and permissions.json still apply when HITL is off.
 			case "switch":
 				if len(parts) < 3 {
 					fmt.Println("Usage: /session switch <id>")
-				} else if err := r.built.Session.Repo.SwitchActive(parts[2]); err != "" {
-					fmt.Println(err)
+				} else if err := r.built.Session.Repo.SwitchActive(parts[2]); err != nil {
+					fmt.Printf("Failed to switch session: %v\n", err)
 				} else {
 					r.next = &application.BuildOptions{SessionID: parts[2]}
 					return true
@@ -327,33 +430,7 @@ Bash deny-list and permissions.json still apply when HITL is off.
 		}
 		fmt.Printf("Judge: %v\n", r.built.Runtime.Judge.IsEnabled())
 	case "/hitl":
-		if len(parts) > 1 {
-			switch strings.ToLower(parts[1]) {
-			case "off":
-				r.built.Security.HITL.SetEnabled(false)
-				fmt.Println("HITL disabled — no approval prompts (bash deny / permissions still apply).")
-			case "on":
-				r.built.Security.HITL.SetEnabled(true)
-				fmt.Printf("HITL enabled (mode=%s).\n", r.built.Security.HITL.Mode())
-			default:
-				if mode, err := hitlaudit.ParseMode(parts[1]); err == nil {
-					r.built.Security.HITL.SetMode(mode)
-					r.built.Security.HITL.SetEnabled(true)
-					r.syncApprovalWithHITL(mode)
-					fmt.Printf("HITL mode: %s\n", parts[1])
-				} else {
-					fmt.Println(err)
-					fmt.Println("Usage: /hitl [off|on|interactive|safe-only|auto-approve|auto-reject|notify-only]")
-				}
-			}
-		} else {
-			r.built.Security.HITL.SetEnabled(!r.built.Security.HITL.IsEnabled())
-			if r.built.Security.HITL.IsEnabled() {
-				fmt.Printf("HITL enabled (mode=%s).\n", r.built.Security.HITL.Mode())
-			} else {
-				fmt.Println("HITL disabled.")
-			}
-		}
+		fmt.Println(r.handleApproval(parts))
 	case "/inbox":
 		data, _ := json.Marshal(r.built.Team.Bus.ReadInbox(r.built.Session.AgentID))
 		fmt.Println(string(data))
@@ -385,32 +462,9 @@ Bash deny-list and permissions.json still apply when HITL is off.
 			fmt.Println("Usage tracking not available.")
 		}
 	case "/security":
-		fmt.Println(securityDesc())
-	case "/security test-bash":
-		if len(parts) < 3 {
-			fmt.Println("Usage: /security test-bash <command>")
-		} else {
-			cmd := strings.Join(parts[2:], " ")
-			fmt.Printf("Testing: %s\nResult: TODO - validate path\n", cmd)
-		}
-	case "/approve":
-		if len(parts) < 2 {
-			r.printApproveStatus()
-		} else {
-			switch parts[1] {
-			case "off", "reset":
-				r.applyApprovePreset("off", hitlaudit.HITLModeInteractive)
-				fmt.Println("All tools require manual confirmation. Diff preview enabled.")
-			case "safe":
-				r.applyApprovePreset("safe", hitlaudit.HITLModeSafeOnly)
-				fmt.Println("Safe tools auto-approved; dangerous tools require confirmation. Diff preview enabled.")
-			case "danger", "all":
-				r.applyApprovePreset("danger", hitlaudit.HITLModeAutoApprove)
-				fmt.Println("ALL tools auto-approved, diff preview skipped — use with caution.")
-			default:
-				fmt.Printf("Unknown level: %s\n", parts[1])
-			}
-		}
+		fmt.Println(handleSecurityCommand(cmd, parts, r.built.Security.Permissions))
+	case "/approval", "/approve":
+		fmt.Println(r.handleApproval(parts))
 	case "/decisions":
 		if r.built.Security.DecisionLog != nil {
 			fmt.Println(r.built.Security.DecisionLog.Render())
@@ -435,40 +489,114 @@ Bash deny-list and permissions.json still apply when HITL is off.
 
 func (r *repl) nextBuild() *application.BuildOptions { return r.next }
 
-func (r *repl) approvalState() *security.ApprovalState {
-	return r.built.Security.Approval
-}
-
-func (r *repl) applyApprovePreset(preset string, mode hitlaudit.HITLMode) {
-	r.built.Security.HITL.SetEnabled(true)
-	r.built.Security.HITL.SetMode(mode)
-	r.approvalState().ApplyPreset(preset)
-}
-
-func (r *repl) syncApprovalWithHITL(mode hitlaudit.HITLMode) {
-	switch mode {
-	case hitlaudit.HITLModeAutoApprove:
-		r.approvalState().ApplyPreset("danger")
+func effectiveApprovalMode(b *application.BuiltRunner) string {
+	if b == nil || b.Security.HITL == nil {
+		return "unavailable"
+	}
+	if !b.Security.HITL.IsEnabled() {
+		return "all-auto (legacy HITL off)"
+	}
+	switch b.Security.HITL.Mode() {
+	case hitlaudit.HITLModeInteractive:
+		return "manual"
 	case hitlaudit.HITLModeSafeOnly:
-		r.approvalState().ApplyPreset("safe")
+		return "safe-auto"
+	case hitlaudit.HITLModeAutoApprove:
+		return "all-auto"
+	case hitlaudit.HITLModeAutoReject:
+		return "reject"
+	case hitlaudit.HITLModeNotifyOnly:
+		return "notify-only"
 	default:
-		r.approvalState().ApplyPreset("off")
+		return "unknown"
 	}
 }
 
-func (r *repl) printApproveStatus() {
-	state := r.approvalState()
-	mode := r.built.Security.HITL.Mode()
-	fmt.Println("Approval status:")
-	fmt.Printf("  HITL mode:           %s\n", mode)
-	fmt.Printf("  Auto-approve safe:   %v\n", state.IsAutoApproveSafe())
-	fmt.Printf("  Auto-approve all:    %v\n", state.IsAutoApproveAll())
-	fmt.Printf("  Diff preview:        %v\n", state.ShouldPreviewDiff())
-	fmt.Println()
-	fmt.Println("Usage: /approve off|safe|danger")
-	fmt.Println("  off    — manual confirmation for every tool; diff preview on")
-	fmt.Println("  safe   — auto-approve safe tools; prompt for danger; diff preview on [default]")
-	fmt.Println("  danger — auto-approve ALL tools; skip diff preview")
+func (r *repl) handleApproval(parts []string) string {
+	if r.built.Security.HITL == nil || r.built.Security.Approval == nil {
+		return "Approval controls are unavailable."
+	}
+	if len(parts) == 1 {
+		mode := effectiveApprovalMode(r.built)
+		preview := "skipped"
+		if (mode == "manual" || mode == "safe-auto") && r.built.Security.Approval.ShouldPreviewDiff() {
+			preview = "enabled"
+		}
+		return fmt.Sprintf("Approval mode: %s\nDiff preview: %s", mode, preview)
+	}
+
+	mode := strings.ToLower(parts[1])
+	legacy := parts[0] != "/approval"
+	switch parts[0] {
+	case "/approve":
+		switch mode {
+		case "off", "reset":
+			mode = "manual"
+		case "safe":
+			mode = "safe-auto"
+		case "danger", "all":
+			mode = "all-auto"
+		default:
+			return "Usage: /approve off|safe|danger [confirm] (compatibility alias for /approval)"
+		}
+	case "/hitl":
+		switch mode {
+		case "on", "safe-only", "safeonly":
+			mode = "safe-auto"
+		case "off", "auto-approve", "approve":
+			mode = "all-auto"
+		case "interactive":
+			mode = "manual"
+		case "auto-reject":
+			mode = "reject"
+		case "notify-only", "notify":
+			mode = "notify-only"
+		default:
+			return "Usage: /hitl on|off|interactive|safe-only|auto-approve|auto-reject|notify-only [confirm] (compatibility alias for /approval)"
+		}
+	}
+
+	if mode == "all-auto" {
+		if len(parts) != 3 || strings.ToLower(parts[2]) != "confirm" {
+			return "WARNING: all-auto disables approval prompts and skips diff previews.\nHard Bash deny rules and permissions.json remain enforced.\nConfirm with: /approval all-auto confirm"
+		}
+	} else if len(parts) != 2 {
+		return "Usage: /approval manual|safe-auto|all-auto|reject|notify-only"
+	}
+
+	r.built.Security.HITL.SetEnabled(true)
+	switch mode {
+	case "manual":
+		r.built.Security.HITL.SetMode(hitlaudit.HITLModeInteractive)
+		r.built.Security.Approval.ApplyPreset("manual")
+	case "safe-auto":
+		r.built.Security.HITL.SetMode(hitlaudit.HITLModeSafeOnly)
+		r.built.Security.Approval.ApplyPreset("safe-auto")
+	case "all-auto":
+		r.built.Security.HITL.SetMode(hitlaudit.HITLModeAutoApprove)
+		r.built.Security.Approval.ApplyPreset("all-auto")
+	case "reject":
+		r.built.Security.HITL.SetMode(hitlaudit.HITLModeAutoReject)
+		r.built.Security.Approval.ApplyPreset("manual")
+	case "notify-only":
+		r.built.Security.HITL.SetMode(hitlaudit.HITLModeNotifyOnly)
+		r.built.Security.Approval.ApplyPreset("manual")
+	default:
+		return "Usage: /approval manual|safe-auto|all-auto|reject|notify-only"
+	}
+
+	prefix := ""
+	if legacy {
+		canonical := "/approval " + mode
+		if mode == "all-auto" {
+			canonical += " confirm"
+		}
+		prefix = fmt.Sprintf("Compatibility alias: use %s.\n", canonical)
+	}
+	if mode == "all-auto" {
+		return prefix + "Approval mode: all-auto — prompts disabled and diff previews skipped; hard deny rules still apply."
+	}
+	return fmt.Sprintf("%sApproval mode: %s", prefix, mode)
 }
 
 func summarizeMessages(messages []llm.Message) string {
@@ -487,10 +615,46 @@ func summarizeMessages(messages []llm.Message) string {
 	return strings.Join(parts, "\n")
 }
 
+func handleSecurityCommand(raw string, parts []string, perms *security.Permissions) string {
+	if len(parts) == 1 {
+		return securityDesc()
+	}
+	if parts[1] != "test-bash" {
+		return fmt.Sprintf("Unknown security command: %s\nUsage: /security test-bash <command>", parts[1])
+	}
+
+	rest := strings.TrimSpace(strings.TrimPrefix(raw, "/security"))
+	command := strings.TrimSpace(strings.TrimPrefix(rest, "test-bash"))
+	if command == "" {
+		return "Usage: /security test-bash <command>"
+	}
+
+	classification := security.ClassifyCommand(command)
+	allowed, needConfirm, policyReason := security.NewDefaultBashPolicy().Validate(command, perms)
+	decision := "allow"
+	if !allowed {
+		decision = "deny"
+	} else if needConfirm {
+		decision = "confirm"
+	}
+	if policyReason == "" {
+		policyReason = classification.Reason
+	}
+
+	return fmt.Sprintf(
+		"Command: %s\nRisk: %s\nDecision: %s\nReason: %s",
+		command,
+		classification.Verdict,
+		decision,
+		policyReason,
+	)
+}
+
 func securityDesc() string {
 	return `Security Status:
   Bash: whitelist (85 commands) + deny/confirm regexps
   Permissions: rules loaded from permissions.json
   Secrets: output sanitizer active
-  Diff: preview available for file writes`
+  Diff: preview available for file writes
+  Dry-run: /security test-bash <command>`
 }
