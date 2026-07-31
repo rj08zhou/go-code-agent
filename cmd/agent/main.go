@@ -4,15 +4,20 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"go-code-agent/internal/application"
-	"go-code-agent/internal/utils"
 	"os"
-	"strings"
 
 	"github.com/chzyer/readline"
+
+	"go-code-agent/internal/application"
+	"go-code-agent/internal/session"
+	"go-code-agent/internal/utils"
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags]\n\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "Flags:\n")
@@ -54,9 +59,19 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 	dataDir := flag.String("data-dir", "", "State directory (default: ~/.config/go-code-agent)")
 	sessionID := flag.String("session", "", "Resume a specific session ID")
 	newSession := flag.Bool("new-session", false, "Start a fresh session")
-	human := flag.Bool("human", false, "Escalate HITL to interactive (all tools require confirmation)")
-	humanMode := flag.String("human-mode", "", "Override HITL mode: interactive|safe-only|auto-approve|auto-reject|notify-only (default: safe-only)")
+	human := flag.Bool("human", false, "Use manual approval mode")
+	humanMode := flag.String("human-mode", "", "Advanced compatibility override: interactive|safe-only|auto-approve|auto-reject|notify-only")
 	flag.Parse()
+	if *sessionID != "" && *newSession {
+		fmt.Fprintln(os.Stderr, "Invalid options: --session and --new-session cannot be used together.")
+		return 2
+	}
+	if *sessionID != "" {
+		if err := session.ValidateSessionID(*sessionID); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid --session value: %v\n", err)
+			return 2
+		}
+	}
 
 	wd := *workdir
 	if wd == "" {
@@ -73,20 +88,27 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 	app, err := application.New(cfgDir, wd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer app.Shutdown(context.Background())
 
 	rl, err := readline.New(utils.Blue + "> " + utils.Reset)
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Failed to initialize terminal: %v\n", err)
+		return 1
 	}
 	defer rl.Close()
 
 	next := &application.BuildOptions{SessionID: *sessionID, NewSession: *newSession, Human: *human, HumanMode: *humanMode}
 	for next != nil {
-		built, rt := app.Build(*next)
-		printBanner(built)
+		built, rt, err := app.Build(*next)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start session: %v\n", err)
+			if next.SessionID != "" {
+				fmt.Fprintln(os.Stderr, "Start without --session, then use /session list to view available sessions.")
+			}
+			return 1
+		}
 		loop := newRepl(built, rt.Ctx, rl.Readline)
 		loop.run()
 		next = loop.nextBuild()
@@ -94,27 +116,5 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 			_ = rt.Close(context.Background())
 		}
 	}
-}
-
-func printBanner(b *application.BuiltRunner) {
-	judgeStatus := "off"
-	if b.Runtime.JudgeEnabled {
-		judgeStatus = "on"
-	}
-
-	divider := strings.Repeat("=", 60)
-	fmt.Println(utils.Bold + utils.Cyan + divider + utils.Reset)
-	fmt.Printf("%s  go-code-agent%s\n", utils.Bold+utils.Cyan, utils.Reset)
-	fmt.Printf("  Model: %s  |  Workspace: %s\n", b.Session.ModelID, b.Session.Workdir)
-	fmt.Printf("  Session: %s - %s\n", b.Session.ID[:13], b.Session.Title)
-	fmt.Printf("  HITL: %s  |  Judge: %s\n", hitlStatus(b), judgeStatus)
-	fmt.Println(utils.Bold + utils.Cyan + divider + utils.Reset)
-	fmt.Println()
-}
-
-func hitlStatus(b *application.BuiltRunner) string {
-	if b.Security.HITL == nil || !b.Security.HITL.IsEnabled() {
-		return "off"
-	}
-	return fmt.Sprintf("on (%s)", b.Security.HITL.Mode())
+	return 0
 }

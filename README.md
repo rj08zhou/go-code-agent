@@ -111,7 +111,7 @@ export SNAPSHOT_ENABLED=1
 ./agent
 ```
 
-Default startup posture: HITL **on**, mode **safe-only**, `/approve safe` (safe tools auto-continue; danger tools and write diffs are reviewed).
+Default approval mode: **`safe-auto`** (lower-risk reviews continue automatically; high-risk operations and write diffs are reviewed). Inspect or change it with `/approval`.
 
 ---
 
@@ -249,10 +249,10 @@ Session Switch / New / Archive
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--workdir <path>` | current dir | Project directory the agent edits |
-| `--data-dir <path>` | `~/.config` (or `$XDG_CONFIG_HOME`) | Config root; state lives under `{data-dir}/go-code-agent/<project>` |
+| `--data-dir <path>` | `~/.config` (or `$XDG_CONFIG_HOME`) | Config root; state lives under `{data-dir}/go-code-agent/<project>-<path-hash>` |
 | `--session <id>` | — | Resume a specific session |
 | `--new-session` | false | Force a new session |
-| `--human` | false | Escalate HITL to interactive + `/approve off` |
+| `--human` | false | Escalate approval mode to `manual` |
 | `--human-mode` | (keep default) | `interactive` \| `safe-only` \| `auto-approve` \| `auto-reject` \| `notify-only` |
 
 ### LLM-as-Judge Env Vars
@@ -367,8 +367,8 @@ go-code-agent/
 | `/team` | List / spawn / shutdown / message teammates |
 | `/inbox` | Read lead inbox |
 | `/judge` | Toggle LLM-as-Judge |
-| `/hitl [mode]` | Toggle or set HITL mode |
-| `/approve [off\|safe\|danger]` | Approval presets (+ sync HITL) |
+| `/approval [manual\|safe-auto\|all-auto\|reject\|notify-only]` | Show or set the effective approval mode (`all-auto` requires `confirm`) |
+| `/approve ...` / `/hitl ...` | Compatibility aliases for legacy commands |
 | `/permissions [reload]` | Show / reload permissions.json |
 | `/security` | Security status |
 | `/security test-bash <cmd>` | Dry-run bash policy |
@@ -475,8 +475,8 @@ Two cooperating pieces:
 
 | Piece | Role |
 |-------|------|
-| `security.ApprovalState` | Session `/approve` posture: `off` / `safe` / `danger`; controls auto-approve flags and whether diff preview is shown |
-| `hitlaudit.HITLManager` | Interactive modes: `safe-only`, `interactive`, `auto-approve`, `auto-reject`, `notify-only` |
+| `security.ApprovalState` | Internal auto-approval flags and diff-preview posture |
+| `hitlaudit.HITLManager` | Implements the effective `manual`, `safe-auto`, `all-auto`, `reject`, and `notify-only` modes |
 
 `HITLApprovalAdapter` adapts both into `tool.ApprovalChecker` for the executor (including chunked diff confirmation).
 
@@ -486,7 +486,7 @@ Tool outputs are sanitized before returning to the model / logs.
 
 ### Additional Security Features
 
-- Diff preview for mutating file tools (skipped under `/approve danger`)
+- Diff preview for mutating file tools (skipped under confirmed `all-auto`)
 - Optional git snapshot + rollback on failure (`SNAPSHOT_ENABLED=1`)
 - Decision audit log (`decisions.jsonl`)
 - Session event log (`session.log`)

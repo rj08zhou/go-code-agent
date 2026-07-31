@@ -39,6 +39,23 @@ func TestAtomicWrite_CrashRecovery(t *testing.T) {
 }
 
 // TestAtomicWrite_Replace verifies full replace cycle.
+func TestAtomicWritePreservesExistingPermissions(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "script.sh")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := AtomicWrite(target, []byte("#!/bin/sh\necho ok\n")); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("mode = %o, want 755", got)
+	}
+}
+
 func TestAtomicWrite_Replace(t *testing.T) {
 	tmpDir := t.TempDir()
 	target := filepath.Join(tmpDir, "data.json")

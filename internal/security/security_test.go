@@ -7,6 +7,25 @@ import (
 	"testing"
 )
 
+func TestDiffPreviewChangeUsesProvidedContent(t *testing.T) {
+	boundWorkdir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(boundWorkdir, "file.txt"), []byte("main workspace\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	diff, err := NewDiffPreview(boundWorkdir).PreviewChange(
+		"file.txt",
+		[]byte("teammate worktree\n"),
+		[]byte("approved change\n"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(diff, "-teammate worktree") || strings.Contains(diff, "-main workspace") {
+		t.Fatalf("diff used bound workdir instead of provided content: %q", diff)
+	}
+}
+
 func TestSecurePath(t *testing.T) {
 	wd := t.TempDir()
 	subDir := filepath.Join(wd, "cmd", "agent")

@@ -339,6 +339,34 @@ func waitForRetry(ctx context.Context, delay time.Duration) error {
 	}
 }
 
+func validateCompletion(provider Provider, response *llm.Completion) error {
+	if response == nil {
+		return invalidModelResponse(provider, "nil completion")
+	}
+	if strings.TrimSpace(response.Content) == "" && len(response.ToolCalls) == 0 {
+		return invalidModelResponse(provider, "completion contained neither text nor tool calls")
+	}
+	return nil
+}
+
+func validateStreamResult(provider Provider, result *llm.StreamResult) error {
+	if result == nil {
+		return invalidModelResponse(provider, "nil stream result")
+	}
+	if strings.TrimSpace(result.Content) == "" && len(result.ToolCalls) == 0 {
+		return invalidModelResponse(provider, "stream contained neither text nor tool calls")
+	}
+	return nil
+}
+
+func invalidModelResponse(provider Provider, detail string) error {
+	name := "unknown"
+	if provider != nil && strings.TrimSpace(provider.Name()) != "" {
+		name = provider.Name()
+	}
+	return NewProviderError(name, 0, "empty_response", errors.New(detail))
+}
+
 func callWithRetry(ctx context.Context, p Provider, params llm.CallParams, throttle *RoleThrottle, usageFn UsageRecorder, role string, policy retryPolicy) (*llm.Completion, error) {
 	if p == nil {
 		return nil, fmt.Errorf("no active LLM provider")
@@ -355,9 +383,12 @@ func callWithRetry(ctx context.Context, p Provider, params llm.CallParams, throt
 		cancel()
 		release()
 		if callErr == nil {
-			if usageFn != nil {
-				usageFn(role, p.Name(), params.Model, GetTraceID(ctx), resp.Usage, time.Since(started).Seconds())
-			}
+			callErr = validateCompletion(p, resp)
+		}
+		if resp != nil && usageFn != nil {
+			usageFn(role, p.Name(), params.Model, GetTraceID(ctx), resp.Usage, time.Since(started).Seconds())
+		}
+		if callErr == nil {
 			return resp, nil
 		}
 
@@ -394,16 +425,16 @@ func streamWithRetry(ctx context.Context, p Provider, params llm.CallParams, sin
 		cancel()
 		release()
 		if callErr == nil {
-			if usageFn != nil {
-				usageFn(role, p.Name(), params.Model, GetTraceID(ctx), sr.Usage, time.Since(started).Seconds())
-			}
+			callErr = validateStreamResult(p, sr)
+		}
+		if sr != nil && usageFn != nil {
+			usageFn(role, p.Name(), params.Model, GetTraceID(ctx), sr.Usage, time.Since(started).Seconds())
+		}
+		if callErr == nil {
 			return sr, nil
 		}
 		if sink.emitted {
-			// Partial content was shown to the user; don't retry.
-			if usageFn != nil {
-				usageFn(role, p.Name(), params.Model, GetTraceID(ctx), sr.Usage, time.Since(started).Seconds())
-			}
+			// Partial content was shown to the user; don't retry or fall back.
 			return sr, callErr
 		}
 

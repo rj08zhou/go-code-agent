@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -89,50 +91,76 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 	c.stdout, err = c.cmd.StdoutPipe()
 	if err != nil {
+		c.closePipesLocked()
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
 	c.stderr, err = c.cmd.StderrPipe()
 	if err != nil {
+		c.closePipesLocked()
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	if err := c.cmd.Start(); err != nil {
+		c.closePipesLocked()
 		return fmt.Errorf("start %s: %w", c.config.Name, err)
 	}
+	go func(stderr io.Reader) {
+		_, _ = io.Copy(io.Discard, stderr)
+	}(c.stderr)
 
 	c.reader = bufio.NewReader(c.stdout)
 	c.running = true
 
-	// Handshake: initialize
+	// Handshake: initialize.
 	if err := c.initialize(ctx); err != nil {
-		c.abortRPC()
-		return err
+		cleanupErr := c.stopProcessLocked()
+		return errors.Join(err, cleanupErr)
 	}
 	c.lastPing = time.Now()
 	return nil
 }
 
-// Stop terminates the MCP server and health loop.
+// Stop terminates the MCP server, waits for it to be reaped, and stops health checks.
 func (c *Client) Stop() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.running {
-		return nil
-	}
+	return c.stopProcessLocked()
+}
+
+func (c *Client) stopProcessLocked() error {
 	c.running = false
 	if c.healthCtx != nil {
 		c.healthCtx()
+		c.healthCtx = nil
 	}
 	if c.stdin != nil {
-		c.stdin.Close()
+		_ = c.stdin.Close()
+	}
+
+	var stopErr error
+	if c.cmd != nil && c.cmd.Process != nil {
+		if err := c.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			stopErr = fmt.Errorf("kill process: %w", err)
+		} else {
+			// Wait releases operating-system resources. ExitError is expected after Kill.
+			_ = c.cmd.Wait()
+			c.cmd = nil
+		}
+	}
+	c.closePipesLocked()
+	return stopErr
+}
+
+func (c *Client) closePipesLocked() {
+	if c.stdin != nil {
+		_ = c.stdin.Close()
 	}
 	if c.stdout != nil {
-		c.stdout.Close()
+		_ = c.stdout.Close()
 	}
-	if c.cmd != nil && c.cmd.Process != nil {
-		c.cmd.Process.Kill()
+	if c.stderr != nil {
+		_ = c.stderr.Close()
 	}
-	return nil
 }
 
 // Health reports whether the MCP server is healthy.
@@ -323,6 +351,9 @@ func (c *Client) sendRequest(ctx context.Context, method string, params interfac
 
 	select {
 	case res := <-done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return res.result, res.err
 	case <-ctx.Done():
 		c.abortRPC()
@@ -368,16 +399,7 @@ func (c *Client) sendRequestSync(method string, params interface{}) (json.RawMes
 // abortRPC stops the client after a cancelled stdio exchange.
 // The caller must hold c.mu.
 func (c *Client) abortRPC() {
-	c.running = false
-	if c.stdin != nil {
-		_ = c.stdin.Close()
-	}
-	if c.stdout != nil {
-		_ = c.stdout.Close()
-	}
-	if c.cmd != nil && c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
-	}
+	_ = c.stopProcessLocked()
 }
 
 func (c *Client) initialize(ctx context.Context) error {
@@ -456,7 +478,7 @@ func (c *Client) callTool(ctx context.Context, name string, args map[string]any)
 	}
 	out := fmt.Sprintf("%v", texts)
 	if wrapper.IsError {
-		return fmt.Sprintf("[MCP Error] %v", texts), nil
+		return out, fmt.Errorf("MCP tool %q failed: %s", name, out)
 	}
 	return out, nil
 }

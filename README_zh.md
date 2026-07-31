@@ -113,7 +113,7 @@ export SNAPSHOT_ENABLED=1
 ./agent
 ```
 
-默认启动姿态：HITL **开启**，模式 **safe-only**，`/approve safe`（安全工具自动继续；危险工具与写文件 diff 会进入审查）。
+默认审批模式为 **`safe-auto`**（较低风险审查自动继续；高风险操作与写文件 diff 会进入审查），可通过 `/approval` 查看或切换。
 
 ---
 
@@ -251,10 +251,10 @@ REPL 将新消息追加到 HistoryStore
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--workdir <path>` | 当前目录 | Agent 编辑与执行命令的项目目录 |
-| `--data-dir <path>` | `~/.config`（或 `$XDG_CONFIG_HOME`） | 配置根；状态位于 `{data-dir}/go-code-agent/<project>` |
+| `--data-dir <path>` | `~/.config`（或 `$XDG_CONFIG_HOME`） | 配置根；状态位于 `{data-dir}/go-code-agent/<project>-<路径哈希>` |
 | `--session <id>` | — | 恢复指定会话 |
 | `--new-session` | false | 强制新建会话 |
-| `--human` | false | HITL 提升为 interactive，并切换到 `/approve off` |
+| `--human` | false | 将审批模式提升为 `manual` |
 | `--human-mode` | （保持默认） | `interactive` \| `safe-only` \| `auto-approve` \| `auto-reject` \| `notify-only` |
 
 ### LLM-as-Judge 环境变量
@@ -370,8 +370,8 @@ go-code-agent/
 | `/team` | 列出 / 拉起 / 关闭 / 发消息给 teammate |
 | `/inbox` | 读取 lead inbox |
 | `/judge` | 开关 LLM-as-Judge |
-| `/hitl [mode]` | 开关或设置 HITL 模式 |
-| `/approve [off\|safe\|danger]` | 审批预设（并同步 HITL） |
+| `/approval [manual\|safe-auto\|all-auto\|reject\|notify-only]` | 查看或设置最终审批模式（`all-auto` 需附加 `confirm`） |
+| `/approve ...` / `/hitl ...` | 旧命令兼容别名 |
 | `/permissions [reload]` | 查看 / 重载 permissions.json |
 | `/security` | 安全状态 |
 | `/security test-bash <cmd>` | 干跑 bash 策略 |
@@ -489,7 +489,7 @@ MCP 服务器启动/批准后，以 `mcp__<server>__<tool>` 形式注册到会�
 
 ### 其他安全能力
 
-- 写文件工具的 diff preview（`/approve danger` 时跳过）
+- 写文件工具的 diff preview（确认启用 `all-auto` 时跳过）
 - 可选 git snapshot + 失败回滚（`SNAPSHOT_ENABLED=1`）
 - 决策审计日志（`decisions.jsonl`）
 - 会话事件日志（`session.log`）

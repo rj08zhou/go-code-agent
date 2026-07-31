@@ -1,10 +1,14 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/model"
+	"go-code-agent/internal/tool"
 )
 
 func TestBuildSessionContext(t *testing.T) {
@@ -59,5 +63,50 @@ func TestInjectTurnContextAddsSessionBlock(t *testing.T) {
 	}
 	if r.turn.originalTask != "do the thing" {
 		t.Fatalf("originalTask=%q", r.turn.originalTask)
+	}
+}
+
+func TestRunnerReturnsWithoutInjectedTurnContext(t *testing.T) {
+	provider := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
+	runner := NewRunner(
+		NewLeadProfile("sys"),
+		model.NewGateway(provider, model.NewRoleThrottle(2)),
+		tool.NewExecutor(tool.NewToolCatalog(), nil, nil),
+		nil,
+		nil,
+	)
+	runner.SetDynamicContext(func() string {
+		return BuildSessionContext("evergreen", "todo", "")
+	})
+	runner.SetMemoryRecall(func(string) string { return "remember this" })
+
+	outcome := runner.Run(context.Background(), []llm.Message{llm.UserMessage("do the thing")}, "context-cleanup")
+	if outcome.Error != nil {
+		t.Fatalf("Run: %v", outcome.Error)
+	}
+	if provider.lastParams == nil || len(provider.lastParams.Messages) != 3 {
+		t.Fatalf("provider did not receive both context snapshots: %#v", provider.lastParams)
+	}
+	if !strings.HasPrefix(provider.lastParams.Messages[2].Content, "<memory-recall>") {
+		t.Fatalf("memory snapshot is not reserved context: %q", provider.lastParams.Messages[2].Content)
+	}
+	if len(outcome.Messages) != 2 || outcome.Messages[0].Content != "do the thing" || outcome.Messages[1].Content != "done" {
+		t.Fatalf("returned messages retained injected context: %#v", outcome.Messages)
+	}
+}
+
+func TestRunnerCancellationRemovesInjectedTurnContext(t *testing.T) {
+	runner := NewRunner(NewLeadProfile("sys"), nil, nil, nil, nil)
+	runner.SetDynamicContext(func() string { return BuildSessionContext("evergreen", "", "") })
+	runner.SetMemoryRecall(func(string) string { return "remember this" })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	outcome := runner.Run(ctx, []llm.Message{llm.UserMessage("do the thing")}, "context-cancel")
+	if !errors.Is(outcome.Error, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", outcome.Error)
+	}
+	if len(outcome.Messages) != 1 || outcome.Messages[0].Content != "do the thing" {
+		t.Fatalf("cancelled outcome retained injected context: %#v", outcome.Messages)
 	}
 }

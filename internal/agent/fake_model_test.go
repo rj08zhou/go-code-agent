@@ -463,7 +463,7 @@ func TestRunner_Integration_MemoryCapabilityDenied(t *testing.T) {
 // TestRunner_Integration_AutoLessonSkipsSubagent verifies that auto-lesson
 // does NOT fire for agents with CanMemory=false (explore/teammate).
 func TestRunner_Integration_AutoLessonSkipsSubagent(t *testing.T) {
-	fakeModel := &fakeProvider{name: "fake"}
+	fakeModel := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
 	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
@@ -505,7 +505,7 @@ func TestRunner_Integration_AutoLessonSkipsSubagent(t *testing.T) {
 // DOES fire for lead agent (CanMemory=true) after enough rounds WITH real
 // tool failures. A run that completed without failures does not need a lesson.
 func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
-	fakeModel := &fakeProvider{name: "fake"}
+	fakeModel := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
 	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
@@ -544,11 +544,9 @@ func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
 }
 
 // TestRunner_Integration_AutoLessonSkipsOnSuccess verifies that auto-lesson
-// does NOT fire when the run completed without any tool execution failure.
-// A successful run has nothing to learn; injecting a lesson prompt would
-// waste a model round.
+// does not run when every tool execution succeeded.
 func TestRunner_Integration_AutoLessonSkipsOnSuccess(t *testing.T) {
-	fakeModel := &fakeProvider{name: "fake"}
+	fakeModel := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
 	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{

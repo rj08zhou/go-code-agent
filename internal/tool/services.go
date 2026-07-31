@@ -60,10 +60,10 @@ type TeamProtocolService interface {
 	ReviewPlan(requestID string, approve bool, feedback string) string
 }
 
-// DiffPreview generates a preview before a mutating file operation.
+// DiffPreview generates a preview from the exact content captured for a
+// mutating file operation.
 type DiffPreview interface {
-	Preview(path string, content []byte) (string, error)
-	PreviewDelete(path string) (string, error)
+	PreviewChange(path string, oldContent, newContent []byte) (string, error)
 }
 
 // BackgroundService is the interface for background job management.

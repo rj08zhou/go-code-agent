@@ -194,7 +194,11 @@ type ToolResultRecord struct {
 
 // Run drives the agent loop, integrating all modules.
 // Stage details live in runner_loop.go; this method is the state-machine skeleton.
-func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) TurnOutcome {
+func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) (result TurnOutcome) {
+	defer func() {
+		result.Messages = stripInjectedTurnContext(result.Messages)
+	}()
+
 	// Runner instances are reused across REPL turns; loop counters and gates
 	// are per turn, so reset them before starting a new execution.
 	r.resetTurnState()
@@ -316,12 +320,37 @@ func lastUserMessage(msgs []llm.Message) string {
 			continue
 		}
 		c := strings.TrimSpace(msgs[i].Content)
-		if c == "" || isEphemeralNudge(msgs[i]) {
+		if c == "" || isEphemeralNudge(msgs[i]) || isInjectedTurnContext(msgs[i]) {
 			continue
 		}
 		return c
 	}
 	return ""
+}
+
+func stripInjectedTurnContext(messages []llm.Message) []llm.Message {
+	removed := false
+	filtered := make([]llm.Message, 0, len(messages))
+	for _, message := range messages {
+		if isInjectedTurnContext(message) {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, message)
+	}
+	if !removed {
+		return messages
+	}
+	return filtered
+}
+
+func isInjectedTurnContext(message llm.Message) bool {
+	if message.Role != llm.RoleUser {
+		return false
+	}
+	content := strings.TrimSpace(message.Content)
+	return strings.HasPrefix(content, "<session-context>") ||
+		strings.HasPrefix(content, "<memory-recall>")
 }
 
 func parseArgsItems(rawArgs string) []map[string]string {

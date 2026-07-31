@@ -125,7 +125,9 @@ func newTrackingSink(inner StreamSink) *trackingSink {
 }
 
 func (s *trackingSink) OnTextDelta(text string) {
-	s.emitted = true
+	if text != "" {
+		s.emitted = true
+	}
 	s.inner.OnTextDelta(text)
 }
 
@@ -178,6 +180,28 @@ func (g *Gateway) SetJudgeProvider(p Provider)       { g.judgeProv = p }
 func (g *Gateway) SetSubagentProvider(p Provider)    { g.subagentProv = p }
 func (g *Gateway) SetTeamProvider(p Provider)        { g.teamProv = p }
 func (g *Gateway) SetUsageRecorder(fn UsageRecorder) { g.usageFn = fn }
+
+// ProviderName returns the provider selected as the primary route for a role.
+func (g *Gateway) ProviderName(role string) string {
+	if g == nil {
+		return ""
+	}
+	p := g.providerFor(role)
+	if p == nil {
+		return ""
+	}
+	return p.Name()
+}
+
+// ReasoningAvailable reports whether the role's primary provider can safely
+// receive native reasoning requests and endpoint-bound continuation state.
+func (g *Gateway) ReasoningAvailable(role string) bool {
+	if g == nil {
+		return false
+	}
+	p := g.providerFor(role)
+	return p != nil && p.Capabilities().Reasoning && ProviderInstanceID(p) != ""
+}
 
 // SetFallbacks registers an ordered fallback chain for a role. The primary
 // provider is tried first; on a permanent failure the Gateway switches to the

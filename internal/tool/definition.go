@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -141,9 +142,11 @@ type ToolDefinition struct {
 
 // PreviewRequest describes a proposed filesystem mutation before it is applied.
 type PreviewRequest struct {
-	Path    string
-	Content []byte
-	Delete  bool
+	Path            string
+	OriginalContent []byte
+	Content         []byte
+	Existed         bool
+	Delete          bool
 }
 
 // ToolPreview computes a mutation preview without changing the filesystem.
@@ -207,6 +210,10 @@ type ToolScope struct {
 
 	// Audit context for logging
 	AuditID string
+
+	// Set only by Executor after preview and approval. Model-provided arguments
+	// cannot populate this per-invocation mutation plan.
+	approvedMutation *PreviewRequest
 }
 
 // ApprovalChecker is the interface for tool approval decisions.
@@ -320,6 +327,46 @@ func (c *ToolCatalog) Register(defs []ToolDefinition) {
 		}
 	}
 	c.snapshot = newSnap
+}
+
+// UnregisterPrefix atomically removes all tools whose names begin with prefix.
+func (c *ToolCatalog) UnregisterPrefix(prefix string) int {
+	if prefix == "" {
+		return 0
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	old := c.snapshot
+	removed := 0
+	for name := range old.Definitions {
+		if strings.HasPrefix(name, prefix) {
+			removed++
+		}
+	}
+	if removed == 0 {
+		return 0
+	}
+
+	newSnap := &ToolCatalogSnapshot{
+		Version:     old.Version + 1,
+		Definitions: make(map[string]ToolDefinition, len(old.Definitions)-removed),
+		Handlers:    make(map[string]ToolHandler, len(old.Handlers)-removed),
+		Order:       make([]string, 0, len(old.Definitions)-removed),
+	}
+	for _, name := range old.orderedNames() {
+		if strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if d, ok := old.Definitions[name]; ok {
+			newSnap.Definitions[name] = d
+			newSnap.Handlers[name] = old.Handlers[name]
+			newSnap.Order = append(newSnap.Order, name)
+		}
+	}
+	c.snapshot = newSnap
+	return removed
 }
 
 // Subset returns a new catalog containing only the named tools that exist
