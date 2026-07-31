@@ -61,19 +61,22 @@ type wireBundle struct {
 }
 
 // BuildRunner wires a single session run via staged helpers.
-func (rt *SessionRuntime) BuildRunner(params RunnerParams, sessionDir string) *BuiltRunner {
+func (rt *SessionRuntime) BuildRunner(params RunnerParams, sessionDir string) (*BuiltRunner, error) {
 	st := rt.SessionState
 	cfg := params.Config
 	if cfg == nil {
 		cfg = &config.Config{ModelID: "default"}
 	}
 
-	wb := &wireBundle{catalog: rt.catalog}
+	histStore, err := wireHistory(sessionDir)
+	if err != nil {
+		return nil, fmt.Errorf("initialize history: %w", err)
+	}
+	wb := &wireBundle{catalog: rt.catalog, histStore: histStore}
 	wb.executor, wb.hitlAdpt = wireSecurity(rt, params)
 	wb.subagent, wb.teamMgr = wireTeam(rt, params, sessionDir, wb.hitlAdpt)
 	wireTools(rt, params, wb)
 	wb.sysPrompt = wireSystemPrompt(rt, params)
-	wb.histStore = wireHistory(rt, sessionDir)
 	wb.runner, wb.judge = wireAgent(rt, params, wb, st.ID, sessionDir)
 	wireObservability(rt, params, wb, sessionDir)
 
@@ -122,7 +125,7 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams, sessionDir string) *B
 			ReasoningAvailable: rt.gateway.ReasoningAvailable("lead"),
 			ReasoningEffort:    strings.ToLower(strings.TrimSpace(cfg.ReasoningEffort)),
 		},
-	}
+	}, nil
 }
 
 func providerEndpointHost(cfg *config.Config, providerName string) string {
@@ -223,12 +226,8 @@ func wireSystemPrompt(rt *SessionRuntime, params RunnerParams) string {
 	).Build(rt.workdir)
 }
 
-func wireHistory(rt *SessionRuntime, sessionDir string) *history.Store {
-	histStore, histErr := history.New(filepath.Join(sessionDir, "history", history.FileName))
-	if histErr != nil {
-		fmt.Fprintf(os.Stderr, "[warn] history store: %v\n", histErr)
-	}
-	return histStore
+func wireHistory(sessionDir string) (*history.Store, error) {
+	return history.New(filepath.Join(sessionDir, "history", history.FileName))
 }
 
 func wireAgent(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionID, sessionDir string) (*agent.Runner, *agent.Judge) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/application"
+	"go-code-agent/internal/history"
 	"go-code-agent/internal/hitlaudit"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
@@ -84,9 +85,15 @@ func (r *repl) run() {
 		r.drainBackground()
 		r.checkInbox(&messages)
 
-		userMsg := llm.UserMessage(line)
-		messages = append(messages, userMsg)
-		histStore.AppendUser(line)
+		if err := histStore.AppendUser(line); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to persist user message: %v\n", err)
+			return
+		}
+		if err := histStore.Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to sync user message: %v\n", err)
+			return
+		}
+		messages = append(messages, llm.UserMessage(line))
 
 		before := len(messages)
 		runCtx := agent.WithPersistedBoundary(ctx, &before)
@@ -96,26 +103,35 @@ func (r *repl) run() {
 			before = len(messages)
 		}
 
-		for _, m := range messages[before:] {
-			switch m.Role {
-			case llm.RoleAssistant:
-				histStore.AppendAssistant(m.Content, m.ToolCalls)
-			case llm.RoleTool:
-				histStore.AppendTool(m.ToolCallID, m.Content)
-			}
+		if err := appendHistoryMessages(histStore, messages[before:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to persist agent output: %v\n", err)
+			return
 		}
-		if len(outcome.Messages) > 0 && outcome.Rounds > 0 && len(messages) > 10 {
-			histStore.AppendCheckpoint(
-				fmt.Sprintf("round %d", outcome.Rounds),
-				histStore.WrittenCount(),
-			)
+		if err := histStore.Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to sync agent output: %v\n", err)
+			return
 		}
 		if outcome.Error != nil {
 			fmt.Fprintf(os.Stderr, "%s[error]%s %v\n", utils.Red, utils.Reset, outcome.Error)
 		}
-		histStore.Sync()
 		fmt.Println()
 	}
+}
+
+func appendHistoryMessages(histStore *history.Store, messages []llm.Message) error {
+	for _, message := range messages {
+		switch message.Role {
+		case llm.RoleAssistant:
+			if err := histStore.AppendAssistant(message.Content, message.ToolCalls); err != nil {
+				return fmt.Errorf("append assistant message: %w", err)
+			}
+		case llm.RoleTool:
+			if err := histStore.AppendTool(message.ToolCallID, message.Content); err != nil {
+				return fmt.Errorf("append tool result %q: %w", message.ToolCallID, err)
+			}
+		}
+	}
+	return nil
 }
 
 func (r *repl) printBanner(restored int) {
@@ -393,7 +409,7 @@ func (r *repl) handleCommand(ctx context.Context, cmd string, messages *[]llm.Me
 			case "switch":
 				if len(parts) < 3 {
 					fmt.Println("Usage: /session switch <id>")
-				} else if err := r.built.Session.Repo.SwitchActive(parts[2]); err != nil {
+				} else if _, err := r.built.Session.Repo.LoadSessionMeta(parts[2]); err != nil {
 					fmt.Printf("Failed to switch session: %v\n", err)
 				} else {
 					r.next = &application.BuildOptions{SessionID: parts[2]}

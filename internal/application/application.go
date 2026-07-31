@@ -126,10 +126,10 @@ func (a *Application) SetRuntime(rt *SessionRuntime) { a.runtime = rt }
 
 // Shutdown gracefully stops all services.
 func (a *Application) Shutdown(ctx context.Context) error {
-	if a.runtime != nil {
-		a.runtime.Close(ctx)
+	if a.runtime == nil {
+		return nil
 	}
-	return nil
+	return a.runtime.Close(ctx)
 }
 
 // resolveDataDir computes a stable, isolated state directory from the
@@ -176,6 +176,7 @@ type SessionRuntime struct {
 	Cancel       context.CancelFunc
 	hooks        []ShutdownHook
 	closed       bool
+	closeErr     error
 }
 
 // NewSessionRuntime creates a runtime for the given session state.
@@ -203,7 +204,7 @@ func (rt *SessionRuntime) AddHook(name string, fn func() error) {
 // 2. Run shutdown hooks in reverse registration order
 func (rt *SessionRuntime) Close(ctx context.Context) error {
 	if rt.closed {
-		return nil
+		return rt.closeErr
 	}
 	rt.closed = true
 	if rt.Cancel != nil {
@@ -218,9 +219,9 @@ func (rt *SessionRuntime) Close(ctx context.Context) error {
 		}
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf("shutdown errors: %v", errs)
+		rt.closeErr = fmt.Errorf("shutdown errors: %v", errs)
 	}
-	return nil
+	return rt.closeErr
 }
 
 // BuildOptions control session startup behaviour.
@@ -257,9 +258,6 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime,
 		if err != nil {
 			return nil, nil, fmt.Errorf("resume session %q: %w", opts.SessionID, err)
 		}
-		if err := repo.SwitchActive(opts.SessionID); err != nil {
-			return nil, nil, fmt.Errorf("activate session %q: %w", opts.SessionID, err)
-		}
 	case idx.ActiveID != "":
 		st, err = repo.LoadSessionMeta(idx.ActiveID)
 		if err != nil {
@@ -277,7 +275,6 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime,
 		if err := repo.CreateSession(st); err != nil {
 			return nil, nil, fmt.Errorf("create session %q: %w", st.ID, err)
 		}
-		idx.ActiveID = st.ID
 		idx.Sessions = append(idx.Sessions, *st)
 		if err := repo.SaveIndex(idx); err != nil {
 			return nil, nil, fmt.Errorf("save sessions index: %w", err)
@@ -295,6 +292,13 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime,
 	// cannot leak across session switches.
 	catalog := tool.NewToolCatalog()
 	rt := NewSessionRuntime(app.gateway, app.workdir, catalog, repo, st)
+	var usageTracker *agent.UsageTracker
+	rt.AddHook("usage", func() error {
+		if usageTracker == nil {
+			return nil
+		}
+		return usageTracker.Close()
+	})
 
 	workdir := app.workdir
 	promptLoader := prompt.NewLoader()
@@ -322,30 +326,47 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime,
 			fmt.Fprintf(os.Stderr, "[warn] %v\n", modeErr)
 		}
 	}
-	// Permissions + DiffPreview + Usage tracker
+	// Permissions + DiffPreview
 	perms := security.NewPermissions()
 	_ = perms.Load(app.dataDir)
 
 	diffPreview := security.NewDiffPreview(workdir)
+	decisionLog, _ := agent.NewDecisionLog(sessionDir)
+	msgBus := team.NewBus(filepath.Join(sessionDir, "team", "inbox"))
+	params := newSessionParams(app, sessionDir, workdir, hitlMgr, approval, perms, diffPreview, decisionLog, msgBus, promptLoader, cfg)
+
+	built, err := rt.BuildRunner(params, sessionDir)
+	if err != nil {
+		buildErr := fmt.Errorf("build runner: %w", err)
+		if closeErr := rt.Close(context.Background()); closeErr != nil {
+			return nil, nil, fmt.Errorf("%w; cleanup runtime: %v", buildErr, closeErr)
+		}
+		return nil, nil, buildErr
+	}
+
 	usageTracker, usageErr := agent.NewUsageTracker(sessionDir)
 	if usageErr != nil {
 		fmt.Fprintf(os.Stderr, "[warn] usage tracker: %v\n", usageErr)
 	}
-	decisionLog, _ := agent.NewDecisionLog(sessionDir)
-	if usageTracker != nil {
-		app.gateway.SetUsageRecorder(func(role, providerName, modelID, traceID string, usage llm.Usage, duration float64) {
-			usageTracker.Record(providerName, role, modelID, traceID, usage, duration)
-		})
-	}
-
-	msgBus := team.NewBus(filepath.Join(sessionDir, "team", "inbox"))
-	params := newSessionParams(app, sessionDir, workdir, hitlMgr, approval, perms, diffPreview, decisionLog, msgBus, promptLoader, cfg)
-
-	built := rt.BuildRunner(params, sessionDir)
 	built.Session.Usage = usageTracker
 	built.Security.ReloadPermissions = func() error {
 		// In-place reload: bash handler closes over this same pointer.
 		return perms.Load(app.dataDir)
+	}
+
+	if idx.ActiveID != st.ID {
+		if err := repo.SwitchActive(st.ID); err != nil {
+			activateErr := fmt.Errorf("activate session %q: %w", st.ID, err)
+			if closeErr := rt.Close(context.Background()); closeErr != nil {
+				return nil, nil, fmt.Errorf("%w; cleanup runtime: %v", activateErr, closeErr)
+			}
+			return nil, nil, activateErr
+		}
+	}
+	if usageTracker != nil {
+		app.gateway.SetUsageRecorder(func(role, providerName, modelID, traceID string, usage llm.Usage, duration float64) {
+			usageTracker.Record(providerName, role, modelID, traceID, usage, duration)
+		})
 	}
 	app.SetRuntime(rt)
 

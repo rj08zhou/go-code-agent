@@ -13,9 +13,10 @@ import (
 
 // UsageTracker records LLM token usage per session.
 type UsageTracker struct {
-	path string
-	mu   sync.Mutex
-	file *os.File
+	path   string
+	mu     sync.Mutex
+	file   *os.File
+	closed bool
 }
 
 func NewUsageTracker(sessionDir string) (*UsageTracker, error) {
@@ -42,6 +43,9 @@ func (u *UsageTracker) reopen() error {
 func (u *UsageTracker) Record(source, role, model, traceID string, usage llm.Usage, durationSec float64) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.closed {
+		return
+	}
 	entry := map[string]interface{}{
 		"source":              source,
 		"role":                role,
@@ -78,6 +82,10 @@ func (u *UsageTracker) Record(source, role, model, traceID string, usage llm.Usa
 func (u *UsageTracker) Close() error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.closed {
+		return nil
+	}
+	u.closed = true
 	if u.file == nil {
 		return nil
 	}
