@@ -142,3 +142,84 @@ func TestBuildRepairsUnavailableImplicitActiveSession(t *testing.T) {
 		t.Fatalf("repaired active ID = %q, want %q", resumed.Session.ID, replacement.Session.ID)
 	}
 }
+
+func TestBuildFailurePreservesActiveSessionAndRuntime(t *testing.T) {
+	app, _, _ := newTestApp(t)
+	defer app.Shutdown(context.Background())
+
+	failedTarget, failedTargetRT, err := app.Build(application.BuildOptions{NewSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := failedTargetRT.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	active, activeRT, err := app.Build(application.BuildOptions{NewSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := activeRT.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	previousRuntime := app.Runtime()
+	before, err := app.SessionRepo().LoadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.ActiveID != active.Session.ID {
+		t.Fatalf("active session before failed Build = %q, want %q", before.ActiveID, active.Session.ID)
+	}
+
+	sessionDir, err := app.SessionRepo().SessionDir(failedTarget.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historyDir := filepath.Join(sessionDir, "history")
+	if err := os.RemoveAll(historyDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(historyDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	built, runtime, err := app.Build(application.BuildOptions{SessionID: failedTarget.Session.ID})
+	if err == nil || !strings.Contains(err.Error(), "initialize history") {
+		t.Fatalf("Build error = %v, want history initialization error", err)
+	}
+	if built != nil || runtime != nil {
+		t.Fatalf("Build returned partial runtime: built=%v runtime=%v", built, runtime)
+	}
+	if app.Runtime() != previousRuntime {
+		t.Fatal("failed Build replaced the previously installed runtime")
+	}
+	after, err := app.SessionRepo().LoadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ActiveID != active.Session.ID {
+		t.Fatalf("active session after failed Build = %q, want %q", after.ActiveID, active.Session.ID)
+	}
+}
+
+func TestShutdownReturnsStableRuntimeCloseError(t *testing.T) {
+	app, _, _ := newTestApp(t)
+	runtime := application.NewSessionRuntime(nil, "", nil, app.SessionRepo(), &session.State{ID: "close-error"})
+	calls := 0
+	runtime.AddHook("failing", func() error {
+		calls++
+		return errors.New("close failed")
+	})
+	app.SetRuntime(runtime)
+
+	first := app.Shutdown(context.Background())
+	if first == nil || !strings.Contains(first.Error(), "close failed") {
+		t.Fatalf("first Shutdown error = %v, want close failure", first)
+	}
+	second := app.Shutdown(context.Background())
+	if second == nil || second.Error() != first.Error() {
+		t.Fatalf("second Shutdown error = %v, want %v", second, first)
+	}
+	if calls != 1 {
+		t.Fatalf("shutdown hook calls = %d, want 1", calls)
+	}
+}

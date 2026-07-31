@@ -17,7 +17,7 @@ func main() {
 	os.Exit(run())
 }
 
-func run() int {
+func run() (exitCode int) {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags]\n\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "Flags:\n")
@@ -90,7 +90,12 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 		fmt.Fprintf(os.Stderr, "Failed to initialize: %v\n", err)
 		return 1
 	}
-	defer app.Shutdown(context.Background())
+	defer func() {
+		if err := app.Shutdown(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to shut down session: %v\n", err)
+			exitCode = 1
+		}
+	}()
 
 	rl, err := readline.New(utils.Blue + "> " + utils.Reset)
 	if err != nil {
@@ -113,7 +118,12 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 		loop.run()
 		next = loop.nextBuild()
 		if next != nil {
-			_ = rt.Close(context.Background())
+			closeErr := rt.Close(context.Background())
+			app.SetRuntime(nil)
+			if closeErr != nil {
+				fmt.Fprintf(os.Stderr, "Failed to close current session: %v\n", closeErr)
+				return 1
+			}
 		}
 	}
 	return 0

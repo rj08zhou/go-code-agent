@@ -61,9 +61,11 @@ func New(path string) (*Store, error) {
 		return nil, err
 	}
 	hs := &Store{path: path}
-	if n, err := hs.countEntries(); err == nil {
-		hs.written = n
+	n, err := hs.countEntries()
+	if err != nil {
+		return nil, fmt.Errorf("count history entries: %w", err)
 	}
+	hs.written = n
 	return hs, nil
 }
 
@@ -188,24 +190,23 @@ func (s *Store) LoadRuntime(systemPrompt string) ([]llm.Message, int, error) {
 	}
 	lastCheckpoint := -1
 	for i := len(entries) - 1; i >= 0; i-- {
-		if entries[i].Kind == kindCheckpoint {
+		if validRuntimeCheckpoint(entries[i], i) {
 			lastCheckpoint = i
 			break
 		}
 	}
 	msgs := []llm.Message{llm.SystemMessage(systemPrompt)}
-	if lastCheckpoint >= 0 {
-		cp := entries[lastCheckpoint]
-		if strings.TrimSpace(cp.Summary) != "" {
-			msgs = append(msgs,
-				llm.UserMessage(fmt.Sprintf("[Compressed history - restored from checkpoint]\n%s", cp.Summary)),
-				llm.AssistantMessage("Understood. Continuing with summary context."),
-			)
-		}
-	}
 	start := 0
 	if lastCheckpoint >= 0 {
-		start = lastCheckpoint + 1
+		cp := entries[lastCheckpoint]
+		msgs = append(msgs,
+			llm.UserMessage(fmt.Sprintf("[Compressed history - restored from checkpoint]\n%s", cp.Summary)),
+			llm.AssistantMessage("Understood. Continuing with summary context."),
+		)
+		// Covers is one-based and inclusive. Starting at To therefore selects
+		// the first uncovered zero-based entry, including recent messages that
+		// were written before the checkpoint itself.
+		start = cp.Covers.To
 	}
 	restored := 0
 	for _, e := range entries[start:] {
@@ -245,6 +246,15 @@ func (s *Store) LoadRuntime(systemPrompt string) ([]llm.Message, int, error) {
 		restored = 0
 	}
 	return msgs, restored, nil
+}
+
+func validRuntimeCheckpoint(entry Entry, index int) bool {
+	return entry.Kind == kindCheckpoint &&
+		entry.Covers != nil &&
+		strings.TrimSpace(entry.Summary) != "" &&
+		entry.Covers.From == 1 &&
+		entry.Covers.To >= 1 &&
+		entry.Covers.To <= index
 }
 
 func (s *Store) WrittenCount() int {

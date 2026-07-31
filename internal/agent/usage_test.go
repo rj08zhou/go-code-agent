@@ -49,6 +49,36 @@ func TestUsageTrackerPersistsAndRendersReasoningTokens(t *testing.T) {
 	}
 }
 
+func TestUsageTrackerDoesNotReopenAfterClose(t *testing.T) {
+	u, err := NewUsageTracker(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Record("openai", "lead", "m", "before-close", llm.Usage{TotalTokens: 1}, 0.1)
+	before, err := os.ReadFile(u.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := u.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	u.Record("openai", "lead", "m", "after-close", llm.Usage{TotalTokens: 2}, 0.2)
+	after, err := os.ReadFile(u.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("usage changed after Close:\n before %s\n after %s", before, after)
+	}
+	if u.file != nil {
+		t.Fatal("UsageTracker reopened its file after Close")
+	}
+	if err := u.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
 func TestRunnerAccumulatesReasoningTokensAcrossModelCalls(t *testing.T) {
 	fake := &fakeProvider{
 		name:    "fake",
