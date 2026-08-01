@@ -1,32 +1,28 @@
 package hitlaudit
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"sync"
+
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/tool"
-	"os"
-	"path/filepath"
-	"sync"
 )
 
 // HITLApprovalAdapter adapts HITLManager to the tool.ApprovalChecker interface,
 // enabling the executor to call HITL for human-in-the-loop approval.
 type HITLApprovalAdapter struct {
-	mgr                 *HITLManager
-	approval            *security.ApprovalState
-	workdir             string
-	mu                  sync.Mutex
-	lastAcceptedContent string
+	mgr           *HITLManager
+	approval      *security.ApprovalState
+	interactionMu sync.Mutex
 }
 
 func NewHITLApprovalAdapter(mgr *HITLManager) *HITLApprovalAdapter {
 	return &HITLApprovalAdapter{mgr: mgr}
 }
 
-func (a *HITLApprovalAdapter) SetWorkdir(wd string) { a.workdir = wd }
-
-// SetApproval binds the session ApprovalState (diff-preview skip /approve presets).
+// SetApproval binds the session ApprovalState used by effective approval modes.
 func (a *HITLApprovalAdapter) SetApproval(s *security.ApprovalState) { a.approval = s }
 
 func (a *HITLApprovalAdapter) shouldPreviewDiff() bool {
@@ -36,50 +32,20 @@ func (a *HITLApprovalAdapter) shouldPreviewDiff() bool {
 	return a.approval.ShouldPreviewDiff()
 }
 
-// AcceptedContent returns the partially-accepted content from chunk-by-chunk
-// diff review, or empty string if no review happened or content wasn't modified.
-func (a *HITLApprovalAdapter) AcceptedContent() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.lastAcceptedContent
-}
-
-func (a *HITLApprovalAdapter) readOldContent(path string) string {
-	if path == "" || a.workdir == "" {
-		return ""
-	}
-	content, err := os.ReadFile(filepath.Join(a.workdir, path))
-	if err != nil {
-		return ""
-	}
-	return string(content)
-}
-
-func extractPathAndContent(args json.RawMessage) (string, string) {
-	var m struct {
-		Path    string `json:"path"`
-		Content string `json:"content"`
-	}
-	if err := json.Unmarshal(args, &m); err != nil {
-		return "", ""
-	}
-	return m.Path, m.Content
-}
-
 func (a *HITLApprovalAdapter) AllowTool(toolName string, args json.RawMessage) (bool, string) {
-	decision, reason, feedback := a.DecideTool(toolName, args, "")
-	if decision == tool.ApprovalModified {
-		return false, feedback
+	result := a.DecideTool(toolName, args, tool.ApprovalPreview{})
+	if result.Decision == tool.ApprovalModified {
+		return false, result.Feedback
 	}
-	return decision == tool.ApprovalAllowed, reason
+	return result.Decision == tool.ApprovalAllowed, result.Reason
 }
 
 func (a *HITLApprovalAdapter) AllowToolWithPreview(toolName string, args json.RawMessage, preview string) (bool, string) {
-	decision, reason, feedback := a.DecideTool(toolName, args, preview)
-	if decision == tool.ApprovalModified {
-		return false, feedback
+	result := a.DecideTool(toolName, args, tool.ApprovalPreview{Text: preview})
+	if result.Decision == tool.ApprovalModified {
+		return false, result.Feedback
 	}
-	return decision == tool.ApprovalAllowed, reason
+	return result.Decision == tool.ApprovalAllowed, result.Reason
 }
 
 func isFileMutation(toolName string) bool {
@@ -90,43 +56,82 @@ func isFileMutation(toolName string) bool {
 	return false
 }
 
-func (a *HITLApprovalAdapter) DecideTool(toolName string, args json.RawMessage, preview string) (tool.ApprovalDecision, string, string) {
+func (a *HITLApprovalAdapter) DecideTool(toolName string, args json.RawMessage, preview tool.ApprovalPreview) tool.ApprovalResult {
 	needsReview, riskLevel, reason := a.mgr.NeedsReview(toolName, string(args))
 
-	// For file mutations with diff preview, do chunk-by-chunk review
-	// only when not in auto-approve mode and diff preview is enabled.
-	if preview != "" && a.mgr.IsEnabled() && isFileMutation(toolName) &&
-		a.mgr.Mode() != HITLModeAutoApprove && a.shouldPreviewDiff() {
-		path, newContent := extractPathAndContent(args)
-		oldContent := a.readOldContent(path)
-		a.mu.Lock()
-		a.lastAcceptedContent = ""
-		a.mu.Unlock()
+	// Only prompting modes perform interactive file review. Reject and
+	// notify-only preserve their non-interactive semantics.
+	mode := a.mgr.Mode()
+	mutationPreview := false
+	if preview.Mutation != nil && isFileMutation(toolName) {
+		request := preview.Mutation
+		mutationPreview = !request.Existed || request.Delete ||
+			!bytes.Equal(request.OriginalContent, request.Content)
+	}
+	promptingMode := mode == HITLModeInteractive || mode == HITLModeSafeOnly
+	if mutationPreview && a.mgr.IsEnabled() && promptingMode && a.shouldPreviewDiff() {
+		request := *preview.Mutation
+		var accepted string
+		var ok bool
 
-		accepted, ok := security.PreviewAndConfirm(path, oldContent, newContent, preview)
-		if !ok {
-			return tool.ApprovalRejected, "changes rejected by operator", ""
+		a.interactionMu.Lock()
+		switch {
+		case request.Delete:
+			ok = security.PreviewDeleteAndConfirm(request.Path, preview.Text)
+		case !request.Existed:
+			accepted, ok = security.PreviewCreateAndConfirm(request.Path, string(request.Content), preview.Text)
+		default:
+			accepted, ok = security.PreviewAndConfirm(
+				request.Path,
+				string(request.OriginalContent),
+				string(request.Content),
+				preview.Text,
+			)
 		}
-		a.mu.Lock()
-		a.lastAcceptedContent = accepted
-		a.mu.Unlock()
-		return tool.ApprovalAllowed, "", ""
+		a.interactionMu.Unlock()
+
+		if !ok {
+			return tool.ApprovalResult{Decision: tool.ApprovalRejected, Reason: "changes rejected by operator"}
+		}
+		result := tool.ApprovalResult{Decision: tool.ApprovalAllowed}
+		if !request.Delete {
+			result.ReplacementContent = &accepted
+		}
+		return result
+	}
+	if mutationPreview && a.mgr.IsEnabled() &&
+		(mode == HITLModeAutoReject || mode == HITLModeNotifyOnly) && !needsReview {
+		needsReview = true
+		riskLevel = "medium"
+		reason = "file mutation requires review"
 	}
 	if !needsReview {
-		return tool.ApprovalAllowed, "", ""
+		return tool.ApprovalResult{Decision: tool.ApprovalAllowed}
 	}
-	if preview != "" {
-		reason += "\n\nProposed mutation:\n" + preview
+	if preview.Text != "" {
+		reason += "\n\nProposed mutation:\n" + preview.Text
 	}
-	resp := a.mgr.RequestApproval(HITLRequest{ToolName: toolName, Arguments: string(args), RiskLevel: riskLevel, Reason: reason})
+
+	a.interactionMu.Lock()
+	resp := a.mgr.RequestApproval(HITLRequest{
+		ToolName:  toolName,
+		Arguments: string(args),
+		RiskLevel: riskLevel,
+		Reason:    reason,
+	})
+	a.interactionMu.Unlock()
+
 	switch resp.Decision {
 	case HITLApprove:
-		return tool.ApprovalAllowed, "", ""
+		return tool.ApprovalResult{Decision: tool.ApprovalAllowed}
 	case HITLReject:
-		return tool.ApprovalRejected, fmt.Sprintf("HITL rejected %s: %s", toolName, reason), ""
+		return tool.ApprovalResult{
+			Decision: tool.ApprovalRejected,
+			Reason:   fmt.Sprintf("HITL rejected %s: %s", toolName, reason),
+		}
 	case HITLModify:
-		return tool.ApprovalModified, "", resp.Feedback
+		return tool.ApprovalResult{Decision: tool.ApprovalModified, Feedback: resp.Feedback}
 	default:
-		return tool.ApprovalRejected, "unknown HITL decision", ""
+		return tool.ApprovalResult{Decision: tool.ApprovalRejected, Reason: "unknown HITL decision"}
 	}
 }

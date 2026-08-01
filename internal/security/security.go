@@ -2,7 +2,10 @@
 package security
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -88,11 +91,10 @@ const (
 	ApproveBlocked                      // never allowed
 )
 
-// ApprovalState is the session's auto-approve posture for tool risk levels
-// (/approve off|safe|danger). It answers "may this risk class run without
-// prompting?" and whether file-mutation diff previews should be shown
-// (skipped only under full auto-approve / danger). Distinct from HITLManager,
-// which owns interactive prompt modes (safe-only, interactive, …).
+// ApprovalState is the session's auto-approve posture for tool risk levels.
+// It answers "may this risk class run without prompting?" and whether
+// file-mutation diff previews should be shown. Distinct from HITLManager,
+// which owns the effective manual/safe-auto/all-auto decision mode.
 // It is safe for concurrent use.
 type ApprovalState struct {
 	mu              sync.RWMutex
@@ -128,16 +130,17 @@ func (s *ApprovalState) IsAutoApproveSafe() bool {
 // Diff preview is skipped only when the user has opted into full auto-approve.
 func (s *ApprovalState) ShouldPreviewDiff() bool { return !s.IsAutoApproveAll() }
 
-// ApplyPreset sets the posture for /approve off|safe|danger.
+// ApplyPreset sets the auto-approval and diff-preview posture. Legacy preset
+// names remain accepted for compatibility with stored/internal callers.
 func (s *ApprovalState) ApplyPreset(preset string) {
 	switch strings.ToLower(strings.TrimSpace(preset)) {
-	case "danger", "all":
+	case "all-auto", "danger", "all":
 		s.SetAutoApproveSafe(true)
 		s.SetAutoApproveAll(true)
-	case "safe":
+	case "safe-auto", "safe":
 		s.SetAutoApproveSafe(true)
 		s.SetAutoApproveAll(false)
-	default: // "off", "reset", or unknown → manual
+	default: // "manual", "off", "reset", or unknown
 		s.SetAutoApproveSafe(false)
 		s.SetAutoApproveAll(false)
 	}
@@ -151,12 +154,12 @@ func (s *ApprovalState) Decide(level ApprovalLevel, desc string) (allowed bool, 
 		if s.IsAutoApproveAll() || s.IsAutoApproveSafe() {
 			return true, ""
 		}
-		return false, fmt.Sprintf("[safe] %s requires approval. Use /approve safe to auto-approve.", desc)
+		return false, fmt.Sprintf("[safe] %s requires approval. Use /approval safe-auto to auto-approve lower-risk reviews.", desc)
 	case ApproveDanger:
 		if s.IsAutoApproveAll() {
 			return true, ""
 		}
-		return false, fmt.Sprintf("[DANGER] %s requires confirmation. Use /approve danger to auto-approve (risky!).", desc)
+		return false, fmt.Sprintf("[DANGER] %s requires confirmation. Use /approval all-auto confirm to bypass prompts (risky!).", desc)
 	case ApproveBlocked:
 		return false, fmt.Sprintf("BLOCKED: %s is not permitted", desc)
 	default:
@@ -309,11 +312,34 @@ func (a *atomicReadLine) Store(fn func(prompt string) (string, error)) {
 	a.fn.Store(fn)
 }
 
+var (
+	defaultReadLineMu     sync.Mutex
+	defaultReadLineSource = os.Stdin
+	defaultReadLineReader = bufio.NewReader(os.Stdin)
+)
+
+func readLineFrom(reader *bufio.Reader, writer io.Writer, prompt string) (string, error) {
+	if _, err := fmt.Fprint(writer, prompt); err != nil {
+		return "", err
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil && (len(line) == 0 || !errors.Is(err, io.EOF)) {
+		return "", err
+	}
+	line = strings.TrimSuffix(line, "\n")
+	line = strings.TrimSuffix(line, "\r")
+	return line, nil
+}
+
 var defaultReadLine = func(prompt string) (string, error) {
-	fmt.Print(prompt)
-	var line string
-	_, err := fmt.Scanln(&line)
-	return line, err
+	defaultReadLineMu.Lock()
+	defer defaultReadLineMu.Unlock()
+
+	if defaultReadLineSource != os.Stdin {
+		defaultReadLineSource = os.Stdin
+		defaultReadLineReader = bufio.NewReader(os.Stdin)
+	}
+	return readLineFrom(defaultReadLineReader, os.Stdout, prompt)
 }
 
 // ReadLine calls the current ReadLine function.
@@ -321,7 +347,12 @@ func ReadLine(prompt string) (string, error) {
 	return readLineFn.Load()(prompt)
 }
 
-// SetReadLine replaces the ReadLine function for testing.
+// SetReadLine replaces the ReadLine function for custom terminal frontends and tests.
 func SetReadLine(fn func(string) (string, error)) {
 	readLineFn.Store(fn)
+}
+
+// ResetReadLine restores the default stdin-backed line reader.
+func ResetReadLine() {
+	readLineFn.Store(defaultReadLine)
 }

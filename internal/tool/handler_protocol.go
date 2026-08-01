@@ -39,7 +39,7 @@ func protocolTools(d builtinDeps) []ToolDefinition {
 		Name:        "plan_approval",
 		Description: "Approve or reject a teammate plan by request ID.",
 		RiskLevel:   RiskAuto,
-		Effects:     Effects(EffectTeamMutation),
+		Effects:     Effects(EffectTeamMutation, EffectDelegation),
 		Schema: MustMarshalJSON(map[string]any{
 			"type": "object", "required": []string{"request_id", "approve"},
 			"properties": map[string]any{

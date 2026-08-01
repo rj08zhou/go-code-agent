@@ -17,12 +17,4 @@ Minimum acceptable score: {{min_score}}
 
 {{tool_results}}
 
-Output ONLY a JSON object:
-{
-  "approved": true/false,
-  "score": 1-10,
-  "issues": ["specific problem 1", "specific problem 2"],
-  "suggestions": ["how to fix 1", "how to fix 2"],
-  "should_retry": true/false,
-  "reason": "brief explanation"
-}
+Return one verdict matching the response JSON Schema. Populate every field. Use empty arrays when there are no issues or suggestions; do not add prose outside the JSON value.

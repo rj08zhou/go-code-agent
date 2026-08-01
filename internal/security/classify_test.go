@@ -16,6 +16,7 @@ func TestClassifyCommand(t *testing.T) {
 		{"git log", "git log --oneline -5", VerdictSafe},
 		{"sed -n readonly", "sed -n '1,10p' main.go", VerdictSafe},
 		{"benign env prefix", "GOOS=linux go build ./...", VerdictSafe},
+		{"read-only pipeline discards stderr", "grep -rn foo . 2>/dev/null | head -20", VerdictSafe},
 
 		// --- caution: side effects, no dangerous pattern ---
 		{"mkdir", "mkdir -p tmp", VerdictCaution},
@@ -30,6 +31,8 @@ func TestClassifyCommand(t *testing.T) {
 		{"git reset hard", "git reset --hard HEAD~1", VerdictDanger},
 		{"kubectl delete", "kubectl delete pod x", VerdictDanger},
 		{"chmod", "chmod +x run.sh", VerdictDanger},
+		{"absolute output redirect", "echo x >/tmp/result", VerdictDanger},
+		{"dev null plus absolute redirect", "grep foo . 2>/dev/null >/tmp/result", VerdictDanger},
 
 		// --- danger: sensitive env override (the LD_PRELOAD bypass) ---
 		{"LD_PRELOAD cat", "LD_PRELOAD=/tmp/evil.so cat x", VerdictDanger},
@@ -68,6 +71,14 @@ func TestClassifyCommand(t *testing.T) {
 					tc.cmd, got.Verdict, got.Reason, tc.want)
 			}
 		})
+	}
+}
+
+func TestClassifyCommandDangerReasonDoesNotRepeatCommand(t *testing.T) {
+	const command = "echo x >/tmp/result"
+	got := ClassifyCommand(command)
+	if got.Verdict != VerdictDanger || got.Reason != "command matches a potentially dangerous pattern" {
+		t.Fatalf("classification = %#v", got)
 	}
 }
 

@@ -16,6 +16,7 @@ const (
 	SessionActivated  EventType = "session_activated"
 	AgentStarted      EventType = "agent_started"
 	ModelCalled       EventType = "model_called"
+	ModelRetry        EventType = "model_retry" // retry backoff wait / provider fallback
 	ToolStarted       EventType = "tool_started"
 	ToolFinished      EventType = "tool_finished"
 	ApprovalRequested EventType = "approval_requested"
@@ -57,32 +58,38 @@ type Event struct {
 // MarshalJSON returns the JSON representation of the event.
 func (e Event) MarshalJSON() ([]byte, error) {
 	type alias struct {
-		Type      EventType  `json:"type"`
-		TraceID   string     `json:"trace_id,omitempty"`
-		SessionID string     `json:"session_id,omitempty"`
-		AgentID   string     `json:"agent_id,omitempty"`
-		ToolName  string     `json:"tool_name,omitempty"`
-		ModelID   string     `json:"model_id,omitempty"`
-		Output    string     `json:"output,omitempty"`
-		Timestamp string     `json:"timestamp"`
-		Outcome   string     `json:"outcome,omitempty"`
-		Error     string     `json:"error,omitempty"`
-		Duration  float64    `json:"duration_sec,omitempty"`
-		Usage     *llm.Usage `json:"usage,omitempty"`
+		Type       EventType  `json:"type"`
+		TraceID    string     `json:"trace_id,omitempty"`
+		SessionID  string     `json:"session_id,omitempty"`
+		AgentID    string     `json:"agent_id,omitempty"`
+		ToolCallID string     `json:"tool_call_id,omitempty"`
+		ToolName   string     `json:"tool_name,omitempty"`
+		ModelID    string     `json:"model_id,omitempty"`
+		Output     string     `json:"output,omitempty"`
+		Timestamp  string     `json:"timestamp"`
+		Status     string     `json:"status,omitempty"`
+		Outcome    string     `json:"outcome,omitempty"`
+		Error      string     `json:"error,omitempty"`
+		Duration   float64    `json:"duration_sec,omitempty"`
+		Usage      *llm.Usage `json:"usage,omitempty"`
+		Payload    any        `json:"payload,omitempty"`
 	}
 	a := alias{
-		Type:      e.Type,
-		TraceID:   e.TraceID,
-		SessionID: e.SessionID,
-		AgentID:   e.AgentID,
-		ToolName:  e.ToolName,
-		ModelID:   e.ModelID,
-		Output:    e.Output,
-		Timestamp: e.Timestamp.Format(time.RFC3339Nano),
-		Outcome:   e.Outcome,
-		Error:     e.Error,
-		Duration:  e.Duration.Seconds(),
-		Usage:     e.Usage,
+		Type:       e.Type,
+		TraceID:    e.TraceID,
+		SessionID:  e.SessionID,
+		AgentID:    e.AgentID,
+		ToolCallID: e.ToolCallID,
+		ToolName:   e.ToolName,
+		ModelID:    e.ModelID,
+		Output:     e.Output,
+		Timestamp:  e.Timestamp.Format(time.RFC3339Nano),
+		Status:     e.Status,
+		Outcome:    e.Outcome,
+		Error:      e.Error,
+		Duration:   e.Duration.Seconds(),
+		Usage:      e.Usage,
+		Payload:    e.Payload,
 	}
 	return json.Marshal(a)
 }

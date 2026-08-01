@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"go-code-agent/internal/store"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,10 +36,7 @@ func (d *DecisionLog) Record(tool, action, reason string, round int) {
 		Action: action, Reason: reason, Round: round,
 	}
 	data, _ := json.Marshal(e)
-	if err := os.MkdirAll(filepath.Dir(d.path), 0o755); err != nil {
-		return
-	}
-	f, err := os.OpenFile(d.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := store.OpenPrivateAppend(d.path)
 	if err != nil {
 		return
 	}

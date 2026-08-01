@@ -37,7 +37,7 @@ func NewSystemPromptBuilder(
 	}
 }
 
-func (b *SystemPromptBuilder) Build(workdir, modelID string) string {
+func (b *SystemPromptBuilder) Build(workdir string) string {
 	skillCtx := ""
 	skillNames := ""
 	if b.skillLoader != nil && b.skillLoader.Len() > 0 {
@@ -47,7 +47,7 @@ func (b *SystemPromptBuilder) Build(workdir, modelID string) string {
 	return b.BuildWith(SystemPromptVars{
 		Workdir:      workdir,
 		Skills:       skillNames,
-		EnvContext:   buildEnvContext(workdir, modelID),
+		EnvContext:   buildEnvContext(workdir),
 		SkillContext: skillCtx,
 	})
 }

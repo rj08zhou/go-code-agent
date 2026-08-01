@@ -158,8 +158,50 @@ func TestTurnFlagsInterceptor(t *testing.T) {
 		Name:      "TodoWrite",
 		Arguments: `{"items":[{"content":"a","status":"pending"}]}`,
 	}, tool.Succeeded("ok"))
-	if env.turn.planning.RoundsWithoutTodo != 0 || !env.turn.planning.HasOpenItems || !env.turn.planning.UsedPlanning {
-		t.Fatalf("todo flags: rounds=%d open=%v planning=%v",
-			env.turn.planning.RoundsWithoutTodo, env.turn.planning.HasOpenItems, env.turn.planning.UsedPlanning)
+	if env.turn.planning.RoundsWithoutTodo != 0 || !env.turn.planning.HasOpenItems || !env.turn.planning.PlanEstablished {
+		t.Fatalf("todo flags: rounds=%d open=%v established=%v",
+			env.turn.planning.RoundsWithoutTodo, env.turn.planning.HasOpenItems, env.turn.planning.PlanEstablished)
+	}
+}
+
+func TestTurnFlagsInterceptorRejectsEmptyOrCompletedTodoAsPlan(t *testing.T) {
+	h := turnFlagsInterceptor{}
+	for _, args := range []string{
+		`{"items":[]}`,
+		`{"items":[{"content":"done","status":"completed","activeForm":"finishing"}]}`,
+	} {
+		env := newEnv("lead")
+		h.After(env, llm.ToolCall{Name: "TodoWrite", Arguments: args}, tool.Succeeded("ok"))
+		if env.turn.planning.PlanEstablished {
+			t.Errorf("TodoWrite %s established an empty plan", args)
+		}
+	}
+}
+
+func TestTurnFlagsInterceptorEstablishesPlanOnlyAfterSuccessfulMutation(t *testing.T) {
+	h := turnFlagsInterceptor{}
+	planArgs := `{"items":[{"content":"a","status":"pending"}]}`
+
+	for _, tc := range []llm.ToolCall{
+		{Name: "TodoWrite", Arguments: planArgs},
+		{Name: "task_create", Arguments: `{"title":"a"}`},
+	} {
+		env := newEnv("lead")
+		h.After(env, tc, tool.Failed("no"))
+		if env.turn.planning.PlanEstablished {
+			t.Errorf("failed %s established a plan", tc.Name)
+		}
+		h.After(env, tc, tool.Succeeded("ok"))
+		if !env.turn.planning.PlanEstablished {
+			t.Errorf("successful %s did not establish a plan", tc.Name)
+		}
+	}
+
+	for _, name := range []string{"task_list", "task_dag", "task_ready"} {
+		env := newEnv("lead")
+		h.After(env, llm.ToolCall{Name: name, Arguments: `{}`}, tool.Succeeded("ok"))
+		if env.turn.planning.PlanEstablished {
+			t.Errorf("query tool %s established a plan", name)
+		}
 	}
 }

@@ -7,10 +7,11 @@ import (
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/history"
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/logging"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
+	"go-code-agent/internal/store"
 	"go-code-agent/internal/utils"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -54,6 +55,19 @@ func maxval(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func compactedHistoryCoverage(written, messageCount, split int, boundary *int) int {
+	if written <= 0 {
+		return 0
+	}
+	persistedEnd := messageCount
+	if boundary != nil {
+		persistedEnd = *boundary
+	}
+	persistedEnd = max(0, min(persistedEnd, messageCount))
+	persistedTail := min(max(persistedEnd-split, 0), written)
+	return written - persistedTail
 }
 
 // Compression handles microCompact (in-place truncation) and
@@ -151,7 +165,6 @@ func MicroCompact(msgs []llm.Message, minClearBytes int) (cleared int, reclaimed
 // buildCompressInput renders a message prefix into compact structured text.
 func buildCompressInput(msgs []llm.Message) string {
 	const maxMsgChars = 500
-	const maxToolChars = 200
 	const maxArgChars = 120
 	const maxTotalChars = 40000
 
@@ -195,7 +208,7 @@ func buildCompressInput(msgs []llm.Message) string {
 			if name == "" {
 				name = "unknown"
 			}
-			lines = append(lines, fmt.Sprintf("  [tool:%s]: %s", name, utils.Truncate(m.Content, maxToolChars)))
+			lines = append(lines, fmt.Sprintf("  [tool:%s]: %s", name, utils.Truncate(m.Content, config.CompressToolOutputChars)))
 		}
 	}
 	all := strings.Join(lines, "\n")
@@ -212,26 +225,30 @@ func buildCompressInput(msgs []llm.Message) string {
 // AutoCompact performs progressive compaction: summarizes the older prefix
 // and keeps recent turns verbatim.
 func (c *Compression) AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Message {
-	origCount := len(msgs)
-	origTokens := llm.EstimateRequestTokens(msgs, nil)
+	// Choose the prefix/tail split. If no safe prefix can be removed, keep the
+	// original context unchanged and do not create a misleading checkpoint.
+	split := findCompactionSplit(msgs, c.keepRecent)
+	if split <= 0 {
+		return msgs
+	}
 
-	// Save full transcript
+	// Save full transcript (agent-private: raw conversation content).
 	tDir := filepath.Join(c.dataDir, "transcripts")
-	os.MkdirAll(tDir, 0o755)
+	_ = store.EnsurePrivateDir(tDir)
 	tPath := filepath.Join(tDir, fmt.Sprintf("transcript_%d.jsonl", time.Now().Unix()))
-	if f, err := os.Create(tPath); err == nil {
+	if f, err := store.OpenPrivateAppend(tPath); err == nil {
 		enc := json.NewEncoder(f)
 		for _, m := range msgs {
-			enc.Encode(m)
+			if err := enc.Encode(m); err != nil {
+				logging.Default().Warn(fmt.Sprintf("compaction transcript write failed: %v", err))
+				break
+			}
 		}
-		f.Close()
+		_ = f.Close()
+	} else {
+		logging.Default().Warn(fmt.Sprintf("compaction transcript open failed: %v", err))
 	}
-	fmt.Printf("[transcript saved: %s]\n", tPath)
 
-	// Choose the prefix/tail split
-	split := findCompactionSplit(msgs, c.keepRecent)
-
-	// Summarize the prefix
 	prefix := msgs[:split]
 	var toSummarize []llm.Message
 	for _, m := range prefix {
@@ -242,31 +259,42 @@ func (c *Compression) AutoCompact(ctx context.Context, msgs []llm.Message, sys s
 	}
 
 	convText := buildCompressInput(toSummarize)
-	summary := "(summary failed)"
-
 	resp, err := c.gateway.Call(ctx, "compress", llm.CallParams{
 		Model:     c.modelID,
 		MaxTokens: 4096,
 		Messages: []llm.Message{llm.UserMessage(
-		prompt.Render(c.promptLoader.MustLoad("compaction"), map[string]string{
-			"conversation": convText,
-		}))},
+			prompt.Render(c.promptLoader.MustLoad("compaction"), map[string]string{
+				"conversation": convText,
+			}))},
 	})
-	if err == nil && resp != nil && strings.TrimSpace(resp.Content) != "" {
-		summary = resp.Content
+	if err != nil || resp == nil || strings.TrimSpace(resp.Content) == "" {
+		if err != nil {
+			logging.Default().Warn(fmt.Sprintf("compaction summary unavailable: %v", err))
+		}
+		return msgs
 	}
+	summary := resp.Content
 
-	// Persist checkpoint
+	// Persist the checkpoint before replacing in-memory context. Covers ends at
+	// the persisted entry represented by the summarized prefix; persisted tail
+	// messages remain recoverable verbatim even though the checkpoint is appended
+	// after them in the JSONL file.
 	if c.histStore != nil {
-		covered := c.histStore.WrittenCount()
-		if err := c.histStore.AppendCheckpoint(summary, covered); err == nil {
-			fmt.Printf("[history] checkpoint saved (covered %d entries)\n", covered)
+		covered := compactedHistoryCoverage(c.histStore.WrittenCount(), len(msgs), split, persistedBoundaryFromCtx(ctx))
+		if covered <= 0 {
+			return msgs
+		}
+		if err := c.histStore.AppendCheckpoint(summary, covered); err != nil {
+			logging.Default().Warn(fmt.Sprintf("compaction checkpoint write failed: %v", err))
+			return msgs
+		}
+		if err := c.histStore.Sync(); err != nil {
+			logging.Default().Warn(fmt.Sprintf("compaction checkpoint sync failed: %v", err))
+			return msgs
 		}
 	}
 
 	tail := msgs[split:]
-	fmt.Printf("[compacted %d/%d messages (~%d tokens) into %d-char summary; kept %d recent]\n",
-		len(prefix), origCount, origTokens, len(summary), len(tail))
 
 	// Remap caller-tracked persisted-boundary in place after the slice
 	// is rebuilt, matching original.

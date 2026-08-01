@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,6 +109,13 @@ const (
 	EffectSessionMutation
 	EffectMemoryMutation
 	EffectTeamMutation
+	// EffectUnclassified marks dynamically discovered tools whose behavior
+	// cannot be classified confidently enough for pre-plan execution.
+	EffectUnclassified
+	// EffectDelegation marks tools that create or authorize other agents
+	// capable of side effects (e.g. spawning a teammate, approving its plan).
+	// Delegation must not be usable to bypass the lead's own planning gate.
+	EffectDelegation
 )
 
 // SnapshotPolicy controls git snapshot creation.
@@ -134,9 +142,11 @@ type ToolDefinition struct {
 
 // PreviewRequest describes a proposed filesystem mutation before it is applied.
 type PreviewRequest struct {
-	Path    string
-	Content []byte
-	Delete  bool
+	Path            string
+	OriginalContent []byte
+	Content         []byte
+	Existed         bool
+	Delete          bool
 }
 
 // ToolPreview computes a mutation preview without changing the filesystem.
@@ -148,11 +158,15 @@ func (td ToolDefinition) HasEffect(e Effect) bool {
 }
 
 type EffectSet struct {
-	bitmask int
+	bitmask  int
+	declared bool
 }
 
+// Effects declares a tool's effects. Calling Effects() with no arguments
+// explicitly classifies a tool as having no relevant effects; the zero value
+// remains undeclared so newly registered tools fail closed before planning.
 func Effects(es ...Effect) EffectSet {
-	var s EffectSet
+	s := EffectSet{declared: true}
 	for _, e := range es {
 		s.bitmask |= int(e)
 	}
@@ -161,6 +175,10 @@ func Effects(es ...Effect) EffectSet {
 
 func (es EffectSet) Has(e Effect) bool {
 	return es.bitmask&int(e) != 0
+}
+
+func (es EffectSet) Declared() bool {
+	return es.declared
 }
 
 // ToolHandler is the unified signature: receives ToolScope, returns structured Result.
@@ -192,6 +210,10 @@ type ToolScope struct {
 
 	// Audit context for logging
 	AuditID string
+
+	// Set only by Executor after preview and approval. Model-provided arguments
+	// cannot populate this per-invocation mutation plan.
+	approvedMutation *PreviewRequest
 }
 
 // ApprovalChecker is the interface for tool approval decisions.
@@ -305,6 +327,46 @@ func (c *ToolCatalog) Register(defs []ToolDefinition) {
 		}
 	}
 	c.snapshot = newSnap
+}
+
+// UnregisterPrefix atomically removes all tools whose names begin with prefix.
+func (c *ToolCatalog) UnregisterPrefix(prefix string) int {
+	if prefix == "" {
+		return 0
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	old := c.snapshot
+	removed := 0
+	for name := range old.Definitions {
+		if strings.HasPrefix(name, prefix) {
+			removed++
+		}
+	}
+	if removed == 0 {
+		return 0
+	}
+
+	newSnap := &ToolCatalogSnapshot{
+		Version:     old.Version + 1,
+		Definitions: make(map[string]ToolDefinition, len(old.Definitions)-removed),
+		Handlers:    make(map[string]ToolHandler, len(old.Handlers)-removed),
+		Order:       make([]string, 0, len(old.Definitions)-removed),
+	}
+	for _, name := range old.orderedNames() {
+		if strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if d, ok := old.Definitions[name]; ok {
+			newSnap.Definitions[name] = d
+			newSnap.Handlers[name] = old.Handlers[name]
+			newSnap.Order = append(newSnap.Order, name)
+		}
+	}
+	c.snapshot = newSnap
+	return removed
 }
 
 // Subset returns a new catalog containing only the named tools that exist

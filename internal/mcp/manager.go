@@ -3,14 +3,18 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"go-code-agent/internal/tool"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+
+	"go-code-agent/internal/tool"
 )
 
 // Manager manages MCP server subprocesses and their tool registrations.
@@ -19,12 +23,17 @@ type Manager struct {
 	mu             sync.Mutex
 	clients        map[string]*Client
 	pendingServers map[string]ServerConfig
+	failures       map[string]string
+	connecting     map[string]struct{}
+	toolCounts     map[string]int
 	registry       ToolRegistry
+	closed         bool
 }
 
-// ToolRegistry is called when MCP tools are discovered, to register them into the ToolCatalog.
+// ToolRegistry manages MCP tools in the runtime ToolCatalog.
 type ToolRegistry interface {
 	RegisterMCPTools(serverName string, tools []ToolInfo)
+	UnregisterMCPTools(serverName string)
 }
 
 func NewManager(workdir string) *Manager {
@@ -32,6 +41,9 @@ func NewManager(workdir string) *Manager {
 		workdir:        workdir,
 		clients:        make(map[string]*Client),
 		pendingServers: make(map[string]ServerConfig),
+		failures:       make(map[string]string),
+		connecting:     make(map[string]struct{}),
+		toolCounts:     make(map[string]int),
 	}
 }
 
@@ -46,130 +58,252 @@ func (m *Manager) SetRegistry(registry ToolRegistry) {
 // discovering and registering their tools into the ToolCatalog.
 // MCP_SERVERS servers auto-start; .mcp.json servers require /mcp approve first.
 func (m *Manager) LoadAndStart(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	var startupErrors []error
 
-	// 1. Auto-start from MCP_SERVERS env var
-	envConfigs := parseMCPConfigEnv()
-	for _, cfg := range envConfigs {
-		if _, exists := m.clients[cfg.Name]; exists {
+	// 1. Auto-start from MCP_SERVERS env var.
+	for _, cfg := range parseMCPConfigEnv() {
+		m.mu.Lock()
+		_, active := m.clients[cfg.Name]
+		_, connecting := m.connecting[cfg.Name]
+		m.mu.Unlock()
+		if active || connecting {
 			continue
 		}
-		m.startServer(ctx, cfg)
+		if _, err := m.startServer(ctx, cfg); err != nil {
+			startupErrors = append(startupErrors, fmt.Errorf("%s: %w", cfg.Name, err))
+		}
 	}
 
-	// 2. Load .mcp.json into pending list (require /mcp approve)
-	fileConfigs := parseMCPConfigFile(m.workdir)
-	for _, cfg := range fileConfigs {
-		if _, exists := m.clients[cfg.Name]; exists {
+	// 2. Load .mcp.json into the pending list (require /mcp approve).
+	pendingCount := 0
+	for _, cfg := range parseMCPConfigFile(m.workdir) {
+		if err := validateServerConfig(cfg); err != nil {
+			startupErrors = append(startupErrors, err)
 			continue
 		}
-		m.pendingServers[cfg.Name] = cfg
+		m.mu.Lock()
+		if _, active := m.clients[cfg.Name]; !active {
+			m.pendingServers[cfg.Name] = cfg
+			pendingCount++
+		}
+		m.mu.Unlock()
 	}
-	if len(fileConfigs) > 0 {
-		log.Printf("[MCP] %d server(s) pending approval from .mcp.json", len(fileConfigs))
+	if pendingCount > 0 {
+		log.Printf("[MCP] %d server(s) pending approval from .mcp.json", pendingCount)
+	}
+	return errors.Join(startupErrors...)
+}
+
+func validateServerConfig(cfg ServerConfig) error {
+	if strings.TrimSpace(cfg.Name) == "" {
+		return errors.New("MCP server name is required")
+	}
+	if cfg.Name != strings.TrimSpace(cfg.Name) || strings.Contains(cfg.Name, "__") {
+		return fmt.Errorf("invalid MCP server name %q", cfg.Name)
+	}
+	for _, r := range cfg.Name {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '.' || r == '-' || r == '_' {
+			continue
+		}
+		return fmt.Errorf("invalid MCP server name %q: only letters, digits, '.', '-' and '_' are allowed", cfg.Name)
+	}
+	if strings.TrimSpace(cfg.Command) == "" {
+		return fmt.Errorf("MCP server %q command is required", cfg.Name)
 	}
 	return nil
 }
 
-func (m *Manager) startServer(ctx context.Context, cfg ServerConfig) {
+// startServer publishes a server only after start, initialize, tool discovery,
+// and catalog registration have all completed successfully.
+func (m *Manager) startServer(ctx context.Context, cfg ServerConfig) (toolCount int, retErr error) {
+	if err := validateServerConfig(cfg); err != nil {
+		return 0, err
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return 0, errors.New("MCP manager is closed")
+	}
+	if _, exists := m.clients[cfg.Name]; exists {
+		m.mu.Unlock()
+		return 0, fmt.Errorf("MCP server %q is already connected", cfg.Name)
+	}
+	if _, exists := m.connecting[cfg.Name]; exists {
+		m.mu.Unlock()
+		return 0, fmt.Errorf("MCP server %q is already connecting", cfg.Name)
+	}
+	m.connecting[cfg.Name] = struct{}{}
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		delete(m.connecting, cfg.Name)
+		if retErr != nil && !m.closed {
+			m.failures[cfg.Name] = strings.ReplaceAll(retErr.Error(), "\n", " ")
+		}
+		m.mu.Unlock()
+	}()
+
 	client := NewClient(cfg)
 	if err := client.Start(ctx); err != nil {
-		log.Printf("[MCP] Failed to start %s: %v", cfg.Name, err)
-		return
+		retErr = fmt.Errorf("start MCP server %q: %w", cfg.Name, err)
+		if cleanupErr := client.Stop(); cleanupErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("cleanup MCP server %q: %w", cfg.Name, cleanupErr))
+		}
+		return 0, retErr
 	}
-	m.clients[cfg.Name] = client
-	client.startHealthLoop(ctx)
 
 	tools, err := client.DiscoverTools(ctx)
 	if err != nil {
-		log.Printf("[MCP] Failed to discover tools from %s: %v", cfg.Name, err)
-		return
+		retErr = fmt.Errorf("discover tools from MCP server %q: %w", cfg.Name, err)
+		if cleanupErr := client.Stop(); cleanupErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("cleanup MCP server %q: %w", cfg.Name, cleanupErr))
+		}
+		return 0, retErr
 	}
+	if err := ctx.Err(); err != nil {
+		retErr = fmt.Errorf("connect MCP server %q: %w", cfg.Name, err)
+		_ = client.Stop()
+		return 0, retErr
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		_ = client.Stop()
+		return 0, errors.New("MCP manager closed while connecting")
+	}
+	// Publish the tools and client under the same manager lock. A handler that
+	// becomes visible concurrently will block in CallTool until the client map
+	// contains the matching server.
 	if m.registry != nil {
 		m.registry.RegisterMCPTools(cfg.Name, tools)
 	}
+	m.clients[cfg.Name] = client
+	m.toolCounts[cfg.Name] = len(tools)
+	delete(m.failures, cfg.Name)
+	m.mu.Unlock()
+
+	client.startHealthLoop(ctx)
 	log.Printf("[MCP] Server %s: %d tools registered", cfg.Name, len(tools))
+	return len(tools), nil
 }
 
-// Approve starts a pending MCP server from .mcp.json.
-func (m *Manager) Approve(ctx context.Context, name string) string {
+// Approve starts a pending MCP server from .mcp.json. A failed server remains
+// retryable with the same command and is exposed through Status as failed.
+func (m *Manager) Approve(ctx context.Context, name string) (int, error) {
 	m.mu.Lock()
 	cfg, ok := m.pendingServers[name]
+	m.mu.Unlock()
 	if !ok {
-		m.mu.Unlock()
-		return fmt.Sprintf("Error: no pending server named '%s'", name)
+		return 0, fmt.Errorf("no pending MCP server named %q", name)
 	}
+
+	toolCount, err := m.startServer(ctx, cfg)
+	if err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
 	delete(m.pendingServers, name)
 	m.mu.Unlock()
-	m.startServer(ctx, cfg)
-	return fmt.Sprintf("Approved and started MCP server '%s'", name)
+	return toolCount, nil
 }
 
 // Connect starts a server from an interactive command.
-func (m *Manager) Connect(ctx context.Context, name, command string, args []string) string {
-	m.mu.Lock()
-	if _, exists := m.clients[name]; exists {
-		m.mu.Unlock()
-		return fmt.Sprintf("MCP server %q already connected", name)
-	}
+func (m *Manager) Connect(ctx context.Context, name, command string, args []string) (int, error) {
 	cfg := ServerConfig{Name: name, Command: command, Args: args, Env: os.Environ()}
-	m.mu.Unlock()
-	m.mu.Lock()
-	m.startServer(ctx, cfg)
-	m.mu.Unlock()
-	return fmt.Sprintf("MCP server %q connected", name)
+	return m.startServer(ctx, cfg)
 }
 
-// Disconnect stops an active server.
-func (m *Manager) Disconnect(name string) string {
+// Disconnect stops an active server and removes its tools from the catalog.
+func (m *Manager) Disconnect(name string) error {
 	m.mu.Lock()
 	client, ok := m.clients[name]
+	registry := m.registry
 	if ok {
 		delete(m.clients, name)
+		delete(m.toolCounts, name)
+		delete(m.failures, name)
 	}
 	m.mu.Unlock()
 	if !ok {
-		return fmt.Sprintf("MCP server %q not connected", name)
+		return fmt.Errorf("MCP server %q is not connected", name)
 	}
-	_ = client.Stop()
-	return fmt.Sprintf("MCP server %q disconnected", name)
+	if registry != nil {
+		registry.UnregisterMCPTools(name)
+	}
+	if err := client.Stop(); err != nil {
+		return fmt.Errorf("stop MCP server %q: %w", name, err)
+	}
+	return nil
 }
 
 // ServerInstructions returns the combined instructions from all active MCP servers.
 func (m *Manager) ServerInstructions() string {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	names := make([]string, 0, len(m.clients))
+	clients := make(map[string]*Client, len(m.clients))
+	for name, client := range m.clients {
+		names = append(names, name)
+		clients[name] = client
+	}
+	m.mu.Unlock()
+
+	sort.Strings(names)
 	var parts []string
-	for _, c := range m.clients {
-		if c.instructions != "" {
-			parts = append(parts, c.instructions)
+	for _, name := range names {
+		if instructions := clients[name].instructions; instructions != "" {
+			parts = append(parts, instructions)
 		}
 	}
 	return strings.Join(parts, "\n")
 }
 
-// ListPending returns names of servers awaiting approval.
+// ListPending returns sorted names that are awaiting first approval. Servers
+// whose last start failed are shown separately by Status and remain retryable.
 func (m *Manager) ListPending() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var names []string
-	for n := range m.pendingServers {
-		names = append(names, n)
+	for name := range m.pendingServers {
+		if _, failed := m.failures[name]; !failed {
+			names = append(names, name)
+		}
 	}
+	sort.Strings(names)
 	return names
 }
 
-// Shutdown stops all MCP server subprocesses.
-func (m *Manager) Shutdown() {
+// FailedCount returns the number of servers whose most recent start failed.
+func (m *Manager) FailedCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for name, client := range m.clients {
+	return len(m.failures)
+}
+
+// Shutdown stops all MCP server subprocesses and removes their tools.
+func (m *Manager) Shutdown() {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.closed = true
+	clients := m.clients
+	registry := m.registry
+	m.clients = make(map[string]*Client)
+	m.toolCounts = make(map[string]int)
+	m.mu.Unlock()
+
+	for name, client := range clients {
+		if registry != nil {
+			registry.UnregisterMCPTools(name)
+		}
 		if err := client.Stop(); err != nil {
 			log.Printf("[MCP] Error stopping %s: %v", name, err)
 		}
 	}
-	m.clients = make(map[string]*Client)
 }
 
 // CallTool invokes an MCP tool by its fully qualified name (mcp__server__tool).
@@ -202,17 +336,100 @@ func (m *Manager) Count() int {
 	return len(m.clients)
 }
 
+// List returns active server names for model context.
 func (m *Manager) List() string {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.clients) == 0 {
+	names := make([]string, 0, len(m.clients))
+	for name := range m.clients {
+		names = append(names, name)
+	}
+	m.mu.Unlock()
+	if len(names) == 0 {
+		return "No active MCP servers."
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// Status renders active, pending, connecting, and failed servers for users.
+func (m *Manager) Status() string {
+	m.mu.Lock()
+	active := make(map[string]*Client, len(m.clients))
+	toolCounts := make(map[string]int, len(m.toolCounts))
+	for name, client := range m.clients {
+		active[name] = client
+		toolCounts[name] = m.toolCounts[name]
+	}
+	var pending []string
+	for name := range m.pendingServers {
+		if _, failed := m.failures[name]; !failed {
+			pending = append(pending, name)
+		}
+	}
+	var connecting []string
+	for name := range m.connecting {
+		connecting = append(connecting, name)
+	}
+	failures := make(map[string]string, len(m.failures))
+	retryable := make(map[string]bool, len(m.failures))
+	for name, failure := range m.failures {
+		failures[name] = failure
+		_, ok := m.pendingServers[name]
+		retryable[name] = ok
+	}
+	m.mu.Unlock()
+
+	if len(active) == 0 && len(pending) == 0 && len(connecting) == 0 && len(failures) == 0 {
 		return "No MCP servers configured."
 	}
-	var names []string
-	for _, c := range m.clients {
-		names = append(names, c.config.Name)
+
+	var out strings.Builder
+	out.WriteString("MCP servers:")
+	if len(active) > 0 {
+		names := make([]string, 0, len(active))
+		for name := range active {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		out.WriteString("\n  active:")
+		for _, name := range names {
+			count := toolCounts[name]
+			label := "tools"
+			if count == 1 {
+				label = "tool"
+			}
+			fmt.Fprintf(&out, "\n    - %s (%s, %d %s)", name, active[name].Health(), count, label)
+		}
 	}
-	return strings.Join(names, ", ")
+	if len(connecting) > 0 {
+		sort.Strings(connecting)
+		out.WriteString("\n  connecting:")
+		for _, name := range connecting {
+			fmt.Fprintf(&out, "\n    - %s", name)
+		}
+	}
+	if len(pending) > 0 {
+		sort.Strings(pending)
+		out.WriteString("\n  pending:")
+		for _, name := range pending {
+			fmt.Fprintf(&out, "\n    - %s", name)
+		}
+	}
+	if len(failures) > 0 {
+		names := make([]string, 0, len(failures))
+		for name := range failures {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		out.WriteString("\n  failed:")
+		for _, name := range names {
+			fmt.Fprintf(&out, "\n    - %s: %s", name, failures[name])
+			if retryable[name] {
+				fmt.Fprintf(&out, "\n      Retry: /mcp approve %s", name)
+			}
+		}
+	}
+	return out.String()
 }
 
 // parseMCPConfigFile reads .mcp.json from the working directory.
@@ -313,6 +530,11 @@ func NewToolCatalogAdapter(catalog *tool.ToolCatalog, mcpMgr *Manager) *ToolCata
 	return &ToolCatalogAdapter{catalog: catalog, mcpMgr: mcpMgr}
 }
 
+// UnregisterMCPTools removes every tool owned by one MCP server.
+func (a *ToolCatalogAdapter) UnregisterMCPTools(serverName string) {
+	a.catalog.UnregisterPrefix("mcp__" + serverName + "__")
+}
+
 // RegisterMCPTools converts discovered MCP tools into ToolDefinitions and
 // atomically adds them to the ToolCatalog.
 func (a *ToolCatalogAdapter) RegisterMCPTools(serverName string, tools []ToolInfo) {
@@ -350,25 +572,40 @@ func (a *ToolCatalogAdapter) RegisterMCPTools(serverName string, tools []ToolInf
 
 // inferMCPEffects guesses tool effects from name and description keywords.
 // MCP tools default to NetworkAccess because they are remote calls.
-func inferMCPEffects(name, desc string, schema map[string]any) tool.EffectSet {
+func inferMCPEffects(name, desc string, _ map[string]any) tool.EffectSet {
 	combined := strings.ToLower(name + " " + desc)
-	var effects []tool.Effect
+	tokens := strings.FieldsFunc(combined, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	hasToken := func(words ...string) bool {
+		for _, token := range tokens {
+			for _, word := range words {
+				if token == word {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	effects := []tool.Effect{tool.EffectNetworkAccess} // all MCP tools are network calls
 
-	effects = append(effects, tool.EffectNetworkAccess) // all MCP tools are network calls
-
-	if strings.Contains(combined, "write") || strings.Contains(combined, "create") ||
-		strings.Contains(combined, "update") || strings.Contains(combined, "delete") ||
-		strings.Contains(combined, "insert") || strings.Contains(combined, "remove") {
+	mutating := hasToken("write", "create", "update", "delete", "insert", "remove", "set", "put", "patch", "archive", "purge", "forget")
+	readOnly := hasToken("read", "query", "search", "get", "list", "fetch", "find", "describe", "inspect")
+	executing := hasToken("exec", "execute", "run", "command", "shell")
+	if mutating {
 		effects = append(effects, tool.EffectWriteFile)
 	}
-	if strings.Contains(combined, "read") || strings.Contains(combined, "query") ||
-		strings.Contains(combined, "search") || strings.Contains(combined, "get") ||
-		strings.Contains(combined, "list") || strings.Contains(combined, "fetch") {
+	if readOnly {
 		effects = append(effects, tool.EffectReadFile)
 	}
-	if strings.Contains(combined, "exec") || strings.Contains(combined, "run") ||
-		strings.Contains(combined, "command") || strings.Contains(combined, "shell") {
+	if executing {
 		effects = append(effects, tool.EffectExecuteProcess)
+	}
+	// A read keyword is not proof that a compound remote operation is read-only.
+	// Mixed or unknown semantics stay unclassified and therefore fail closed
+	// until a plan is established.
+	if (!mutating && !readOnly && !executing) || (readOnly && (mutating || executing)) {
+		effects = append(effects, tool.EffectUnclassified)
 	}
 	return tool.Effects(effects...)
 }

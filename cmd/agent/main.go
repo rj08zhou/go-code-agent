@@ -2,17 +2,30 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"go-code-agent/internal/application"
-	"go-code-agent/internal/utils"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/chzyer/readline"
+
+	"go-code-agent/internal/application"
+	"go-code-agent/internal/logging"
+	"go-code-agent/internal/model/provider"
+	"go-code-agent/internal/security"
+	"go-code-agent/internal/session"
+	"go-code-agent/internal/store"
+	"go-code-agent/internal/utils"
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() (exitCode int) {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags]\n\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "Flags:\n")
@@ -54,9 +67,19 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 	dataDir := flag.String("data-dir", "", "State directory (default: ~/.config/go-code-agent)")
 	sessionID := flag.String("session", "", "Resume a specific session ID")
 	newSession := flag.Bool("new-session", false, "Start a fresh session")
-	human := flag.Bool("human", false, "Escalate HITL to interactive (all tools require confirmation)")
-	humanMode := flag.String("human-mode", "", "Override HITL mode: interactive|safe-only|auto-approve|auto-reject|notify-only (default: safe-only)")
+	human := flag.Bool("human", false, "Use manual approval mode")
+	humanMode := flag.String("human-mode", "", "Advanced compatibility override: interactive|safe-only|auto-approve|auto-reject|notify-only")
 	flag.Parse()
+	if *sessionID != "" && *newSession {
+		fmt.Fprintln(os.Stderr, "Invalid options: --session and --new-session cannot be used together.")
+		return 2
+	}
+	if *sessionID != "" {
+		if err := session.ValidateSessionID(*sessionID); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid --session value: %v\n", err)
+			return 2
+		}
+	}
 
 	wd := *workdir
 	if wd == "" {
@@ -73,48 +96,102 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 	app, err := application.New(cfgDir, wd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize: %v\n", err)
-		os.Exit(1)
-	}
-	defer app.Shutdown(context.Background())
+		if errors.Is(err, provider.ErrNoProvider) {
+			fmt.Fprint(os.Stderr, `
+No usable LLM provider. Set at least one API key, e.g.:
 
-	rl, err := readline.New(utils.Blue + "> " + utils.Reset)
+  export ANTHROPIC_API_KEY="sk-ant-..."   # for claude-* models (default)
+  export OPENAI_API_KEY="sk-..."          # for gpt-* / OpenAI-compatible models
+
+If a key is already set, make sure it matches MODEL_ID / LLM_PROVIDER.
+Run with --help for the full list of environment variables.
+`)
+		}
+		return 1
+	}
+	defer func() {
+		if err := app.Shutdown(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to shut down session: %v\n", err)
+			exitCode = 1
+		}
+	}()
+
+	// Route non-event runtime diagnostics to a private file instead of
+	// stdout so they cannot interleave with streamed model output. Structured
+	// audit and usage events remain authoritative in the session log.
+	logFile := filepath.Join(app.DataDir(), "terminal", "agent.log")
+	if lf, err := store.OpenPrivateAppend(logFile); err != nil {
+		fmt.Fprintf(os.Stderr, "[warn] file logging disabled: %v\n", err)
+	} else {
+		defer lf.Close()
+		logging.SetDefault(logging.New(lf, logging.LevelInfo, false))
+	}
+
+	replPrompt := utils.Blue + "> " + utils.Reset
+
+	// Pre-create the history file with owner-only permissions (0700 dir,
+	// 0600 file); readline itself would create it world-readable (0666).
+	histFile := filepath.Join(app.DataDir(), "terminal", "history")
+	if f, err := store.OpenPrivateAppend(histFile); err != nil {
+		fmt.Fprintf(os.Stderr, "[warn] repl history disabled: %v\n", err)
+		histFile = "" // fall back to in-memory history
+	} else {
+		f.Close()
+	}
+
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:                 replPrompt,
+		HistoryFile:            histFile,
+		HistorySearchFold:      true, // case-insensitive Ctrl-R
+		DisableAutoSaveHistory: true, // approval y/n/m answers must not pollute history
+		AutoComplete:           newCompleter(),
+	})
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Failed to initialize terminal: %v\n", err)
+		return 1
 	}
 	defer rl.Close()
 
+	var terminalMu sync.Mutex
+	readTerminal := func(prompt string, saveHistory bool) (string, error) {
+		terminalMu.Lock()
+		defer terminalMu.Unlock()
+		rl.SetPrompt(prompt)
+		defer rl.SetPrompt(replPrompt)
+		line, err := rl.Readline()
+		if saveHistory && err == nil && strings.TrimSpace(line) != "" {
+			_ = rl.SaveHistory(line) // write error only affects persistence
+		}
+		return line, err
+	}
+	security.SetReadLine(func(prompt string) (string, error) {
+		return readTerminal(prompt, false)
+	})
+	defer security.ResetReadLine()
+
 	next := &application.BuildOptions{SessionID: *sessionID, NewSession: *newSession, Human: *human, HumanMode: *humanMode}
 	for next != nil {
-		built, rt := app.Build(*next)
-		printBanner(built)
-		loop := newRepl(built, rt.Ctx, rl.Readline)
+		built, rt, err := app.Build(*next)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start session: %v\n", err)
+			if next.SessionID != "" {
+				fmt.Fprintln(os.Stderr, "Start without --session, then use /session list to view available sessions.")
+			}
+			return 1
+		}
+		loop := newRepl(built, rt.Ctx, func() (string, error) {
+			return readTerminal(replPrompt, true)
+		})
 		loop.run()
 		next = loop.nextBuild()
 		if next != nil {
-			_ = rt.Close(context.Background())
+			closeErr := rt.Close(context.Background())
+			app.SetRuntime(nil)
+			if closeErr != nil {
+				fmt.Fprintf(os.Stderr, "Failed to close current session: %v\n", closeErr)
+				return 1
+			}
 		}
 	}
-}
-
-func printBanner(b *application.BuiltRunner) {
-	judgeStatus := "off"
-	if b.Runtime.JudgeEnabled {
-		judgeStatus = "on"
-	}
-
-	divider := strings.Repeat("=", 60)
-	fmt.Println(utils.Bold + utils.Cyan + divider + utils.Reset)
-	fmt.Printf("%s  go-code-agent%s\n", utils.Bold+utils.Cyan, utils.Reset)
-	fmt.Printf("  Model: %s  |  Workspace: %s\n", b.Session.ModelID, b.Session.Workdir)
-	fmt.Printf("  Session: %s - %s\n", b.Session.ID[:13], b.Session.Title)
-	fmt.Printf("  HITL: %s  |  Judge: %s\n", hitlStatus(b), judgeStatus)
-	fmt.Println(utils.Bold + utils.Cyan + divider + utils.Reset)
-	fmt.Println()
-}
-
-func hitlStatus(b *application.BuiltRunner) string {
-	if b.Security.HITL == nil || !b.Security.HITL.IsEnabled() {
-		return "off"
-	}
-	return fmt.Sprintf("on (%s)", b.Security.HITL.Mode())
+	return 0
 }

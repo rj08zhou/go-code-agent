@@ -8,8 +8,8 @@ import (
 
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/model"
+	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/tool"
 )
 
