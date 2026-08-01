@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"go-code-agent/internal/config"
+	"go-code-agent/internal/event"
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/logging"
 	"strings"
 	"sync"
 	"time"
@@ -367,7 +369,7 @@ func invalidModelResponse(provider Provider, detail string) error {
 	return NewProviderError(name, 0, "empty_response", errors.New(detail))
 }
 
-func callWithRetry(ctx context.Context, p Provider, params llm.CallParams, throttle *RoleThrottle, usageFn UsageRecorder, role string, policy retryPolicy) (*llm.Completion, error) {
+func callWithRetry(ctx context.Context, p Provider, params llm.CallParams, throttle *RoleThrottle, usageFn UsageRecorder, eventSink event.Sink, role string, policy retryPolicy) (*llm.Completion, error) {
 	if p == nil {
 		return nil, fmt.Errorf("no active LLM provider")
 	}
@@ -401,7 +403,9 @@ func callWithRetry(ctx context.Context, p Provider, params llm.CallParams, throt
 			if attempt == policy.maxRetries {
 				return nil, &RetryExhaustedError{Provider: p.Name(), Attempts: attempt + 1, Err: callErr}
 			}
-			if err := waitForRetry(ctx, retryDelay(policy, attempt, callErr)); err != nil {
+			delay := retryDelay(policy, attempt, callErr)
+			logRetryWait(ctx, eventSink, role, p, attempt, policy.maxRetries, delay, callErr)
+			if err := waitForRetry(ctx, delay); err != nil {
 				return nil, err
 			}
 		}
@@ -409,7 +413,25 @@ func callWithRetry(ctx context.Context, p Provider, params llm.CallParams, throt
 	panic("unreachable")
 }
 
-func streamWithRetry(ctx context.Context, p Provider, params llm.CallParams, sink *trackingSink, throttle *RoleThrottle, usageFn UsageRecorder, role string, policy retryPolicy) (*llm.StreamResult, error) {
+// logRetryWait makes backoff visible: without it the user may stare at a
+// silent terminal for minutes (rate-limit delays reach 60s per attempt).
+// It goes through the event sink (console + session.log); logging is only a
+// fallback for wirings without a sink (eval, tests).
+func logRetryWait(ctx context.Context, eventSink event.Sink, role string, p Provider, attempt, maxRetries int, delay time.Duration, err error) {
+	summary := fmt.Sprintf("llm retry %d/%d: role=%s provider=%s waiting %s (%v)",
+		attempt+1, maxRetries, role, p.Name(), delay.Round(time.Second), err)
+	if eventSink == nil {
+		logging.Default().Warn(summary)
+		return
+	}
+	eventSink.Emit(event.Event{
+		Type:    event.ModelRetry,
+		TraceID: GetTraceID(ctx),
+		Payload: map[string]string{"summary": summary},
+	})
+}
+
+func streamWithRetry(ctx context.Context, p Provider, params llm.CallParams, sink *trackingSink, throttle *RoleThrottle, usageFn UsageRecorder, eventSink event.Sink, role string, policy retryPolicy) (*llm.StreamResult, error) {
 	if p == nil {
 		return nil, fmt.Errorf("no active LLM provider")
 	}
@@ -447,7 +469,9 @@ func streamWithRetry(ctx context.Context, p Provider, params llm.CallParams, sin
 			if attempt == policy.maxRetries {
 				return nil, &RetryExhaustedError{Provider: p.Name(), Attempts: attempt + 1, Err: callErr}
 			}
-			if err := waitForRetry(ctx, retryDelay(policy, attempt, callErr)); err != nil {
+			delay := retryDelay(policy, attempt, callErr)
+			logRetryWait(ctx, eventSink, role, p, attempt, policy.maxRetries, delay, callErr)
+			if err := waitForRetry(ctx, delay); err != nil {
 				return nil, err
 			}
 			sink.reset()

@@ -222,9 +222,14 @@ func (h *HITLManager) promptInteractive(req HITLRequest) HITLResponse {
 	fmt.Println("  [n] reject   — veto, agent will pick another approach")
 	fmt.Println("  [m] modify   — veto and provide guidance to the agent")
 
+	return readInteractiveDecision()
+}
+
+func readInteractiveDecision() HITLResponse {
 	for {
 		raw, err := security.ReadLine("Your choice [y/n/m]: ")
 		if err != nil {
+			fmt.Println("[hitl] input closed; rejected")
 			return HITLResponse{Decision: HITLReject}
 		}
 		choice := strings.ToLower(strings.TrimSpace(raw))
@@ -236,7 +241,11 @@ func (h *HITLManager) promptInteractive(req HITLRequest) HITLResponse {
 			fmt.Println("[hitl] rejected")
 			return HITLResponse{Decision: HITLReject}
 		case "m", "modify":
-			fb, _ := security.ReadLine("Feedback for the agent: ")
+			fb, err := security.ReadLine("Feedback for the agent: ")
+			if err != nil {
+				fmt.Println("[hitl] feedback input closed; rejected")
+				return HITLResponse{Decision: HITLReject}
+			}
 			fb = strings.TrimSpace(fb)
 			fmt.Println("[hitl] modified with feedback")
 			return HITLResponse{Decision: HITLModify, Feedback: fb}

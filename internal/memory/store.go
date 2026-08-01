@@ -5,8 +5,6 @@ package memory
 import (
 	"encoding/json"
 	"fmt"
-	"go-code-agent/internal/config"
-	"go-code-agent/internal/store"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,6 +12,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/logging"
+	"go-code-agent/internal/store"
 )
 
 // Store persists user preferences, lessons, and facts across sessions.
@@ -29,7 +31,7 @@ type Store struct {
 func NewStore(dataDir string) *Store {
 	dailyDir := filepath.Join(dataDir, "daily")
 	if err := store.EnsurePrivateDir(dailyDir); err != nil {
-		fmt.Fprintf(os.Stderr, "[warn] memory: create daily dir: %v\n", err)
+		logging.Default().Warn(fmt.Sprintf("memory: create daily dir: %v", err))
 	}
 	s := &Store{dataDir: dataDir, dailyDir: dailyDir}
 	s.cleanExpired()
@@ -65,7 +67,7 @@ func (s *Store) cleanExpired() {
 		}
 	}
 	if removed > 0 {
-		fmt.Printf("[memory] cleaned %d expired daily files (older than %d days)\n", removed, config.MemoryTTLDays)
+		logging.Default().Info(fmt.Sprintf("memory: cleaned %d expired daily files (older than %d days)", removed, config.MemoryTTLDays))
 	}
 }
 

@@ -16,6 +16,7 @@ const (
 	SessionActivated  EventType = "session_activated"
 	AgentStarted      EventType = "agent_started"
 	ModelCalled       EventType = "model_called"
+	ModelRetry        EventType = "model_retry" // retry backoff wait / provider fallback
 	ToolStarted       EventType = "tool_started"
 	ToolFinished      EventType = "tool_finished"
 	ApprovalRequested EventType = "approval_requested"

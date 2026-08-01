@@ -7,6 +7,7 @@ import (
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/history"
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/logging"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/store"
@@ -225,9 +226,6 @@ func buildCompressInput(msgs []llm.Message) string {
 // AutoCompact performs progressive compaction: summarizes the older prefix
 // and keeps recent turns verbatim.
 func (c *Compression) AutoCompact(ctx context.Context, msgs []llm.Message, sys string) []llm.Message {
-	origCount := len(msgs)
-	origTokens := llm.EstimateRequestTokens(msgs, nil)
-
 	// Choose the prefix/tail split. If no safe prefix can be removed, keep the
 	// original context unchanged and do not create a misleading checkpoint.
 	split := findCompactionSplit(msgs, c.keepRecent)
@@ -235,20 +233,23 @@ func (c *Compression) AutoCompact(ctx context.Context, msgs []llm.Message, sys s
 		return msgs
 	}
 
-	// Save full transcript (agent-private: raw conversation content)
+	// Save full transcript (agent-private: raw conversation content).
 	tDir := filepath.Join(c.dataDir, "transcripts")
-	store.EnsurePrivateDir(tDir)
+	_ = store.EnsurePrivateDir(tDir)
 	tPath := filepath.Join(tDir, fmt.Sprintf("transcript_%d.jsonl", time.Now().Unix()))
 	if f, err := store.OpenPrivateAppend(tPath); err == nil {
 		enc := json.NewEncoder(f)
 		for _, m := range msgs {
-			enc.Encode(m)
+			if err := enc.Encode(m); err != nil {
+				logging.Default().Warn(fmt.Sprintf("compaction transcript write failed: %v", err))
+				break
+			}
 		}
-		f.Close()
+		_ = f.Close()
+	} else {
+		logging.Default().Warn(fmt.Sprintf("compaction transcript open failed: %v", err))
 	}
-	fmt.Printf("[transcript saved: %s]\n", tPath)
 
-	// Summarize the prefix
 	prefix := msgs[:split]
 	var toSummarize []llm.Message
 	for _, m := range prefix {
@@ -268,7 +269,9 @@ func (c *Compression) AutoCompact(ctx context.Context, msgs []llm.Message, sys s
 			}))},
 	})
 	if err != nil || resp == nil || strings.TrimSpace(resp.Content) == "" {
-		fmt.Printf("[compaction skipped: summary unavailable]\n")
+		if err != nil {
+			logging.Default().Warn(fmt.Sprintf("compaction summary unavailable: %v", err))
+		}
 		return msgs
 	}
 	summary := resp.Content
@@ -280,23 +283,19 @@ func (c *Compression) AutoCompact(ctx context.Context, msgs []llm.Message, sys s
 	if c.histStore != nil {
 		covered := compactedHistoryCoverage(c.histStore.WrittenCount(), len(msgs), split, persistedBoundaryFromCtx(ctx))
 		if covered <= 0 {
-			fmt.Printf("[compaction skipped: no persisted history covered]\n")
 			return msgs
 		}
 		if err := c.histStore.AppendCheckpoint(summary, covered); err != nil {
-			fmt.Printf("[compaction skipped: checkpoint write failed: %v]\n", err)
+			logging.Default().Warn(fmt.Sprintf("compaction checkpoint write failed: %v", err))
 			return msgs
 		}
 		if err := c.histStore.Sync(); err != nil {
-			fmt.Printf("[compaction skipped: checkpoint sync failed: %v]\n", err)
+			logging.Default().Warn(fmt.Sprintf("compaction checkpoint sync failed: %v", err))
 			return msgs
 		}
-		fmt.Printf("[history] checkpoint saved (covered %d entries)\n", covered)
 	}
 
 	tail := msgs[split:]
-	fmt.Printf("[compacted %d/%d messages (~%d tokens) into %d-char summary; kept %d recent]\n",
-		len(prefix), origCount, origTokens, len(summary), len(tail))
 
 	// Remap caller-tracked persisted-boundary in place after the slice
 	// is rebuilt, matching original.

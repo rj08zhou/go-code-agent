@@ -300,7 +300,11 @@ func wireAgent(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionI
 }
 
 func wireObservability(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionDir string) {
-	sinks := []event.Sink{event.NewConsoleSink(), event.NewAuditSink(), event.NewUsageSink()}
+	// session.log is the authoritative structured event record. Keep the
+	// terminal sink for user-facing summaries; audit and usage events are
+	// already captured by SessionLogSink and should not be duplicated in
+	// agent.log.
+	sinks := []event.Sink{event.NewConsoleSink()}
 	if sessionLog, logErr := event.NewSessionLogSink(filepath.Join(sessionDir, "session.log")); logErr != nil {
 		fmt.Fprintf(os.Stderr, "[warn] session.log: %v\n", logErr)
 	} else {
@@ -311,6 +315,7 @@ func wireObservability(rt *SessionRuntime, params RunnerParams, wb *wireBundle, 
 	wb.runner.SetEventSink(allEvents)
 	wb.subagent.SetEventSink(allEvents)
 	wb.teamMgr.SetEventSink(allEvents)
+	rt.gateway.SetEventSink(allEvents)
 
 	rt.AddHook("team", func() error { wb.teamMgr.ShutdownAll(); wb.teamMgr.Wait(); return nil })
 	rt.AddHook("mcp", func() error { params.MCPMgr.Shutdown(); return nil })

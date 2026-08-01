@@ -20,6 +20,36 @@ import (
 
 // --- HITLApprovalAdapter ---
 
+func TestInteractiveDecisionPreservesNaturalLanguageFeedback(t *testing.T) {
+	calls := setReviewAnswers(t, "m", "please use tabs")
+	response := readInteractiveDecision()
+	if response.Decision != HITLModify {
+		t.Fatalf("decision = %v, want modify", response.Decision)
+	}
+	if response.Feedback != "please use tabs" {
+		t.Fatalf("feedback = %q, want complete natural-language input", response.Feedback)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("input calls = %d, want choice and feedback", got)
+	}
+}
+
+func TestInteractiveDecisionRejectsWhenFeedbackInputCloses(t *testing.T) {
+	setReviewAnswers(t, "m")
+	response := readInteractiveDecision()
+	if response.Decision != HITLReject {
+		t.Fatalf("decision = %v, want fail-closed rejection", response.Decision)
+	}
+}
+
+func TestInteractiveDecisionTrimsChoiceWhitespace(t *testing.T) {
+	setReviewAnswers(t, "  y   ")
+	response := readInteractiveDecision()
+	if response.Decision != HITLApprove {
+		t.Fatalf("decision = %v, want approval", response.Decision)
+	}
+}
+
 func TestHITLApprovalAdapter_AllowsSafeTool(t *testing.T) {
 	mgr := NewHITLManager(nil)
 	mgr.SetEnabled(true)

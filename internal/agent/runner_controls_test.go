@@ -14,6 +14,33 @@ import (
 	"go-code-agent/internal/tool"
 )
 
+func TestToolEventPayloadOnlyExposesInvestigationMetadata(t *testing.T) {
+	read := toolEventPayload(llm.ToolCall{
+		Name:      "read_file",
+		Arguments: `{"path":"internal/event/sinks.go","offset":60,"limit":12}`,
+	})
+	if read["path"] != "internal/event/sinks.go" || read["offset"] != "60" || read["limit"] != "12" {
+		t.Fatalf("read_file payload = %#v", read)
+	}
+	search := toolEventPayload(llm.ToolCall{
+		Name:      "search_content",
+		Arguments: `{"pattern":"ConsoleSink","path":"internal/event"}`,
+	})
+	if search["path"] != "internal/event" || search["pattern"] != "ConsoleSink" {
+		t.Fatalf("search_content payload = %#v", search)
+	}
+	list := toolEventPayload(llm.ToolCall{Name: "list_dir", Arguments: `{}`})
+	if list["path"] != "." {
+		t.Fatalf("list_dir payload = %#v", list)
+	}
+	if payload := toolEventPayload(llm.ToolCall{
+		Name:      "write_file",
+		Arguments: `{"path":"secret.txt","content":"do not expose"}`,
+	}); payload != nil {
+		t.Fatalf("write arguments leaked into event payload: %#v", payload)
+	}
+}
+
 func TestRunner_BlocksRepeatedIdenticalToolCalls(t *testing.T) {
 	fake := &fakeProvider{name: "fake", content: "continue"}
 	gateway := model.NewGateway(fake, model.NewRoleThrottle(10))

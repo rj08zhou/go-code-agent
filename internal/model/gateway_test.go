@@ -3,9 +3,11 @@ package model
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"go-code-agent/internal/event"
 	"go-code-agent/internal/llm"
 )
 
@@ -542,4 +544,61 @@ func (s *collectTestSink) OnTextDelta(text string) { s.text += text }
 func (s *collectTestSink) OnDone() {
 	s.done = true
 	s.doneCount++
+}
+
+// collectEventSink records emitted events (implements event.Sink).
+type collectEventSink struct {
+	events []event.Event
+}
+
+func (s *collectEventSink) Emit(e event.Event) { s.events = append(s.events, e) }
+
+func (s *collectEventSink) summaries() []string {
+	var out []string
+	for _, e := range s.events {
+		if e.Type != event.ModelRetry {
+			continue
+		}
+		if mp, ok := e.Payload.(map[string]string); ok {
+			out = append(out, mp["summary"])
+		}
+	}
+	return out
+}
+
+func TestGateway_RetryAndFallbackEmitModelRetryEvents(t *testing.T) {
+	calls := 0
+	primary := &capsProvider{
+		name: "primary",
+		caps: ProviderCapabilities{Streaming: true},
+		callFn: func(context.Context, llm.CallParams) (*llm.Completion, error) {
+			calls++
+			if calls == 1 {
+				return nil, NewProviderError("primary", 429, "rate_limit_error", errors.New("slow down"))
+			}
+			return nil, NewProviderError("primary", 401, "invalid_api_key", errors.New("bad key"))
+		},
+	}
+	fallback := &capsProvider{name: "backup", caps: ProviderCapabilities{Streaming: true}}
+
+	rec := &collectEventSink{}
+	gw := NewGateway(primary, NewRoleThrottle(4))
+	gw.retry = fastRetryPolicy(3, time.Second)
+	gw.SetEventSink(rec)
+	gw.SetFallbacks("lead", fallback)
+
+	if _, err := gw.Call(context.Background(), "lead", llm.CallParams{Model: "test"}); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+
+	got := rec.summaries()
+	if len(got) != 2 {
+		t.Fatalf("ModelRetry events = %d (%v), want 2 (1 retry + 1 fallback)", len(got), got)
+	}
+	if !strings.Contains(got[0], "llm retry 1/3") || !strings.Contains(got[0], "provider=primary") {
+		t.Fatalf("retry summary = %q", got[0])
+	}
+	if !strings.Contains(got[1], "provider fallback") || !strings.Contains(got[1], "primary → backup") {
+		t.Fatalf("fallback summary = %q", got[1])
+	}
 }

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -152,4 +154,59 @@ func newApprovalTestRepl() *repl {
 	return &repl{built: &application.BuiltRunner{Security: application.SecurityFacade{
 		HITL: hitl, Approval: approval,
 	}}}
+}
+
+type stubWebService struct {
+	output string
+	err    error
+}
+
+func (s stubWebService) Fetch(context.Context, string) (string, error) { return "", nil }
+func (s stubWebService) Search(context.Context, string) (string, error) {
+	return s.output, s.err
+}
+
+func TestRunSearchAlwaysReturnsFeedback(t *testing.T) {
+	tests := []struct {
+		name string
+		web  stubWebService
+		set  bool
+		want string
+	}{
+		{name: "unavailable", want: "Web search is unavailable."},
+		{name: "failure", set: true, web: stubWebService{err: errors.New("backend down")}, want: "Search failed: backend down"},
+		{name: "empty", set: true, web: stubWebService{output: " \n"}, want: "No search results."},
+		{name: "results", set: true, web: stubWebService{output: " result \n"}, want: "result"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &repl{built: &application.BuiltRunner{}}
+			if tc.set {
+				r.built.Runtime.Web = tc.web
+			}
+			if got := r.runSearch(context.Background(), "query"); got != tc.want {
+				t.Fatalf("runSearch() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatInboxMessagesIsReadableAndTerminalSafe(t *testing.T) {
+	if got := formatInboxMessages(nil); got != "Inbox is empty." {
+		t.Fatalf("empty inbox = %q", got)
+	}
+	got := formatInboxMessages([]map[string]any{{
+		"from":       "alice",
+		"type":       "plan_request",
+		"request_id": "plan-1",
+		"content":    "review this\n\x1b[31mplan",
+	}})
+	for _, want := range []string{"Inbox (1):", "[plan_request]", "from alice", "request_id=plan-1", `review this\n\x1b[31mplan`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("inbox output %q does not contain %q", got, want)
+		}
+	}
+	if strings.ContainsRune(got, '\x1b') || strings.Contains(got, `{"from"`) {
+		t.Fatalf("inbox output is unsafe or raw JSON: %q", got)
+	}
 }

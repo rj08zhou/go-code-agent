@@ -49,7 +49,7 @@ func TestRenderBannerShowsOneCompleteStatusCard(t *testing.T) {
 		"Approval: safe-auto",
 		"Judge: on",
 		"MCP: 0 active  |  0 pending  |  0 failed",
-		"Type a message, /help for commands, Ctrl-D to exit.",
+		"Type a message; /help for commands; Ctrl-C clears input or interrupts a turn; Ctrl-D exits.",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("banner %q does not contain %q", got, want)
