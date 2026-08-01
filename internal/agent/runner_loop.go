@@ -266,15 +266,6 @@ func (r *Runner) prepareRound(
 			r.turn.planning.HasOpenItems, r.turn.planning.LastTriggered,
 			taskCount, progressSummary,
 		)
-		if resetF {
-			r.turn.failure.clearConsecutive()
-		}
-		if resetNag {
-			r.turn.planning.clearRoundsWithoutTodo()
-		}
-		if resetStuck {
-			r.turn.failure.clearRoundsSinceComplete()
-		}
 		for _, k := range triggered {
 			r.turn.planning.markTriggered(k, r.turn.rounds)
 			r.emit(event.Event{
@@ -287,6 +278,17 @@ func (r *Runner) prepareRound(
 					"prompt_count":          fmt.Sprintf("%d", len(reflPrompts)),
 				},
 			})
+		}
+		// Reset counters only after the events above captured the values
+		// that actually satisfied the trigger conditions.
+		if resetF {
+			r.turn.failure.clearConsecutive()
+		}
+		if resetNag {
+			r.turn.planning.clearRoundsWithoutTodo()
+		}
+		if resetStuck {
+			r.turn.failure.clearRoundsSinceComplete()
 		}
 		for _, p := range reflPrompts {
 			messages = append(messages, llm.UserMessage(p))

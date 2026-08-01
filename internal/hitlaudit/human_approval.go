@@ -3,12 +3,14 @@ package hitlaudit
 import (
 	"encoding/json"
 	"fmt"
-	"go-code-agent/internal/prompt"
-	"go-code-agent/internal/security"
-	"go-code-agent/internal/utils"
 	"os"
 	"strings"
 	"sync"
+	"unicode"
+
+	"go-code-agent/internal/prompt"
+	"go-code-agent/internal/security"
+	"go-code-agent/internal/utils"
 )
 
 func isStdinTTY() bool {
@@ -161,9 +163,8 @@ func (h *HITLManager) RequestApproval(req HITLRequest) HITLResponse {
 		fmt.Println("[hitl] auto-approved")
 		return HITLResponse{Decision: HITLApprove}
 	case HITLModeSafeOnly:
-		// Show preview but auto-approve RiskSafe; prompt for RiskDanger.
+		// Auto-approve safe requests; the interactive panel fully renders risky ones.
 		if strings.EqualFold(req.RiskLevel, "danger") || strings.EqualFold(req.RiskLevel, "high") {
-			h.printReviewHeader(req)
 			return h.promptInteractive(req)
 		}
 		h.printReviewHeader(req)
@@ -215,8 +216,9 @@ func (h *HITLManager) promptInteractive(req HITLRequest) HITLResponse {
 		fmt.Printf("  Reason     : %s\n", req.Reason)
 	}
 	fmt.Println(strings.Repeat("-", 60))
-	fmt.Println("  Arguments  :")
-	fmt.Println(indent(prettyPrintArgs(req.Arguments), "    "))
+	label, details := approvalDetails(req)
+	fmt.Printf("  %-11s:\n", label)
+	fmt.Println(indent(details, "    "))
 	fmt.Println(divider)
 	fmt.Println("  [y] approve  — run the tool as-is")
 	fmt.Println("  [n] reject   — veto, agent will pick another approach")
@@ -279,6 +281,21 @@ func extractBashCommand(arguments string) string {
 		return v
 	}
 	return ""
+}
+
+func approvalDetails(req HITLRequest) (string, string) {
+	if req.ToolName == "bash" {
+		if command := extractBashCommand(req.Arguments); command != "" {
+			command = strings.Map(func(r rune) rune {
+				if unicode.IsControl(r) {
+					return ' '
+				}
+				return r
+			}, command)
+			return "Command", utils.Truncate(command, 1500)
+		}
+	}
+	return "Arguments", prettyPrintArgs(req.Arguments)
 }
 
 func prettyPrintArgs(arguments string) string {

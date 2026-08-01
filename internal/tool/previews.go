@@ -36,8 +36,10 @@ func previewWriteFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, e
 
 func previewEditFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, error) {
 	var a struct {
-		Path, OldText, NewText string
-		ReplaceAll             bool `json:"replace_all"`
+		Path       string `json:"path"`
+		OldText    string `json:"old_text"`
+		NewText    string `json:"new_text"`
+		ReplaceAll bool   `json:"replace_all"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return PreviewRequest{}, err

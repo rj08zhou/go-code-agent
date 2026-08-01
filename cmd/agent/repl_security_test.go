@@ -38,7 +38,7 @@ func TestHandleSecurityCommand(t *testing.T) {
 		{
 			name: "dangerous command requires confirmation",
 			raw:  "/security test-bash rm file.txt",
-			want: []string{"Risk: danger", "Decision: confirm", "Reason: potentially dangerous"},
+			want: []string{"Risk: danger", "Decision: confirm", "Reason: command matches a potentially dangerous pattern"},
 		},
 		{
 			name: "denied command",

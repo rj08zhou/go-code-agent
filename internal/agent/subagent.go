@@ -322,7 +322,8 @@ func (t *truncateSanitizer) Sanitize(s string) string {
 	// re-read the same file (which wastes rounds): to see the rest, page with
 	// read_file offset/limit, or grep for the specific symbol with
 	// search_content instead of reading the whole file.
-	headLen := t.maxLen - 256
+	const tailLen = 512
+	headLen := t.maxLen - tailLen
 	notice := fmt.Sprintf(
 		"\n... (output capped at %d chars; content omitted here) ...\n"+
 			"To continue, re-run read_file with an offset past the lines shown above, "+

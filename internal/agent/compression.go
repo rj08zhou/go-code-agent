@@ -165,7 +165,6 @@ func MicroCompact(msgs []llm.Message, minClearBytes int) (cleared int, reclaimed
 // buildCompressInput renders a message prefix into compact structured text.
 func buildCompressInput(msgs []llm.Message) string {
 	const maxMsgChars = 500
-	const maxToolChars = 200
 	const maxArgChars = 120
 	const maxTotalChars = 40000
 
@@ -209,7 +208,7 @@ func buildCompressInput(msgs []llm.Message) string {
 			if name == "" {
 				name = "unknown"
 			}
-			lines = append(lines, fmt.Sprintf("  [tool:%s]: %s", name, utils.Truncate(m.Content, maxToolChars)))
+			lines = append(lines, fmt.Sprintf("  [tool:%s]: %s", name, utils.Truncate(m.Content, config.CompressToolOutputChars)))
 		}
 	}
 	all := strings.Join(lines, "\n")
