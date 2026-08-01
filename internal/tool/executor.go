@@ -37,16 +37,22 @@ type PreviewApprovalChecker interface {
 	AllowToolWithPreview(toolName string, args json.RawMessage, preview string) (bool, string)
 }
 
-// DetailedApprovalChecker preserves HITL's allow/reject/modify decision.
+// DetailedApprovalChecker preserves HITL's allow/reject/modify decision and
+// returns any approved replacement content with the same invocation result.
 type DetailedApprovalChecker interface {
-	DecideTool(toolName string, args json.RawMessage, preview string) (ApprovalDecision, string, string)
+	DecideTool(toolName string, args json.RawMessage, preview ApprovalPreview) ApprovalResult
 }
 
-// ContentProvider exposes partially-accepted content from chunk-by-chunk
-// diff review, so the executor can replace the content arg before the
-// handler runs.
-type ContentProvider interface {
-	AcceptedContent() string
+type ApprovalPreview struct {
+	Text     string
+	Mutation *PreviewRequest
+}
+
+type ApprovalResult struct {
+	Decision           ApprovalDecision
+	Reason             string
+	Feedback           string
+	ReplacementContent *string
 }
 
 type ApprovalDecision int
@@ -75,6 +81,15 @@ func NewExecutor(catalog *ToolCatalog, approval ApprovalChecker, network Network
 	}
 }
 
+// Definition returns the current immutable definition for a registered tool.
+func (e *Executor) Definition(name string) (ToolDefinition, bool) {
+	if e == nil || e.catalog == nil {
+		return ToolDefinition{}, false
+	}
+	definition, ok := e.catalog.Load().Definitions[name]
+	return definition, ok
+}
+
 // Execute runs a single tool call through the full security+execution pipeline.
 func (e *Executor) Execute(ctx context.Context, scope *ToolScope, tc llm.ToolCall) Result {
 	started := time.Now()
@@ -91,6 +106,9 @@ func (e *Executor) Execute(ctx context.Context, scope *ToolScope, tc llm.ToolCal
 	handler, hasHandler := snap.Handlers[tc.Name]
 	if !known || !hasHandler {
 		return Unavailable(fmt.Sprintf("unknown tool %q", tc.Name))
+	}
+	if scope == nil {
+		return Denied(fmt.Sprintf("tool %q requires an execution scope", tc.Name))
 	}
 
 	// 3. Check capability via scope
@@ -119,44 +137,45 @@ func (e *Executor) Execute(ctx context.Context, scope *ToolScope, tc llm.ToolCal
 	}
 
 	// 4. Compute a mutation preview before approval and before the handler runs.
-	preview := ""
-	if def.Preview != nil && (scope == nil || scope.DiffPreview == nil) {
+	approvalPreview := ApprovalPreview{}
+	if def.Preview != nil && scope.DiffPreview == nil {
 		return Denied("mutation preview service is required for this tool")
 	}
-	if def.Preview != nil && scope != nil && scope.DiffPreview != nil {
+	if def.Preview != nil && scope.DiffPreview != nil {
 		req, err := def.Preview(scope, json.RawMessage(tc.Arguments))
 		if err != nil {
 			return Denied(fmt.Sprintf("cannot create mutation preview: %v", err))
 		}
-		if req.Delete {
-			preview, err = scope.DiffPreview.PreviewDelete(req.Path)
-		} else {
-			preview, err = scope.DiffPreview.Preview(req.Path, req.Content)
-		}
+		approvalPreview.Text, err = scope.DiffPreview.PreviewChange(
+			req.Path,
+			req.OriginalContent,
+			req.Content,
+		)
 		if err != nil {
 			return Denied(fmt.Sprintf("cannot create mutation preview: %v", err))
 		}
+		approvalPreview.Mutation = &req
 	}
 
 	// 5. Approval check — preview-aware HITL runs before mutation.
+	var replacementContent *string
 	if e.approval != nil {
 		if detailed, ok := e.approval.(DetailedApprovalChecker); ok {
-			decision, reason, feedback := detailed.DecideTool(tc.Name, json.RawMessage(tc.Arguments), preview)
-			switch decision {
+			approvalResult := detailed.DecideTool(tc.Name, json.RawMessage(tc.Arguments), approvalPreview)
+			switch approvalResult.Decision {
 			case ApprovalRejected:
-				return Rejected(reason)
+				return Rejected(approvalResult.Reason)
 			case ApprovalModified:
-				return Modified(feedback)
+				return Modified(approvalResult.Feedback)
 			}
-			// If the adapter produced accepted content (chunk-by-chunk diff review),
-			// replace the content field in the args so the handler uses it.
-			if cp, ok2 := e.approval.(ContentProvider); ok2 {
-				if accepted := cp.AcceptedContent(); accepted != "" {
-					tc.Arguments = replaceContentArg(tc.Arguments, accepted)
+			if approvalResult.ReplacementContent != nil {
+				if approvalPreview.Mutation == nil || approvalPreview.Mutation.Delete {
+					return Denied("approval returned replacement content for a non-write mutation")
 				}
+				replacementContent = approvalResult.ReplacementContent
 			}
 		} else if checker, ok := e.approval.(PreviewApprovalChecker); ok {
-			if allowed, reason := checker.AllowToolWithPreview(tc.Name, json.RawMessage(tc.Arguments), preview); !allowed {
+			if allowed, reason := checker.AllowToolWithPreview(tc.Name, json.RawMessage(tc.Arguments), approvalPreview.Text); !allowed {
 				return Rejected(reason)
 			}
 		} else if allowed, reason := e.approval.AllowTool(tc.Name, json.RawMessage(tc.Arguments)); !allowed {
@@ -201,14 +220,25 @@ func (e *Executor) Execute(ctx context.Context, scope *ToolScope, tc llm.ToolCal
 	resultCh := make(chan Result, 1)
 	handlerScope := *scope
 	handlerScope.Context = callCtx
+	if approvalPreview.Mutation != nil {
+		request := *approvalPreview.Mutation
+		request.OriginalContent = append([]byte(nil), request.OriginalContent...)
+		request.Content = append([]byte(nil), request.Content...)
+		if replacementContent != nil {
+			request.Content = []byte(*replacementContent)
+		}
+		handlerScope.approvedMutation = &request
+	}
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				resultCh <- Failed(fmt.Sprintf("tool panicked: %v", r))
-			}
+		result := func() (result Result) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					result = Failed(fmt.Sprintf("tool panicked: %v", recovered))
+				}
+			}()
+			return handler(&handlerScope, json.RawMessage(tc.Arguments))
 		}()
-		result := handler(&handlerScope, json.RawMessage(tc.Arguments))
-		if e.sanitizer != nil && result.Succeeded() {
+		if e.sanitizer != nil {
 			result.Output = e.sanitizer.Sanitize(result.Output)
 		}
 		resultCh <- result
@@ -304,32 +334,6 @@ func pathAllowed(scope *ToolScope, raw string) bool {
 		}
 	}
 	return false
-}
-
-// replaceContentArg substitutes the "content" field in a JSON arguments string
-// with the accepted content from chunk-by-chunk diff review.
-func replaceContentArg(args string, content string) string {
-	var m map[string]any
-	if json.Unmarshal([]byte(args), &m) != nil {
-		return args
-	}
-	if _, ok := m["content"]; ok {
-		m["content"] = content
-		b, err := json.Marshal(m)
-		if err != nil {
-			return args
-		}
-		return string(b)
-	}
-	if _, ok := m["new_text"]; ok {
-		m["new_text"] = content
-		b, err := json.Marshal(m)
-		if err != nil {
-			return args
-		}
-		return string(b)
-	}
-	return args
 }
 
 // extractURL tries to pull a "url" or "URL" field from raw JSON tool arguments.

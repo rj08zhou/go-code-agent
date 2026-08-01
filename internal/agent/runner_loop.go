@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
@@ -34,6 +35,52 @@ func (r *Runner) emit(e event.Event) {
 	r.eventSink.Emit(e)
 }
 
+// toolEventPayload exposes only non-sensitive display metadata for filesystem
+// investigation tools. It never copies file contents or mutation text.
+func toolEventPayload(tc llm.ToolCall) map[string]string {
+	var args struct {
+		Path    string `json:"path"`
+		Pattern string `json:"pattern"`
+		Offset  int    `json:"offset"`
+		Limit   int    `json:"limit"`
+	}
+	if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
+		return nil
+	}
+
+	payload := map[string]string{}
+	switch tc.Name {
+	case "read_file":
+		if args.Path == "" {
+			return nil
+		}
+		payload["path"] = args.Path
+		if args.Offset > 0 {
+			payload["offset"] = fmt.Sprintf("%d", args.Offset)
+		}
+		if args.Limit > 0 {
+			payload["limit"] = fmt.Sprintf("%d", args.Limit)
+		}
+	case "list_dir":
+		payload["path"] = args.Path
+		if args.Path == "" {
+			payload["path"] = "."
+		}
+	case "search_file", "search_content":
+		if args.Pattern == "" {
+			return nil
+		}
+		payload["pattern"] = args.Pattern
+		payload["path"] = args.Path
+		if args.Path == "" {
+			payload["path"] = "."
+		}
+	default:
+		return nil
+	}
+	return payload
+}
+
 func (r *Runner) injectTurnContext(messages []llm.Message) []llm.Message {
 	r.turn.originalTask = lastUserMessage(messages)
 	messages = r.injectDynamicContext(messages)
@@ -59,7 +106,7 @@ func (r *Runner) injectMemoryRecall(messages []llm.Message) []llm.Message {
 	if recalled == "" || recalled == "No memories found." {
 		return messages
 	}
-	return append(messages, llm.UserMessage("Relevant memory:\n"+recalled))
+	return append(messages, llm.UserMessage("<memory-recall>\n"+recalled+"\n</memory-recall>"))
 }
 
 // prepareRound runs pre-LLM housekeeping for one loop iteration.
@@ -130,18 +177,21 @@ func (r *Runner) prepareRound(
 			if r.profile.Role == "explore" {
 				r.turn.tokens.PromptUsed += int64(r.turn.tokens.Cached)
 			}
+			before := len(messages)
 			messages = r.compress.AutoCompact(ctx, messages, r.profile.SystemPrompt)
-			// Invalidate cache after compaction since the message slice
-			// was rebuilt.
+			// Invalidate cache after a compaction attempt since the summary call
+			// and any rebuilt message slice make the estimate stale.
 			r.turn.tokens.invalidateCache()
-			r.emit(event.Event{
-				Type:    event.ContextDecision,
-				TraceID: traceID,
-				Payload: map[string]string{
-					"action": "auto_compact",
-					"rounds": fmt.Sprintf("%d", r.turn.rounds),
-				},
-			})
+			if len(messages) < before {
+				r.emit(event.Event{
+					Type:    event.ContextDecision,
+					TraceID: traceID,
+					Payload: map[string]string{
+						"action":  "auto_compact",
+						"summary": fmt.Sprintf("%d -> %d messages", before, len(messages)),
+					},
+				})
+			}
 		}
 	}
 
@@ -183,8 +233,7 @@ func (r *Runner) prepareRound(
 	// --- Planning gate (round 0 & 1 only) ---
 	if r.planGate != nil && r.turn.rounds <= 1 {
 		if planMsg := r.planGate.Eval(
-			r.turn.rounds, r.turn.planning.UsedPlanning, r.turn.planning.UsedThink, r.turn.explore.Used,
-			r.turn.originalTask,
+			r.turn.rounds, r.turn.planning.PlanEstablished, r.turn.originalTask,
 		); planMsg != "" {
 			r.emit(event.Event{
 				Type:    event.PlanningDecision,
@@ -217,15 +266,6 @@ func (r *Runner) prepareRound(
 			r.turn.planning.HasOpenItems, r.turn.planning.LastTriggered,
 			taskCount, progressSummary,
 		)
-		if resetF {
-			r.turn.failure.clearConsecutive()
-		}
-		if resetNag {
-			r.turn.planning.clearRoundsWithoutTodo()
-		}
-		if resetStuck {
-			r.turn.failure.clearRoundsSinceComplete()
-		}
 		for _, k := range triggered {
 			r.turn.planning.markTriggered(k, r.turn.rounds)
 			r.emit(event.Event{
@@ -238,6 +278,17 @@ func (r *Runner) prepareRound(
 					"prompt_count":          fmt.Sprintf("%d", len(reflPrompts)),
 				},
 			})
+		}
+		// Reset counters only after the events above captured the values
+		// that actually satisfied the trigger conditions.
+		if resetF {
+			r.turn.failure.clearConsecutive()
+		}
+		if resetNag {
+			r.turn.planning.clearRoundsWithoutTodo()
+		}
+		if resetStuck {
+			r.turn.failure.clearRoundsSinceComplete()
 		}
 		for _, p := range reflPrompts {
 			messages = append(messages, llm.UserMessage(p))
@@ -304,21 +355,15 @@ func (r *Runner) callModel(
 		Messages:  messages,
 		Tools:     toolDefs,
 		MaxTokens: r.profile.MaxTokens,
+		Reasoning: reasoningRequestFromConfig(r.cfg),
 	}, newPrefixedSink(r.profile.Role))
 	if err != nil {
 		out.Error = fmt.Errorf("API call failed: %w", err)
 		out.Messages = messages
 		return messages, nil, out
 	}
-	// Accumulate per-round usage for turn-level summary.
-	if !sr.Usage.IsZero() {
-		r.turn.usage.PromptTokens += sr.Usage.PromptTokens
-		r.turn.usage.CompletionTokens += sr.Usage.CompletionTokens
-		r.turn.usage.TotalTokens += sr.Usage.TotalTokens
-		r.turn.usage.CachedReadTokens += sr.Usage.CachedReadTokens
-		r.turn.usage.CacheMissTokens += sr.Usage.CacheMissTokens
-		r.turn.usage.CacheCreateTokens += sr.Usage.CacheCreateTokens
-	}
+	// Accumulate every usage dimension for the turn-level summary.
+	r.turn.usage.Add(sr.Usage)
 	r.emit(event.Event{
 		Type:     event.ModelCalled,
 		TraceID:  traceID,
@@ -362,12 +407,18 @@ func (r *Runner) handleNoToolCalls(
 ) (msgs []llm.Message, cont bool, done TurnOutcome) {
 	out.Completed = true
 
-	// Auto-Lesson: after enough rounds, inject a prompt asking
-	// the model to record lessons, then continue the loop.
+	// Auto-Lesson: after enough rounds with real tool failures, inject a
+	// prompt asking the model to record lessons, then continue the loop.
 	// Only for agents with memory capability (lead agent).
 	// Subagents (explore/teammate) have CanMemory=false and
 	// would fail trying to call memory_write.
-	if r.profile.CanMemory && r.turn.rounds >= config.LessonThreshold && !r.turn.lesson.Written && r.lessonWriter != nil {
+	//
+	// A run that completed without any tool execution failure does not need
+	// a lesson: there is nothing to learn from success. Planning-gate denials
+	// (beforeDenyEarly) are excluded from the failure count, so a run that was
+	// merely told to plan first also does not trigger a lesson.
+	if r.profile.CanMemory && r.turn.rounds >= config.LessonThreshold &&
+		r.turn.failures > 0 && !r.turn.lesson.Written && r.lessonWriter != nil {
 		r.turn.lesson.Written = true
 		r.turn.lesson.RoundsRemaining = config.LessonRoundsLimit
 		r.emit(event.Event{
@@ -381,11 +432,12 @@ func (r *Runner) handleNoToolCalls(
 			messages = append(messages, llm.UserMessage(
 				"<auto-lesson>Record any lessons, preferences, or patterns learned in this session to long-term memory using memory_write.</auto-lesson>"))
 		}
+		out.Completed = false
 		return messages, true, TurnOutcome{}
 	}
 
 	if r.judge != nil && r.judge.IsEnabled() && r.turn.judge.RetryInjects < config.JudgeMaxRetryInjects {
-		taskText := lastUserMessage(messages)
+		taskText := r.turn.originalTask
 		judgeResults := make([]JudgeToolResult, 0, len(out.ToolResults))
 		for _, tr := range out.ToolResults {
 			judgeResults = append(judgeResults, JudgeToolResult{
@@ -397,19 +449,26 @@ func (r *Runner) handleNoToolCalls(
 		}
 		verdict, jerr := r.judge.Verify(ctx, taskText, messages, judgeResults, modelID)
 		if verdict != nil {
-			r.emit(event.Event{
+			judgeEvent := event.Event{
 				Type:    event.JudgeDecision,
 				TraceID: traceID,
+				Status:  "ok",
 				Payload: map[string]string{
 					"score":    fmt.Sprintf("%d", verdict.Score),
 					"approved": fmt.Sprintf("%v", verdict.Approved),
 					"retry":    fmt.Sprintf("%v", verdict.ShouldRetry),
 					"reason":   utils.Truncate(verdict.Reason, 200),
 				},
-			})
+			}
+			if jerr != nil {
+				judgeEvent.Status = "degraded"
+				judgeEvent.Error = utils.Truncate(jerr.Error(), 300)
+			}
+			r.emit(judgeEvent)
 		}
 		if jerr != nil {
-			// Soft-fail open on judge errors (matches original).
+			// Judge availability remains fail-open, but the degraded decision is
+			// explicit in the event stream instead of looking like an approval.
 		} else if verdict != nil && !(verdict.Approved && !verdict.ShouldRetry) {
 			r.turn.judge.RetryInjects++
 			messages = append(messages, llm.UserMessage(verdict.FormatFeedback()))
@@ -457,6 +516,16 @@ func (r *Runner) executeToolBatch(
 	var manualCompress bool
 	var pendingNudges []string
 	hooks := defaultToolInterceptors(r.loader())
+	// Planning authorization is snapshotted for the entire assistant tool-call
+	// batch. A plan created in this batch only authorizes side effects starting
+	// with the next model round.
+	//
+	// The hard guard deliberately does NOT depend on planGate being wired:
+	// planGate only supplies nudge copy, while blocking is a safety property
+	// that must hold even when the optional nudge component is missing.
+	planEstablishedAtBatchStart := r.turn.planning.PlanEstablished
+	enforcePlanning := r.profile.Role == "lead" &&
+		needsPlan(r.turn.originalTask, planEstablishedAtBatchStart)
 
 	for _, tc := range toolCalls {
 		if tc.Arguments != "" && !strings.HasPrefix(tc.Arguments, "{") {
@@ -474,23 +543,54 @@ func (r *Runner) executeToolBatch(
 		env := &toolCallEnv{role: r.profile.Role, turn: &r.turn, key: key}
 
 		toolStart := time.Now()
+		toolPayload := toolEventPayload(tc)
 		r.emit(event.Event{
 			Type:       event.ToolStarted,
 			TraceID:    traceID,
 			ToolCallID: tc.ID,
 			ToolName:   tc.Name,
+			Payload:    toolPayload,
 		})
 
-		// Before hooks: deferred nudges always collected; first non-continue wins.
+		// Before hooks: planning guard runs first, then deferred nudges are
+		// collected and the first non-continue decision wins.
 		var decision beforeDecision
 		var result tool.Result
-		for _, h := range hooks {
-			br := h.Before(env, tc)
-			pendingNudges = append(pendingNudges, br.nudges...)
-			if br.decision != beforeContinue {
-				decision = br.decision
-				result = br.result
-				break
+		if enforcePlanning {
+			definition, known := r.executor.Definition(tc.Name)
+			if classification, blocked := unplannedToolBlock(definition, known); blocked {
+				reason := fmt.Sprintf(
+					"tool %q blocked: this non-trivial run has no established plan (%s); "+
+						"successfully call TodoWrite or task_create, then retry this tool in the next model round",
+					tc.Name, classification,
+				)
+				decision = beforeDenyEarly
+				result = tool.Denied(reason)
+				r.emit(event.Event{
+					Type:       event.PlanningDecision,
+					TraceID:    traceID,
+					ToolCallID: tc.ID,
+					ToolName:   tc.Name,
+					Status:     "blocked",
+					Error:      reason,
+					Output:     fmt.Sprintf("round=%d classification=%s", r.turn.rounds, classification),
+					Payload: map[string]string{
+						"action":         "block_unplanned_side_effect",
+						"classification": classification,
+						"round":          fmt.Sprintf("%d", r.turn.rounds),
+					},
+				})
+			}
+		}
+		if decision == beforeContinue {
+			for _, h := range hooks {
+				br := h.Before(env, tc)
+				pendingNudges = append(pendingNudges, br.nudges...)
+				if br.decision != beforeContinue {
+					decision = br.decision
+					result = br.result
+					break
+				}
 			}
 		}
 
@@ -500,13 +600,16 @@ func (r *Runner) executeToolBatch(
 				Name: tc.Name, Args: tc.Arguments, Status: result.Status, Output: result.Output,
 			})
 			messages = append(messages, llm.ToolMessage(result.ToToolMessage(), tc.ID))
-			r.turn.failures++
-			turnFailCount++
+			// Planning-gate denials are not execution failures: the tool never
+			// ran. Counting them as failures would inflate lesson triggers and
+			// reflection/stuck heuristics. The model just needs to establish a
+			// plan first; that is expected flow, not a lesson to learn.
 			turnToolCount++
 			r.emit(event.Event{
 				Type: event.ToolFinished, TraceID: traceID,
 				ToolCallID: tc.ID, ToolName: tc.Name,
 				Duration: time.Since(toolStart), Status: string(result.Status), Output: result.Output,
+				Payload: toolPayload,
 			})
 			continue
 		case beforeOverride:
@@ -537,6 +640,7 @@ func (r *Runner) executeToolBatch(
 			Duration:   time.Since(toolStart),
 			Status:     string(result.Status),
 			Output:     result.Output,
+			Payload:    toolPayload,
 		})
 
 		if !result.Succeeded() {
@@ -584,13 +688,14 @@ func (r *Runner) afterTools(
 		r.turn.tokens.invalidateCache()
 	}
 
-	// Lesson stage budget: if the model was given a lesson prompt, limit
-	// how many extra rounds it can use before we force a wrap-up.
+	// Lesson stage budget: stop cleanly if lesson collection keeps calling
+	// tools beyond its bounded extra rounds.
 	if r.turn.lesson.Written {
 		r.turn.lesson.RoundsRemaining--
 		if r.turn.lesson.RoundsRemaining <= 0 {
 			out.Rounds = r.turn.rounds
 			out.ToolFailures = r.turn.failures
+			out.StoppedReason = "lesson_budget"
 			out.Messages = messages
 			r.emit(event.Event{
 				Type:    event.TurnComplete,

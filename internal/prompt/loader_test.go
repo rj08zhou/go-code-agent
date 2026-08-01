@@ -29,7 +29,6 @@ func TestRequiredTemplatesPresent(t *testing.T) {
 		"session_to_memory",
 		"judge_critical",
 		"judge_system",
-		"think_required",
 		"planning_required",
 		"strategy_change",
 		"todo_nag",

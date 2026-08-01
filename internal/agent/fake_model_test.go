@@ -23,6 +23,9 @@ type fakeProvider struct {
 	content      string
 	finishReason string
 	callErr      error
+	usage        llm.Usage
+	reasoning    bool
+	instanceID   string
 
 	// oneShot: if true, toolCalls are cleared after the first invocation
 	// so the model stops returning tool calls, simulating a real conversation.
@@ -37,6 +40,21 @@ type fakeProvider struct {
 }
 
 func (f *fakeProvider) Name() string { return f.name }
+func (f *fakeProvider) InstanceID() string {
+	if f.instanceID != "" {
+		return f.instanceID
+	}
+	return f.name
+}
+
+func (f *fakeProvider) Capabilities() model.ProviderCapabilities {
+	return model.ProviderCapabilities{
+		StructuredOutput: true,
+		ToolCalling:      true,
+		Streaming:        true,
+		Reasoning:        f.reasoning,
+	}
+}
 
 func (f *fakeProvider) nextTools() []llm.ToolCall {
 	if f.callScript != nil {
@@ -66,6 +84,7 @@ func (f *fakeProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Co
 		Content:      f.content,
 		ToolCalls:    f.nextTools(),
 		FinishReason: f.finishReason,
+		Usage:        f.usage,
 	}, nil
 }
 
@@ -82,6 +101,7 @@ func (f *fakeProvider) Stream(ctx context.Context, params llm.CallParams, sink m
 		Content:      f.content,
 		ToolCalls:    tc,
 		FinishReason: f.finishReason,
+		Usage:        f.usage,
 	}, nil
 }
 
@@ -173,7 +193,10 @@ func TestRunner_Integration_ExecutesToolAndCollectsResult(t *testing.T) {
 	fakeModel.content = "I wrote the file"
 	fakeModel.withOneShot()
 
-	outcome := runner.Run(context.Background(), []llm.Message{llm.UserMessage("write test.txt")}, "trace-2")
+	// This test exercises the tool-execution pipeline itself; use a trivial
+	// task text so the planning hard-guard (tested separately in
+	// runner_controls_test.go) does not intercept the unplanned write.
+	outcome := runner.Run(context.Background(), []llm.Message{llm.UserMessage("hello")}, "trace-2")
 
 	if outcome.Error != nil {
 		t.Fatalf("unexpected error: %v", outcome.Error)
@@ -440,7 +463,7 @@ func TestRunner_Integration_MemoryCapabilityDenied(t *testing.T) {
 // TestRunner_Integration_AutoLessonSkipsSubagent verifies that auto-lesson
 // does NOT fire for agents with CanMemory=false (explore/teammate).
 func TestRunner_Integration_AutoLessonSkipsSubagent(t *testing.T) {
-	fakeModel := &fakeProvider{name: "fake"}
+	fakeModel := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
 	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
@@ -479,9 +502,10 @@ func TestRunner_Integration_AutoLessonSkipsSubagent(t *testing.T) {
 }
 
 // TestRunner_Integration_AutoLessonFiresForLead verifies that auto-lesson
-// DOES fire for lead agent (CanMemory=true) after enough rounds.
+// DOES fire for lead agent (CanMemory=true) after enough rounds WITH real
+// tool failures. A run that completed without failures does not need a lesson.
 func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
-	fakeModel := &fakeProvider{name: "fake"}
+	fakeModel := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
 	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
@@ -490,7 +514,7 @@ func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
 			Description: "No-op",
 			Effects:     tool.Effects(),
 			Handler: func(scope *tool.ToolScope, args json.RawMessage) tool.Result {
-				return tool.Succeeded("ok")
+				return tool.Failed("simulated failure to trigger lesson")
 			},
 		},
 	})
@@ -519,7 +543,44 @@ func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
 	}
 }
 
-// spyLessonWriter records whether RecordFailure was called.
+// TestRunner_Integration_AutoLessonSkipsOnSuccess verifies that auto-lesson
+// does not run when every tool execution succeeded.
+func TestRunner_Integration_AutoLessonSkipsOnSuccess(t *testing.T) {
+	fakeModel := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
+	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	catalog := tool.NewToolCatalog()
+	catalog.RegisterAll([]tool.ToolDefinition{
+		{
+			Name:        "noop",
+			Description: "No-op",
+			Effects:     tool.Effects(),
+			Handler: func(scope *tool.ToolScope, args json.RawMessage) tool.Result {
+				return tool.Succeeded("ok")
+			},
+		},
+	})
+
+	exec := tool.NewExecutor(catalog, nil, nil)
+	scope := &tool.ToolScope{Role: "lead", CanRead: true, CanMemory: true}
+	profile := NewLeadProfile("You are a test agent.")
+	runner := NewRunner(profile, gw, exec, scope, nil)
+
+	spy := &spyLessonWriter{}
+	runner.SetLessonWriter(spy)
+
+	fakeModel.toolCalls = []llm.ToolCall{{ID: "call_1", Name: "noop", Arguments: `{}`}}
+	fakeModel.multiShot = 3
+
+	outcome := runner.Run(context.Background(), []llm.Message{llm.UserMessage("test")}, "trace-no-lesson")
+
+	if spy.called {
+		t.Fatal("auto-lesson must NOT fire when all tools succeeded")
+	}
+	if outcome.Error != nil {
+		t.Fatalf("expected no error, got %v", outcome.Error)
+	}
+}
+
 type spyLessonWriter struct {
 	called bool
 }

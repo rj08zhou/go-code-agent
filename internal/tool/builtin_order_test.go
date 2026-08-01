@@ -57,6 +57,9 @@ func TestBuiltinTools_OrderAndCount(t *testing.T) {
 		if defs[i].Name != want {
 			t.Fatalf("builtin[%d]=%q, want %q", i, defs[i].Name, want)
 		}
+		if !defs[i].Effects.Declared() {
+			t.Errorf("builtin[%d]=%q has no explicit Effects declaration", i, defs[i].Name)
+		}
 	}
 }
 

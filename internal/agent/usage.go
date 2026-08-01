@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/store"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,9 +13,10 @@ import (
 
 // UsageTracker records LLM token usage per session.
 type UsageTracker struct {
-	path string
-	mu   sync.Mutex
-	file *os.File
+	path   string
+	mu     sync.Mutex
+	file   *os.File
+	closed bool
 }
 
 func NewUsageTracker(sessionDir string) (*UsageTracker, error) {
@@ -27,10 +29,7 @@ func NewUsageTracker(sessionDir string) (*UsageTracker, error) {
 }
 
 func (u *UsageTracker) reopen() error {
-	if err := os.MkdirAll(filepath.Dir(u.path), 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(u.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := store.OpenPrivateAppend(u.path)
 	if err != nil {
 		return err
 	}
@@ -44,6 +43,9 @@ func (u *UsageTracker) reopen() error {
 func (u *UsageTracker) Record(source, role, model, traceID string, usage llm.Usage, durationSec float64) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.closed {
+		return
+	}
 	entry := map[string]interface{}{
 		"source":              source,
 		"role":                role,
@@ -54,6 +56,7 @@ func (u *UsageTracker) Record(source, role, model, traceID string, usage llm.Usa
 		"cached_read_tokens":  usage.CachedReadTokens,
 		"cache_miss_tokens":   usage.CacheMissTokens,
 		"cache_create_tokens": usage.CacheCreateTokens,
+		"reasoning_tokens":    usage.ReasoningTokens,
 		"total":               usage.TotalTokens,
 		"duration_s":          fmt.Sprintf("%.2f", durationSec),
 	}
@@ -79,6 +82,10 @@ func (u *UsageTracker) Record(source, role, model, traceID string, usage llm.Usa
 func (u *UsageTracker) Close() error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.closed {
+		return nil
+	}
+	u.closed = true
 	if u.file == nil {
 		return nil
 	}
@@ -94,7 +101,7 @@ func (u *UsageTracker) Render() string {
 		return "No usage recorded."
 	}
 	lines := strings.Split(string(data), "\n")
-	var totalIn, totalOut, totalHit, totalMiss, totalCreate, count int64
+	var totalIn, totalOut, totalHit, totalMiss, totalCreate, totalReasoning, count int64
 	for _, line := range lines {
 		if line == "" {
 			continue
@@ -116,6 +123,9 @@ func (u *UsageTracker) Render() string {
 			if cc, ok := e["cache_create_tokens"].(float64); ok {
 				totalCreate += int64(cc)
 			}
+			if rt, ok := e["reasoning_tokens"].(float64); ok {
+				totalReasoning += int64(rt)
+			}
 			count++
 		}
 	}
@@ -127,6 +137,6 @@ func (u *UsageTracker) Render() string {
 	if input > 0 {
 		rate = float64(totalHit) / float64(input) * 100
 	}
-	return fmt.Sprintf("Usage: %d calls, %d in, %d out, %d total, cache hit %d, miss %d, create %d (%.1f%%)",
-		count, totalIn, totalOut, totalIn+totalOut, totalHit, totalMiss, totalCreate, rate)
+	return fmt.Sprintf("Usage: %d calls, %d in, %d out, %d reasoning, %d total, cache hit %d, miss %d, create %d (%.1f%%)",
+		count, totalIn, totalOut, totalReasoning, totalIn+totalOut, totalHit, totalMiss, totalCreate, rate)
 }

@@ -19,6 +19,12 @@ type stubProvider struct{}
 
 func (stubProvider) Name() string { return "openai" }
 
+func (stubProvider) Capabilities() model.ProviderCapabilities {
+	return model.ProviderCapabilities{
+		Streaming: true,
+	}
+}
+
 func (stubProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Completion, error) {
 	return &llm.Completion{Content: "ok", FinishReason: "stop"}, nil
 }
@@ -54,10 +60,59 @@ func newTestApp(t *testing.T) (*application.Application, string, string) {
 	return app, cfgDir, workdir
 }
 
+func TestBuildExposesSanitizedRuntimeStatus(t *testing.T) {
+	t.Setenv("MCP_SERVERS", "")
+	cfgDir := t.TempDir()
+	workdir := t.TempDir()
+	baseURL := "https://user:password@Proxy.Example:8443/v1/chat?api_key=secret#private"
+	primary := provider.NewOpenAI("test-not-used", baseURL)
+	registry := provider.NewRegistry()
+	registry.Register(primary)
+	app, err := application.NewWithGateway(
+		cfgDir,
+		workdir,
+		&config.Config{
+			ModelID:           "gpt-5.2",
+			LLMProvider:       "openai",
+			OpenAIAPIKey:      "test-not-used",
+			OpenAIBaseURL:     baseURL,
+			ReasoningEnabled:  true,
+			ReasoningEffort:   " HIGH ",
+			LLMMaxConcurrency: 1,
+		},
+		model.NewGateway(primary, model.NewRoleThrottle(1)),
+		registry,
+	)
+	if err != nil {
+		t.Fatalf("NewWithGateway: %v", err)
+	}
+	defer app.Shutdown(context.Background())
+
+	built, rt, err := app.Build(application.BuildOptions{NewSession: true})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer rt.Close(context.Background())
+
+	if built.Runtime.ProviderName != "openai" {
+		t.Fatalf("ProviderName = %q, want openai", built.Runtime.ProviderName)
+	}
+	if built.Runtime.EndpointHost != "proxy.example:8443" {
+		t.Fatalf("EndpointHost = %q, want proxy.example:8443", built.Runtime.EndpointHost)
+	}
+	if !built.Runtime.ReasoningRequested || !built.Runtime.ReasoningAvailable || built.Runtime.ReasoningEffort != "high" {
+		t.Fatalf("reasoning runtime status = requested:%v available:%v effort:%q",
+			built.Runtime.ReasoningRequested, built.Runtime.ReasoningAvailable, built.Runtime.ReasoningEffort)
+	}
+}
+
 func TestBuild_Smoke_NewBuildClose(t *testing.T) {
 	app, cfgDir, workdir := newTestApp(t)
 
-	built, rt := app.Build(application.BuildOptions{NewSession: true})
+	built, rt, err := app.Build(application.BuildOptions{NewSession: true})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
 	if built == nil || rt == nil {
 		t.Fatal("Build returned nil BuiltRunner or SessionRuntime")
 	}
@@ -104,14 +159,26 @@ func TestBuild_Smoke_NewBuildClose(t *testing.T) {
 	if built.Session.SysPrompt == "" {
 		t.Error("SysPrompt is empty")
 	}
+	if built.Runtime.ProviderName != "openai" {
+		t.Errorf("ProviderName = %q, want openai", built.Runtime.ProviderName)
+	}
+	if built.Runtime.EndpointHost != "api.openai.com" {
+		t.Errorf("EndpointHost = %q, want api.openai.com", built.Runtime.EndpointHost)
+	}
+	if built.Runtime.ReasoningRequested || built.Runtime.ReasoningAvailable {
+		t.Errorf("unexpected reasoning status: requested=%v available=%v", built.Runtime.ReasoningRequested, built.Runtime.ReasoningAvailable)
+	}
 	if snap := built.Session.Catalog.Load(); snap == nil || len(snap.Order) == 0 {
 		t.Error("Catalog has no registered tools")
 	}
 
-	// --- session directory structure ---
-	dataDir := filepath.Join(cfgDir, "go-code-agent", filepath.Base(workdir))
-	if app.DataDir() != dataDir {
-		t.Errorf("DataDir = %q, want %q", app.DataDir(), dataDir)
+	// --- isolated workspace/session directory structure ---
+	dataDir := app.DataDir()
+	if filepath.Dir(dataDir) != filepath.Join(cfgDir, "go-code-agent") {
+		t.Errorf("DataDir parent = %q, want %q", filepath.Dir(dataDir), filepath.Join(cfgDir, "go-code-agent"))
+	}
+	if dataDir == filepath.Join(cfgDir, "go-code-agent", filepath.Base(workdir)) {
+		t.Errorf("DataDir still uses collision-prone basename-only path: %q", dataDir)
 	}
 	sessionDir := filepath.Join(dataDir, "sessions", built.Session.ID)
 	mustExist := []string{

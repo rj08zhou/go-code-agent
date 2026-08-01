@@ -17,13 +17,29 @@ func previewWriteFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, e
 	if a.Path == "" {
 		return PreviewRequest{}, fmt.Errorf("path is required")
 	}
-	return PreviewRequest{Path: a.Path, Content: []byte(a.Content)}, nil
+	fp, err := security.SecurePath(scope.Workdir, a.Path, true)
+	if err != nil {
+		return PreviewRequest{}, err
+	}
+	original, err := os.ReadFile(fp)
+	existed := err == nil
+	if err != nil && !os.IsNotExist(err) {
+		return PreviewRequest{}, err
+	}
+	return PreviewRequest{
+		Path:            a.Path,
+		OriginalContent: original,
+		Content:         []byte(a.Content),
+		Existed:         existed,
+	}, nil
 }
 
 func previewEditFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, error) {
 	var a struct {
-		Path, OldText, NewText string
-		ReplaceAll             bool `json:"replace_all"`
+		Path       string `json:"path"`
+		OldText    string `json:"old_text"`
+		NewText    string `json:"new_text"`
+		ReplaceAll bool   `json:"replace_all"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return PreviewRequest{}, err
@@ -53,7 +69,12 @@ func previewEditFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, er
 	} else {
 		content = strings.Replace(content, old, a.NewText, 1)
 	}
-	return PreviewRequest{Path: a.Path, Content: []byte(content)}, nil
+	return PreviewRequest{
+		Path:            a.Path,
+		OriginalContent: data,
+		Content:         []byte(content),
+		Existed:         true,
+	}, nil
 }
 
 func previewInsertFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, error) {
@@ -84,7 +105,12 @@ func previewInsertFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, 
 	updated := append([]string{}, lines[:idx]...)
 	updated = append(updated, strings.Split(a.Content, "\n")...)
 	updated = append(updated, lines[idx:]...)
-	return PreviewRequest{Path: a.Path, Content: []byte(strings.Join(updated, "\n"))}, nil
+	return PreviewRequest{
+		Path:            a.Path,
+		OriginalContent: data,
+		Content:         []byte(strings.Join(updated, "\n")),
+		Existed:         true,
+	}, nil
 }
 
 func previewDeleteFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, error) {
@@ -94,8 +120,18 @@ func previewDeleteFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, 
 	if err := json.Unmarshal(args, &a); err != nil {
 		return PreviewRequest{}, err
 	}
-	if _, err := security.SecurePath(scope.Workdir, a.Path, true); err != nil {
+	fp, err := security.SecurePath(scope.Workdir, a.Path, true)
+	if err != nil {
 		return PreviewRequest{}, err
 	}
-	return PreviewRequest{Path: a.Path, Delete: true}, nil
+	original, err := os.ReadFile(fp)
+	if err != nil {
+		return PreviewRequest{}, err
+	}
+	return PreviewRequest{
+		Path:            a.Path,
+		OriginalContent: original,
+		Existed:         true,
+		Delete:          true,
+	}, nil
 }

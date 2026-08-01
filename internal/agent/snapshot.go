@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"go-code-agent/internal/logging"
 	"go-code-agent/internal/tool"
 	"os/exec"
 	"strings"
@@ -58,21 +59,24 @@ func (s *SnapshotManager) WithSnapshot(toolName string, run func() tool.Result) 
 	}
 	sha, err := takeSnapshot(s.workdir)
 	if err != nil {
-		fmt.Printf("[snapshot] skip (%v)\n", err)
-		return run()
+		logging.Default().Warn(fmt.Sprintf("snapshot skipped for %s: %v", toolName, err))
+		result := run()
+		if result.Output != "" {
+			result.Output += "\n"
+		}
+		result.Output += "[snapshot] unavailable; tool ran without rollback protection"
+		return result
 	}
 	result := run()
 	if result.Succeeded() {
 		return result
 	}
-	// Failed — rollback
 	if rerr := restoreSnapshot(s.workdir, sha); rerr != nil {
-		fmt.Printf("[snapshot] rollback failed: %v\n", rerr)
+		logging.Default().Warn(fmt.Sprintf("snapshot rollback failed for %s: %v", toolName, rerr))
 		result.Output += fmt.Sprintf("\n[snapshot] rollback FAILED: %v", rerr)
 		return result
 	}
 	if sha != "" {
-		fmt.Printf("[snapshot] rolled back '%s' to %s\n", toolName, sha[:8])
 		result.Output += fmt.Sprintf("\n[snapshot] working tree restored to pre-call state (%s)", sha[:8])
 	}
 	return result

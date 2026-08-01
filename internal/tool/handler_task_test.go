@@ -69,6 +69,18 @@ func TestTaskTools(t *testing.T) {
 		}
 	})
 
+	t.Run("task_create rejects blank subject", func(t *testing.T) {
+		svc := &recordingTaskService{}
+		tool := mustTool(t, taskTools(builtinDeps{taskSvc: svc}), "task_create")
+		got := tool.Handler(scope, json.RawMessage(`{"subject":"  "}`))
+		if got.Status != StatusFailed || !strings.Contains(got.Output, "subject is required") {
+			t.Fatalf("got %#v", got)
+		}
+		if svc.createSubject != "" {
+			t.Fatalf("invalid task reached service: %q", svc.createSubject)
+		}
+	})
+
 	t.Run("task_create nil service", func(t *testing.T) {
 		tool := mustTool(t, taskTools(builtinDeps{}), "task_create")
 		got := tool.Handler(scope, json.RawMessage(`{"subject":"x"}`))
@@ -121,7 +133,7 @@ func TestTaskTools(t *testing.T) {
 	t.Run("TodoWrite delegates", func(t *testing.T) {
 		todo := &recordingTodoService{}
 		tool := mustTool(t, taskTools(builtinDeps{todoSvc: todo}), "TodoWrite")
-		got := tool.Handler(scope, json.RawMessage(`{"items":[{"content":"do it","status":"pending"}]}`))
+		got := tool.Handler(scope, json.RawMessage(`{"items":[{"content":"do it","status":"pending","activeForm":"doing it"}]}`))
 		if got.Status != StatusSucceeded || !strings.Contains(got.Output, "todos updated") {
 			t.Fatalf("got %#v", got)
 		}
@@ -133,7 +145,7 @@ func TestTaskTools(t *testing.T) {
 	t.Run("tool descriptions carry usage guidance", func(t *testing.T) {
 		defs := taskTools(builtinDeps{})
 		cases := map[string][]string{
-			"TodoWrite":   {"items", "When NOT to use", "5-node DAG", "status"},
+			"TodoWrite":   {"items", "When NOT to use", "5-node DAG", "status", "activeForm"},
 			"task_create": {"depends_on", "When to use", "numeric ID", "task_dag"},
 			"task_update": {"task_id", "never use 0", "status only"},
 			"task_get":    {"numeric task_id", "Never pass 0"},

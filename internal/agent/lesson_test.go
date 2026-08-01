@@ -10,6 +10,9 @@ import (
 type lessonProvider struct{}
 
 func (lessonProvider) Name() string { return "lesson-test" }
+func (lessonProvider) Capabilities() model.ProviderCapabilities {
+	return model.ProviderCapabilities{}
+}
 func (lessonProvider) Call(context.Context, llm.CallParams) (*llm.Completion, error) {
 	return &llm.Completion{Content: "Prefer atomic writes and validate paths before mutation."}, nil
 }

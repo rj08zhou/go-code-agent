@@ -3,7 +3,6 @@ package logging
 import (
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,34 +58,6 @@ func Default() *Logger { return defaultLogger.Load() }
 // SetDefault replaces the default logger.
 func SetDefault(l *Logger) { defaultLogger.Store(l) }
 
-// PrintSystem prints a system message to stdout with a color prefix.
-func PrintSystem(msg string) {
-	c := "\033[36m" // cyan
-	r := "\033[0m"
-	if !isTerminal() {
-		c, r = "", ""
-	}
-	fmt.Printf("%s[system]%s %s\n", c, r, msg)
-}
-
-// PrintError prints an error message to stderr.
-func PrintError(msg string) {
-	c := "\033[31m" // red
-	r := "\033[0m"
-	if !isTerminal() {
-		c, r = "", ""
-	}
-	fmt.Fprintf(os.Stderr, "%s[error]%s %s\n", c, r, msg)
-}
-
-func isTerminal() bool {
-	fi, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-	return (fi.Mode() & os.ModeCharDevice) != 0
-}
-
 // MultiHandler writes to multiple outputs.
 type MultiHandler struct {
 	mu      sync.Mutex
@@ -105,5 +76,3 @@ func (m *MultiHandler) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
-
-var _ = strings.TrimSpace

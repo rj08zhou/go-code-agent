@@ -53,13 +53,17 @@ func shellTools(d builtinDeps) []ToolDefinition {
 				return Failed("command timed out after " + config.BashTimeout.String())
 			}
 			out := strings.TrimSpace(string(output))
-			if err != nil && out == "" {
-				out = fmt.Sprintf("Error: %v", err)
+			if err != nil {
+				if out != "" {
+					out += "\n"
+				}
+				out += fmt.Sprintf("Error: %v", err)
+				return Failed(truncateBashOutput(out, config.BashOutputMaxChars))
 			}
 			if out == "" {
 				out = "(no output)"
 			}
-			return Succeeded(out)
+			return Succeeded(truncateBashOutput(out, config.BashOutputMaxChars))
 		},
 	})
 
@@ -124,4 +128,30 @@ func shellTools(d builtinDeps) []ToolDefinition {
 	})
 
 	return defs
+}
+
+// truncateBashOutput caps command output with a head/tail window. Unlike
+// read_file, bash has no offset paging, so oversized output is kept as the
+// first (maxLen-tail) chars plus the final tail chars — command diagnostics
+// (build errors, stack traces, test failures) usually surface at the end.
+// The explicit hint tells the model to narrow the command rather than
+// blindly re-running it and flooding context again.
+func truncateBashOutput(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	tailLen := maxLen / 4
+	if tailLen > 4096 {
+		tailLen = 4096
+	}
+	if tailLen < 256 {
+		tailLen = 256
+	}
+	headLen := maxLen - tailLen
+	notice := fmt.Sprintf(
+		"\n... (output capped at %d chars) ...\n"+
+			"Middle of the output was omitted. To see a specific part, re-run with "+
+			"head/tail/grep (or redirect to a file and read_file) to narrow the output.\n",
+		maxLen)
+	return s[:headLen] + notice + s[len(s)-tailLen:]
 }

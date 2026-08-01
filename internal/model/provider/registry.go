@@ -2,6 +2,7 @@
 package provider
 
 import (
+	"errors"
 	"fmt"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/llm"
@@ -9,6 +10,10 @@ import (
 	"strings"
 	"sync"
 )
+
+// ErrNoProvider means no registered provider matches the configuration:
+// either no API key was set, or the key does not match MODEL_ID/LLM_PROVIDER.
+var ErrNoProvider = errors.New("no LLM provider available")
 
 // Registry holds all registered providers.
 type Registry struct {
@@ -56,7 +61,7 @@ func (r *Registry) Pick(cfg *config.Config) (model.Provider, error) {
 	if p, ok := r.providers["openai"]; ok {
 		return p, nil
 	}
-	return nil, fmt.Errorf("no LLM provider available")
+	return nil, ErrNoProvider
 }
 
 func (r *Registry) JudgeProvider(cfg *config.Config) model.Provider {

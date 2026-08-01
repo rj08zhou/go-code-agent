@@ -3,8 +3,10 @@ package tool
 import (
 	"context"
 	"encoding/json"
-	"go-code-agent/internal/llm"
+	"strings"
 	"testing"
+
+	"go-code-agent/internal/llm"
 )
 
 func newTestCatalog() *ToolCatalog {
@@ -150,6 +152,17 @@ func TestExecutor_ReturnsUnavailableForUnknownTool(t *testing.T) {
 	}
 }
 
+func TestExecutorRejectsMissingScopeWithoutPanic(t *testing.T) {
+	exec := NewExecutor(newTestCatalog(), nil, nil)
+	result := exec.Execute(context.Background(), nil, llm.ToolCall{Name: "read", Arguments: `{}`})
+	if result.Status != StatusDenied {
+		t.Fatalf("status = %s, want denied", result.Status)
+	}
+	if !strings.Contains(result.Output, "requires an execution scope") {
+		t.Fatalf("denial output = %q", result.Output)
+	}
+}
+
 // --- Panic recovery ---
 
 func TestExecutor_RecoversFromPanic(t *testing.T) {
@@ -164,6 +177,34 @@ func TestExecutor_RecoversFromPanic(t *testing.T) {
 	r := exec.Execute(context.Background(), scope, llm.ToolCall{Name: "crash", Arguments: `{}`})
 	if r.Status != StatusFailed {
 		t.Fatalf("expected StatusFailed after panic, got %s", r.Status)
+	}
+}
+
+func TestExecutorSanitizesFailureAndPanicOutputs(t *testing.T) {
+	catalog := NewToolCatalog()
+	catalog.RegisterAll([]ToolDefinition{
+		{
+			Name: "failure",
+			Handler: func(*ToolScope, json.RawMessage) Result {
+				return Failed("request failed with secret-token")
+			},
+		},
+		{
+			Name: "panic",
+			Handler: func(*ToolScope, json.RawMessage) Result {
+				panic("secret-token")
+			},
+		},
+	})
+	executor := NewExecutor(catalog, nil, nil).WithSanitizer(maskSecretSanitizer{})
+	for _, name := range []string{"failure", "panic"} {
+		result := executor.Execute(context.Background(), &ToolScope{}, llm.ToolCall{Name: name, Arguments: `{}`})
+		if result.Status != StatusFailed {
+			t.Fatalf("%s status = %s, want failed", name, result.Status)
+		}
+		if strings.Contains(result.Output, "secret-token") || !strings.Contains(result.Output, "[REDACTED]") {
+			t.Fatalf("%s output was not sanitized: %q", name, result.Output)
+		}
 	}
 }
 
@@ -187,6 +228,31 @@ func TestExecutor_ExecuteAll(t *testing.T) {
 }
 
 // --- ToolCatalog thread safety ---
+
+func TestToolCatalogUnregisterPrefixPreservesOtherToolsAndOrder(t *testing.T) {
+	catalog := NewToolCatalog()
+	noop := func(scope *ToolScope, args json.RawMessage) Result { return Succeeded("ok") }
+	catalog.RegisterAll([]ToolDefinition{
+		{Name: "builtin", Handler: noop},
+		{Name: "mcp__alpha__one", Handler: noop},
+		{Name: "mcp__beta__one", Handler: noop},
+		{Name: "mcp__alpha__two", Handler: noop},
+	})
+
+	if removed := catalog.UnregisterPrefix("mcp__alpha__"); removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	if catalog.IsKnown("mcp__alpha__one") || catalog.IsKnown("mcp__alpha__two") {
+		t.Fatal("matching tools remained registered")
+	}
+	if !catalog.IsKnown("builtin") || !catalog.IsKnown("mcp__beta__one") {
+		t.Fatal("unrelated tools were removed")
+	}
+	defs := catalog.ToolDefs()
+	if len(defs) != 2 || defs[0]["name"] != "builtin" || defs[1]["name"] != "mcp__beta__one" {
+		t.Fatalf("remaining tool order = %#v", defs)
+	}
+}
 
 func TestToolCatalog_ConcurrentAccess(t *testing.T) {
 	catalog := NewToolCatalog()
@@ -232,3 +298,9 @@ type testNetwork struct {
 
 func (n *testNetwork) AllowURL(url string) bool   { return n.allow }
 func (n *testNetwork) AllowHost(host string) bool { return n.allow }
+
+type maskSecretSanitizer struct{}
+
+func (maskSecretSanitizer) Sanitize(value string) string {
+	return strings.ReplaceAll(value, "secret-token", "[REDACTED]")
+}

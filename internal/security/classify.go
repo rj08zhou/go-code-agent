@@ -2,6 +2,7 @@ package security
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -59,6 +60,10 @@ var sensitiveEnvVars = map[string]bool{
 	"GIT_PAGER": true, "PAGER": true, "EDITOR": true, "VISUAL": true,
 }
 
+// Writing to /dev/null does not create or modify user data. Remove only these
+// exact redirection tokens from the input used by confirm-pattern matching.
+var devNullOutputRedirectRegexp = regexp.MustCompile(`(?:[0-9]*|&)>>?\s*/dev/null($|[\s;&|])`)
+
 // readOnlyPrefixes lists token-prefix patterns considered read-only.
 // Multi-word entries (e.g. "go test") must match leading tokens exactly.
 var readOnlyPrefixes = []string{
@@ -97,7 +102,7 @@ func ClassifyCommand(command string) Classification {
 	// subshells/quoting inside segments cannot dodge them.
 	for _, re := range dangerousRegexps {
 		if re.MatchString(lower) {
-			return Classification{VerdictDeny, fmt.Sprintf("dangerous command blocked: %q", cmd)}
+			return Classification{VerdictDeny, "dangerous command blocked"}
 		}
 	}
 	for _, pat := range defaultDenyPatterns {
@@ -139,10 +144,12 @@ func ClassifyCommand(command string) Classification {
 			fmt.Sprintf("sensitive environment override %q requires confirmation", sensitiveEnv)}
 	}
 
-	// 4. Confirmable destructive patterns.
+	// 4. Confirmable destructive patterns. Discarding output via /dev/null is
+	// harmless; all other absolute-path redirects still match the existing rule.
+	confirmInput := devNullOutputRedirectRegexp.ReplaceAllString(lower, "$1")
 	for _, re := range confirmRegexps {
-		if re.MatchString(lower) {
-			return Classification{VerdictDanger, fmt.Sprintf("potentially dangerous: %q", cmd)}
+		if re.MatchString(confirmInput) {
+			return Classification{VerdictDanger, "command matches a potentially dangerous pattern"}
 		}
 	}
 	for _, pat := range defaultConfirmPatterns {
