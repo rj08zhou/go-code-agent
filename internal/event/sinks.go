@@ -2,15 +2,18 @@ package event
 
 import (
 	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"unicode"
+
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/logging"
 	"go-code-agent/internal/store"
 	"go-code-agent/internal/utils"
-	"os"
-	"sync"
 )
 
-// ConsoleSink logs events to stdout for debugging.
+// ConsoleSink renders concise, user-facing event summaries to stderr.
 type ConsoleSink struct {
 	mu sync.Mutex
 }
@@ -73,26 +76,79 @@ func (s *ConsoleSink) Emit(e Event) {
 		return
 	}
 
+	// Model retry wait / provider fallback — keep the user informed during
+	// backoff instead of showing a silent terminal.
+	if e.Type == ModelRetry {
+		mp, _ := e.Payload.(map[string]string)
+		fmt.Fprintf(os.Stderr, "%s[retry]%s %s\n", utils.BoldYellow, utils.Reset, mp["summary"])
+		return
+	}
+
 	label := decisionLabel(e.Type)
 	color := decisionColor(e.Type)
+	payload, _ := e.Payload.(map[string]string)
+	var preview []string
+	previewOmitted := 0
 
 	if e.ToolName != "" {
-		fmt.Fprintf(os.Stderr, "%s[%s]%s %s%s%s | agent=%s session=%s",
-			utils.BoldYellow, e.ToolName, utils.Reset,
-			color, e.Type, utils.Reset, e.AgentID, e.SessionID)
+		action := string(e.Type)
+		switch e.Type {
+		case ToolStarted:
+			action = "started"
+		case ToolFinished:
+			action = e.Status
+			if action == "" {
+				action = "finished"
+			}
+		}
+		fmt.Fprintf(os.Stderr, "%s[%s]%s %s%s%s",
+			utils.BoldYellow, e.ToolName, utils.Reset, color, action, utils.Reset)
 	} else {
-		fmt.Fprintf(os.Stderr, "%s[%s]%s %s%s%s | agent=%s session=%s",
-			utils.Dim, label, utils.Reset,
-			color, e.Type, utils.Reset, e.AgentID, e.SessionID)
+		fmt.Fprintf(os.Stderr, "%s[%s]%s", color, label, utils.Reset)
+	}
+	// The active terminal already identifies the session. Keep agent identity
+	// only for concurrent subagents and teammates, where it disambiguates output.
+	if e.AgentID != "" && e.AgentID != "lead" {
+		fmt.Fprintf(os.Stderr, " agent=%s", e.AgentID)
+	}
+	if path := payload["path"]; path != "" {
+		fmt.Fprintf(os.Stderr, " path=%s", consoleLine(path))
+	}
+	if pattern := payload["pattern"]; pattern != "" {
+		fmt.Fprintf(os.Stderr, " pattern=%q", consoleLine(pattern))
+	}
+	if offset := payload["offset"]; offset != "" {
+		fmt.Fprintf(os.Stderr, " offset=%s", offset)
+	}
+	if limit := payload["limit"]; limit != "" {
+		fmt.Fprintf(os.Stderr, " limit=%s", limit)
+	}
+	if e.Status != "" && e.Type != ToolFinished {
+		fmt.Fprintf(os.Stderr, " status=%s", e.Status)
 	}
 	if e.Error != "" {
-		fmt.Fprintf(os.Stderr, " %serror=%s%s", utils.Red, e.Error, utils.Reset)
+		fmt.Fprintf(os.Stderr, " %serror=%s%s", utils.Red, consoleLine(e.Error), utils.Reset)
 	}
 	if e.Duration > 0 {
 		fmt.Fprintf(os.Stderr, " dur=%.2fs", e.Duration.Seconds())
 	}
-	if e.Output != "" {
-		fmt.Fprintf(os.Stderr, "\n%s  %s%s", utils.Dim, utils.Truncate(e.Output, 2000), utils.Reset)
+	if e.Type == ToolFinished {
+		switch {
+		case e.Status != "succeeded" && e.Output != "":
+			if e.Error == "" {
+				fmt.Fprintf(os.Stderr, " %serror=%s%s", utils.Red, consoleLine(e.Output), utils.Reset)
+			}
+		case e.Status == "succeeded" && consoleResultLabel(e.ToolName) != "":
+			label := consoleResultLabel(e.ToolName)
+			var total int
+			preview, total = consoleToolPreview(e.ToolName, e.Output, 8)
+			previewOmitted = total - len(preview)
+			fmt.Fprintf(os.Stderr, " %s=%d", label, total)
+		case e.Status == "succeeded" && e.Output != "" && len(e.Output) <= 240:
+			fmt.Fprintf(os.Stderr, " %s", consoleLine(e.Output))
+		case e.Status == "succeeded" && e.Output != "":
+			fmt.Fprintf(os.Stderr, " output=%dB", len(e.Output))
+		}
 	}
 	// Print payload fields for decision events (matches original verbose output).
 	if mp, ok := e.Payload.(map[string]string); ok && len(mp) > 0 {
@@ -133,31 +189,64 @@ func (s *ConsoleSink) Emit(e Event) {
 			cacheHitRate(*e.Usage), utils.Reset)
 	}
 	fmt.Fprintln(os.Stderr)
-}
-
-// AuditSink writes security-relevant events to the audit log.
-type AuditSink struct {
-	mu sync.Mutex
-}
-
-func NewAuditSink() *AuditSink { return &AuditSink{} }
-
-func (s *AuditSink) Emit(e Event) {
-	switch e.Type {
-	case ApprovalRequested, ApprovalResolved, ToolFinished:
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		logging.Default().Info(fmt.Sprintf("[audit] %s tool=%s agent=%s session=%s outcome=%s",
-			e.Type, e.ToolName, e.AgentID, e.SessionID, e.Outcome))
+	for _, line := range preview {
+		fmt.Fprintf(os.Stderr, "%s  %s%s\n", utils.Dim, line, utils.Reset)
+	}
+	if previewOmitted > 0 {
+		fmt.Fprintf(os.Stderr, "%s  ... %d more lines%s\n", utils.Dim, previewOmitted, utils.Reset)
 	}
 }
 
-// UsageSink tracks token usage by session/agent.
-type UsageSink struct {
-	mu sync.Mutex
+func consoleLine(text string) string {
+	return utils.Truncate(consoleText(strings.Join(strings.Fields(text), " ")), 240)
 }
 
-func NewUsageSink() *UsageSink { return &UsageSink{} }
+func consoleResultLabel(toolName string) string {
+	switch toolName {
+	case "read_file":
+		return "lines"
+	case "list_dir":
+		return "entries"
+	case "search_file", "search_content":
+		return "matches"
+	default:
+		return ""
+	}
+}
+
+func consoleToolPreview(toolName, text string, maxLines int) ([]string, int) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" ||
+		(toolName == "search_file" && trimmed == "No files matched.") ||
+		(toolName == "search_content" && trimmed == "No matches found.") {
+		return nil, 0
+	}
+	return consolePreview(text, maxLines)
+}
+
+func consolePreview(text string, maxLines int) ([]string, int) {
+	text = strings.TrimRight(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	if text == "" {
+		return nil, 0
+	}
+	lines := strings.Split(text, "\n")
+	limit := min(len(lines), maxLines)
+	preview := make([]string, 0, limit)
+	for _, line := range lines[:limit] {
+		preview = append(preview, utils.Truncate(consoleText(line), 180))
+	}
+	return preview, len(lines)
+}
+
+func consoleText(text string) string {
+	text = strings.ReplaceAll(text, "\t", "    ")
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, text)
+}
 
 func cacheHitRate(u llm.Usage) float64 {
 	input := u.PromptTokens
@@ -168,33 +257,6 @@ func cacheHitRate(u llm.Usage) float64 {
 		return 0
 	}
 	return float64(u.CachedReadTokens) / float64(input) * 100
-}
-
-func (s *UsageSink) Emit(e Event) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Per-round detail (every LLM call).
-	if e.Type == ModelCalled && e.Usage != nil {
-		u := e.Usage
-		logging.Default().Info(fmt.Sprintf("[usage] trace=%s agent=%s session=%s model=%s in=%d out=%d reasoning=%d total=%d cached_read=%d cache_miss=%d cache_create=%d hit_rate=%.1f%% dur=%.2fs",
-			e.TraceID, e.AgentID, e.SessionID, e.ModelID,
-			u.PromptTokens, u.CompletionTokens, u.ReasoningTokens, u.TotalTokens,
-			u.CachedReadTokens, u.CacheMissTokens, u.CacheCreateTokens,
-			cacheHitRate(*u), e.Duration.Seconds()))
-		return
-	}
-
-	// Per-turn summary (one user conversation).
-	if e.Type == TurnComplete && e.Usage != nil && !e.Usage.IsZero() {
-		u := e.Usage
-		logging.Default().Info(fmt.Sprintf("[usage:turn] trace=%s agent=%s session=%s %s in=%d out=%d reasoning=%d total=%d cached_read=%d cache_miss=%d cache_create=%d hit_rate=%.1f%%",
-			e.TraceID, e.AgentID, e.SessionID,
-			e.Payload.(map[string]string)["summary"],
-			u.PromptTokens, u.CompletionTokens, u.ReasoningTokens, u.TotalTokens,
-			u.CachedReadTokens, u.CacheMissTokens, u.CacheCreateTokens,
-			cacheHitRate(*u)))
-	}
 }
 
 // SessionLogSink appends structured events to a JSONL file for session replay.
@@ -233,24 +295,30 @@ func (s *SessionLogSink) Emit(e Event) {
 	}
 	data, err := e.MarshalJSON()
 	if err != nil {
+		logging.Default().Error(fmt.Sprintf("session log marshal failed for %s: %v", e.Type, err))
 		return
 	}
 	line := append(data, '\n')
 	// Dir wipe leaves an open FD writing to an unlinked inode — detect via Stat.
 	if s.f == nil {
 		if err := s.reopen(); err != nil {
+			logging.Default().Error(fmt.Sprintf("session log reopen failed: %v", err))
 			return
 		}
 	} else if _, err := os.Stat(s.path); err != nil {
 		if err := s.reopen(); err != nil {
+			logging.Default().Error(fmt.Sprintf("session log reopen failed: %v", err))
 			return
 		}
 	}
-	if _, err := s.f.Write(line); err != nil {
+	if _, writeErr := s.f.Write(line); writeErr != nil {
 		if err := s.reopen(); err != nil {
+			logging.Default().Error(fmt.Sprintf("session log write failed: %v; reopen failed: %v", writeErr, err))
 			return
 		}
-		_, _ = s.f.Write(line)
+		if _, err := s.f.Write(line); err != nil {
+			logging.Default().Error(fmt.Sprintf("session log retry write failed: %v", err))
+		}
 	}
 }
 

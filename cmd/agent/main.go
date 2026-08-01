@@ -2,14 +2,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/chzyer/readline"
 
 	"go-code-agent/internal/application"
+	"go-code-agent/internal/logging"
+	"go-code-agent/internal/model/provider"
+	"go-code-agent/internal/security"
 	"go-code-agent/internal/session"
+	"go-code-agent/internal/store"
 	"go-code-agent/internal/utils"
 )
 
@@ -88,6 +96,17 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 	app, err := application.New(cfgDir, wd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize: %v\n", err)
+		if errors.Is(err, provider.ErrNoProvider) {
+			fmt.Fprint(os.Stderr, `
+No usable LLM provider. Set at least one API key, e.g.:
+
+  export ANTHROPIC_API_KEY="sk-ant-..."   # for claude-* models (default)
+  export OPENAI_API_KEY="sk-..."          # for gpt-* / OpenAI-compatible models
+
+If a key is already set, make sure it matches MODEL_ID / LLM_PROVIDER.
+Run with --help for the full list of environment variables.
+`)
+		}
 		return 1
 	}
 	defer func() {
@@ -97,12 +116,58 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 		}
 	}()
 
-	rl, err := readline.New(utils.Blue + "> " + utils.Reset)
+	// Route non-event runtime diagnostics to a private file instead of
+	// stdout so they cannot interleave with streamed model output. Structured
+	// audit and usage events remain authoritative in the session log.
+	logFile := filepath.Join(app.DataDir(), "terminal", "agent.log")
+	if lf, err := store.OpenPrivateAppend(logFile); err != nil {
+		fmt.Fprintf(os.Stderr, "[warn] file logging disabled: %v\n", err)
+	} else {
+		defer lf.Close()
+		logging.SetDefault(logging.New(lf, logging.LevelInfo, false))
+	}
+
+	replPrompt := utils.Blue + "> " + utils.Reset
+
+	// Pre-create the history file with owner-only permissions (0700 dir,
+	// 0600 file); readline itself would create it world-readable (0666).
+	histFile := filepath.Join(app.DataDir(), "terminal", "history")
+	if f, err := store.OpenPrivateAppend(histFile); err != nil {
+		fmt.Fprintf(os.Stderr, "[warn] repl history disabled: %v\n", err)
+		histFile = "" // fall back to in-memory history
+	} else {
+		f.Close()
+	}
+
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:                 replPrompt,
+		HistoryFile:            histFile,
+		HistorySearchFold:      true, // case-insensitive Ctrl-R
+		DisableAutoSaveHistory: true, // approval y/n/m answers must not pollute history
+		AutoComplete:           newCompleter(),
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize terminal: %v\n", err)
 		return 1
 	}
 	defer rl.Close()
+
+	var terminalMu sync.Mutex
+	readTerminal := func(prompt string, saveHistory bool) (string, error) {
+		terminalMu.Lock()
+		defer terminalMu.Unlock()
+		rl.SetPrompt(prompt)
+		defer rl.SetPrompt(replPrompt)
+		line, err := rl.Readline()
+		if saveHistory && err == nil && strings.TrimSpace(line) != "" {
+			_ = rl.SaveHistory(line) // write error only affects persistence
+		}
+		return line, err
+	}
+	security.SetReadLine(func(prompt string) (string, error) {
+		return readTerminal(prompt, false)
+	})
+	defer security.ResetReadLine()
 
 	next := &application.BuildOptions{SessionID: *sessionID, NewSession: *newSession, Human: *human, HumanMode: *humanMode}
 	for next != nil {
@@ -114,7 +179,9 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 			}
 			return 1
 		}
-		loop := newRepl(built, rt.Ctx, rl.Readline)
+		loop := newRepl(built, rt.Ctx, func() (string, error) {
+			return readTerminal(replPrompt, true)
+		})
 		loop.run()
 		next = loop.nextBuild()
 		if next != nil {

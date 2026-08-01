@@ -310,8 +310,9 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 			}
 			// Regular tool execution
 			toolStart := time.Now()
+			toolPayload := toolEventPayload(tc)
 			if tm.eventSink != nil {
-				tm.eventSink.Emit(event.Event{Type: event.ToolStarted, TraceID: traceID, AgentID: name, ToolCallID: tc.ID, ToolName: tc.Name})
+				tm.eventSink.Emit(event.Event{Type: event.ToolStarted, TraceID: traceID, AgentID: name, ToolCallID: tc.ID, ToolName: tc.Name, Payload: toolPayload})
 			}
 			// Gate file mutations and process execution by plan approval.
 			if requiresApprovedPlan(executor, tc.Name) && !team.HasApprovedPlan(tm.protocols, name) {
@@ -321,7 +322,7 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 			}
 			result := executor.Execute(ctx, scope, tc)
 			if tm.eventSink != nil {
-				tm.eventSink.Emit(event.Event{Type: event.ToolFinished, TraceID: traceID, AgentID: name, ToolCallID: tc.ID, ToolName: tc.Name, Duration: time.Since(toolStart), Status: string(result.Status), Output: result.Output})
+				tm.eventSink.Emit(event.Event{Type: event.ToolFinished, TraceID: traceID, AgentID: name, ToolCallID: tc.ID, ToolName: tc.Name, Duration: time.Since(toolStart), Status: string(result.Status), Output: result.Output, Payload: toolPayload})
 			}
 			*msgs = append(*msgs, llm.ToolMessage(result.ToToolMessage(), tc.ID))
 		}

@@ -1,30 +1,58 @@
 package utils
 
-const (
-	Reset = "\033[0m"
+import (
+	"os"
 
-	Bold   = "\033[1m"
-	Dim    = "\033[2m"
-	Italic = "\033[3m"
-
-	Black   = "\033[30m"
-	Red     = "\033[31m"
-	Green   = "\033[32m"
-	Yellow  = "\033[33m"
-	Blue    = "\033[34m"
-	Magenta = "\033[35m"
-	Cyan    = "\033[36m"
-	White   = "\033[37m"
-
-	BoldBlack   = "\033[1;30m"
-	BoldRed     = "\033[1;31m"
-	BoldGreen   = "\033[1;32m"
-	BoldYellow  = "\033[1;33m"
-	BoldBlue    = "\033[1;34m"
-	BoldMagenta = "\033[1;35m"
-	BoldCyan    = "\033[1;36m"
-	BoldWhite   = "\033[1;37m"
+	"github.com/chzyer/readline"
 )
 
-// Color wraps s in ANSI color codes.
+var terminalStylesEnabled = terminalColorsAllowed(
+	readline.IsTerminal(int(os.Stdout.Fd())),
+	readline.IsTerminal(int(os.Stderr.Fd())),
+	noColorRequested(),
+)
+
+var (
+	Reset = terminalStyle("\033[0m")
+
+	Bold   = terminalStyle("\033[1m")
+	Dim    = terminalStyle("\033[2m")
+	Italic = terminalStyle("\033[3m")
+
+	Black   = terminalStyle("\033[30m")
+	Red     = terminalStyle("\033[31m")
+	Green   = terminalStyle("\033[32m")
+	Yellow  = terminalStyle("\033[33m")
+	Blue    = terminalStyle("\033[34m")
+	Magenta = terminalStyle("\033[35m")
+	Cyan    = terminalStyle("\033[36m")
+	White   = terminalStyle("\033[37m")
+
+	BoldBlack   = terminalStyle("\033[1;30m")
+	BoldRed     = terminalStyle("\033[1;31m")
+	BoldGreen   = terminalStyle("\033[1;32m")
+	BoldYellow  = terminalStyle("\033[1;33m")
+	BoldBlue    = terminalStyle("\033[1;34m")
+	BoldMagenta = terminalStyle("\033[1;35m")
+	BoldCyan    = terminalStyle("\033[1;36m")
+	BoldWhite   = terminalStyle("\033[1;37m")
+)
+
+func terminalColorsAllowed(stdoutTTY, stderrTTY, noColor bool) bool {
+	return stdoutTTY && stderrTTY && !noColor
+}
+
+func noColorRequested() bool {
+	_, present := os.LookupEnv("NO_COLOR")
+	return present
+}
+
+func terminalStyle(code string) string {
+	if !terminalStylesEnabled {
+		return ""
+	}
+	return code
+}
+
+// Color wraps s in ANSI color codes when terminal styling is enabled.
 func Color(s, code string) string { return code + s + Reset }

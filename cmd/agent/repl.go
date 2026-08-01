@@ -2,8 +2,18 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+
+	"github.com/chzyer/readline"
+
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/application"
 	"go-code-agent/internal/history"
@@ -12,10 +22,6 @@ import (
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/utils"
-	"os"
-	"os/signal"
-	"strings"
-	"syscall"
 )
 
 type repl struct {
@@ -29,93 +35,215 @@ func newRepl(built *application.BuiltRunner, rtCtx context.Context, readFn func(
 	return &repl{built: built, rtCtx: rtCtx, readFn: readFn}
 }
 
+// turnCanceller tracks the active agent turn so Ctrl-C can interrupt it
+// without tearing down the whole REPL session.
+type turnCanceller struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+}
+
+func (t *turnCanceller) arm(cancel context.CancelFunc) {
+	t.mu.Lock()
+	t.cancel = cancel
+	t.mu.Unlock()
+}
+
+func (t *turnCanceller) disarm() {
+	t.mu.Lock()
+	t.cancel = nil
+	t.mu.Unlock()
+}
+
+func (t *turnCanceller) interrupt() bool {
+	t.mu.Lock()
+	cancel := t.cancel
+	t.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
 func (r *repl) run() {
 	r.next = nil
-	runner := r.built.Runtime.Runner
-	histStore := r.built.Session.HistStore
 
-	messages, restored, err := histStore.LoadRuntime(r.built.Session.SysPrompt)
+	messages, restored, err := r.built.Session.HistStore.LoadRuntime(r.built.Session.SysPrompt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load history: %v\n", err)
 		return
 	}
 	r.printBanner(restored)
 
-	ctx, cancel := context.WithCancel(r.rtCtx)
-	defer cancel()
+	sessionCtx, cancelSession := context.WithCancel(r.rtCtx)
+	defer cancelSession()
 
-	sigCount := 0
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		for range sigCh {
-			sigCount++
-			if sigCount >= 2 {
-				fmt.Fprintln(os.Stderr, "\nForce quitting...")
-				os.Exit(1)
-			}
-			fmt.Fprintln(os.Stderr, "\nShutting down... (Ctrl+C again to force quit)")
-			cancel()
-		}
-	}()
+	var turns turnCanceller
+	defer r.watchSignals(sessionCtx, cancelSession, &turns)()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		line, err := r.readFn()
-		if err != nil {
-			fmt.Println("Goodbye!")
-			return
-		}
-		line = strings.TrimSpace(line)
-		if line == "" {
+	for sessionCtx.Err() == nil {
+		line, action := r.readPrompt()
+		switch action {
+		case promptContinue:
 			continue
+		case promptExit:
+			return
 		}
+
 		if strings.HasPrefix(line, "/") {
-			if r.handleCommand(ctx, line, &messages) {
+			if r.handleCommand(sessionCtx, line, &messages) {
 				return
 			}
 			continue
 		}
 
-		// Drain background notifications and inbox before LLM call
-		r.drainBackground()
-		r.checkInbox(&messages)
-
-		if err := histStore.AppendUser(line); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to persist user message: %v\n", err)
+		messages = r.runUserTurn(sessionCtx, &turns, messages, line)
+		if sessionCtx.Err() != nil {
 			return
-		}
-		if err := histStore.Sync(); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to sync user message: %v\n", err)
-			return
-		}
-		messages = append(messages, llm.UserMessage(line))
-
-		before := len(messages)
-		runCtx := agent.WithPersistedBoundary(ctx, &before)
-		outcome := runner.Run(runCtx, messages, model.NewTraceID())
-		messages = outcome.Messages
-		if before > len(messages) {
-			before = len(messages)
-		}
-
-		if err := appendHistoryMessages(histStore, messages[before:]); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to persist agent output: %v\n", err)
-			return
-		}
-		if err := histStore.Sync(); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to sync agent output: %v\n", err)
-			return
-		}
-		if outcome.Error != nil {
-			fmt.Fprintf(os.Stderr, "%s[error]%s %v\n", utils.Red, utils.Reset, outcome.Error)
 		}
 		fmt.Println()
 	}
+}
+
+type promptAction int
+
+const (
+	promptRun promptAction = iota
+	promptContinue
+	promptExit
+)
+
+func (r *repl) readPrompt() (string, promptAction) {
+	line, err := r.readFn()
+	if err != nil {
+		switch {
+		case errors.Is(err, readline.ErrInterrupt):
+			return "", promptContinue
+		case errors.Is(err, io.EOF):
+			fmt.Println("Goodbye!")
+		default:
+			fmt.Fprintf(os.Stderr, "Input error: %v\n", err)
+		}
+		return "", promptExit
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return "", promptContinue
+	}
+	return line, promptRun
+}
+
+func (r *repl) watchSignals(sessionCtx context.Context, cancelSession context.CancelFunc, turns *turnCanceller) func() {
+	sigCh := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-sessionCtx.Done():
+				return
+			case sig := <-sigCh:
+				if sig == syscall.SIGTERM {
+					fmt.Fprintln(os.Stderr, "\nShutting down...")
+					cancelSession()
+					return
+				}
+				if turns.interrupt() {
+					fmt.Fprintln(os.Stderr, "\nInterrupting current turn...")
+				}
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(sigCh)
+		close(done)
+	}
+}
+
+func (r *repl) runUserTurn(sessionCtx context.Context, turns *turnCanceller, messages []llm.Message, line string) []llm.Message {
+	histStore := r.built.Session.HistStore
+	r.drainBackground()
+	r.checkInbox(&messages)
+
+	userHistorySaved := true
+	if err := persistUserHistory(histStore, line); err != nil {
+		fmt.Fprintln(os.Stderr, formatHistorySaveWarning(err))
+		userHistorySaved = false
+	}
+	messages = append(messages, llm.UserMessage(line))
+
+	before := len(messages)
+	if !userHistorySaved {
+		// Compaction must not treat this unsaved user message as covered.
+		before--
+	}
+
+	turnCtx, cancelTurn := context.WithCancel(sessionCtx)
+	turns.arm(cancelTurn)
+	outcome := r.built.Runtime.Runner.Run(
+		agent.WithPersistedBoundary(turnCtx, &before),
+		messages,
+		model.NewTraceID(),
+	)
+	turns.disarm()
+	cancelTurn()
+
+	// Incomplete streamed text is not part of outcome.Messages, so a
+	// cancelled partial response is not persisted.
+	messages = outcome.Messages
+	if before > len(messages) {
+		before = len(messages)
+	}
+	if userHistorySaved {
+		if err := persistAgentHistory(histStore, messages[before:]); err != nil {
+			fmt.Fprintln(os.Stderr, formatHistorySaveWarning(err))
+		}
+	}
+	if notice := formatTurnOutcomeError(outcome.Error, sessionCtx.Err()); notice != "" {
+		fmt.Fprintln(os.Stderr, notice)
+	}
+	return messages
+}
+
+func formatTurnOutcomeError(turnErr, sessionErr error) string {
+	if turnErr == nil {
+		return ""
+	}
+	if errors.Is(turnErr, context.Canceled) {
+		if sessionErr == nil {
+			return utils.Dim + "[interrupted] current turn stopped" + utils.Reset
+		}
+		return ""
+	}
+	return fmt.Sprintf("%s[error]%s %v", utils.Red, utils.Reset, turnErr)
+}
+
+func persistUserHistory(histStore *history.Store, content string) error {
+	if err := histStore.AppendUser(content); err != nil {
+		return fmt.Errorf("append user message: %w", err)
+	}
+	if err := histStore.Sync(); err != nil {
+		return fmt.Errorf("sync user message: %w", err)
+	}
+	return nil
+}
+
+func persistAgentHistory(histStore *history.Store, messages []llm.Message) error {
+	if err := appendHistoryMessages(histStore, messages); err != nil {
+		return err
+	}
+	if err := histStore.Sync(); err != nil {
+		return fmt.Errorf("sync agent output: %w", err)
+	}
+	return nil
+}
+
+func formatHistorySaveWarning(err error) string {
+	detail := strings.Join(strings.Fields(err.Error()), " ")
+	return fmt.Sprintf("%s[warn]%s history save failed; continuing in memory (this turn may not be restorable): %s",
+		utils.Yellow, utils.Reset, utils.Truncate(detail, 300))
 }
 
 func appendHistoryMessages(histStore *history.Store, messages []llm.Message) error {
@@ -180,7 +308,7 @@ func renderBanner(b *application.BuiltRunner, restored int) string {
 		fmt.Fprintf(&out, "  MCP: %d active  |  %d pending  |  %d failed\n", active, pending, failed)
 	}
 	fmt.Fprintf(&out, "%s%s%s\n\n", utils.Bold+utils.Cyan, divider, utils.Reset)
-	out.WriteString("Type a message, /help for commands, Ctrl-D to exit.\n")
+	out.WriteString("Type a message; /help for commands; Ctrl-C clears input or interrupts a turn; Ctrl-D exits.\n")
 	return out.String()
 }
 
@@ -226,6 +354,61 @@ func (r *repl) checkInbox(messages *[]llm.Message) {
 		}
 		*messages = append(*messages, llm.SystemMessage(text))
 	}
+}
+
+func (r *repl) readInbox(agentID string) string {
+	if r.built.Team.Bus == nil {
+		return "Inbox is unavailable."
+	}
+	return formatInboxMessages(r.built.Team.Bus.ReadInbox(agentID))
+}
+
+func formatInboxMessages(messages []map[string]any) string {
+	if len(messages) == 0 {
+		return "Inbox is empty."
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, "Inbox (%d):", len(messages))
+	for i, message := range messages {
+		from, _ := message["from"].(string)
+		msgType, _ := message["type"].(string)
+		content, _ := message["content"].(string)
+		if from == "" {
+			from = "unknown"
+		}
+		if msgType == "" {
+			msgType = "message"
+		}
+		fmt.Fprintf(&out, "\n  %d. [%s] from %s", i+1, inboxText(msgType, 80), inboxText(from, 80))
+		if requestID, ok := message["request_id"].(string); ok && requestID != "" {
+			fmt.Fprintf(&out, " request_id=%s", inboxText(requestID, 120))
+		}
+		if content != "" {
+			fmt.Fprintf(&out, ": %s", inboxText(content, 500))
+		}
+	}
+	return out.String()
+}
+
+func inboxText(text string, limit int) string {
+	text = utils.Truncate(strings.TrimSpace(text), limit)
+	quoted := strconv.QuoteToGraphic(text)
+	return strings.TrimSuffix(strings.TrimPrefix(quoted, `"`), `"`)
+}
+
+func (r *repl) runSearch(ctx context.Context, query string) string {
+	if r.built.Runtime.Web == nil {
+		return "Web search is unavailable."
+	}
+	output, err := r.built.Runtime.Web.Search(ctx, query)
+	if err != nil {
+		return fmt.Sprintf("Search failed: %v", err)
+	}
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return "No search results."
+	}
+	return output
 }
 
 func renderHelp() string {
@@ -289,6 +472,56 @@ Notes:
   Approval starts in safe-auto mode; use /approval to inspect the effective mode.
   all-auto requires an explicit "confirm"; hard Bash deny rules and permissions.json still apply.
 `)
+}
+
+// newCompleter builds Tab completion for slash commands.
+// Keep in sync with renderHelp and handleCommand when commands change.
+func newCompleter() readline.AutoCompleter {
+	return readline.NewPrefixCompleter(
+		readline.PcItem("/tasks"),
+		readline.PcItem("/dag"),
+		readline.PcItem("/task", readline.PcItem("clear"), readline.PcItem("reset")),
+		readline.PcItem("/memory"),
+		readline.PcItem("/session",
+			readline.PcItem("list"),
+			readline.PcItem("switch"),
+			readline.PcItem("new"),
+			readline.PcItem("rename"),
+			readline.PcItem("archive"),
+		),
+		readline.PcItem("/compact"),
+		readline.PcItem("/approval",
+			readline.PcItem("manual"),
+			readline.PcItem("safe-auto"),
+			readline.PcItem("all-auto", readline.PcItem("confirm")),
+			readline.PcItem("reject"),
+			readline.PcItem("notify-only"),
+		),
+		readline.PcItem("/approve"),
+		readline.PcItem("/hitl"),
+		readline.PcItem("/permissions", readline.PcItem("reload")),
+		readline.PcItem("/security", readline.PcItem("test-bash")),
+		readline.PcItem("/decisions"),
+		readline.PcItem("/mcp",
+			readline.PcItem("pending"),
+			readline.PcItem("approve"),
+			readline.PcItem("connect"),
+			readline.PcItem("disconnect"),
+		),
+		readline.PcItem("/search"),
+		readline.PcItem("/team",
+			readline.PcItem("spawn"),
+			readline.PcItem("shutdown"),
+			readline.PcItem("message"),
+			readline.PcItem("inbox"),
+		),
+		readline.PcItem("/inbox"),
+		readline.PcItem("/judge"),
+		readline.PcItem("/usage"),
+		readline.PcItem("/help"),
+		readline.PcItem("/exit"),
+		readline.PcItem("/quit"),
+	)
 }
 
 func (r *repl) handleCommand(ctx context.Context, cmd string, messages *[]llm.Message) bool {
@@ -393,8 +626,7 @@ func (r *repl) handleCommand(ctx context.Context, cmd string, messages *[]llm.Me
 				fmt.Println(r.built.Team.Bus.Send("lead", parts[2], strings.Join(parts[3:], " "), "message", nil))
 			}
 		case "inbox":
-			data, _ := json.Marshal(r.built.Team.Bus.ReadInbox("lead"))
-			fmt.Println(string(data))
+			fmt.Println(r.readInbox("lead"))
 		default:
 			fmt.Println(r.built.Team.Mgr.ListAll())
 		}
@@ -448,18 +680,12 @@ func (r *repl) handleCommand(ctx context.Context, cmd string, messages *[]llm.Me
 	case "/hitl":
 		fmt.Println(r.handleApproval(parts))
 	case "/inbox":
-		data, _ := json.Marshal(r.built.Team.Bus.ReadInbox(r.built.Session.AgentID))
-		fmt.Println(string(data))
+		fmt.Println(r.readInbox(r.built.Session.AgentID))
 	case "/search":
 		if len(parts) < 2 {
 			fmt.Println("Usage: /search <query>")
-		} else if r.built.Runtime.Web != nil {
-			output, err := r.built.Runtime.Web.Search(context.Background(), strings.Join(parts[1:], " "))
-			if err != nil {
-				fmt.Println(err)
-			} else {
-				fmt.Println(output)
-			}
+		} else {
+			fmt.Println(r.runSearch(ctx, strings.Join(parts[1:], " ")))
 		}
 	case "/permissions":
 		if len(parts) > 1 && parts[1] == "reload" && r.built.Security.ReloadPermissions != nil {
@@ -491,8 +717,13 @@ func (r *repl) handleCommand(ctx context.Context, cmd string, messages *[]llm.Me
 		if r.built.Session.Compact == nil {
 			fmt.Println("Compaction unavailable.")
 		} else {
+			before := len(*messages)
 			*messages = r.built.Session.Compact(ctx, *messages)
-			fmt.Printf("Compacted conversation to %d messages.\n", len(*messages))
+			if len(*messages) < before {
+				fmt.Printf("Compacted conversation: %d -> %d messages.\n", before, len(*messages))
+			} else {
+				fmt.Println("Compaction skipped.")
+			}
 		}
 	case "/exit", "/quit":
 		fmt.Println("Goodbye!")

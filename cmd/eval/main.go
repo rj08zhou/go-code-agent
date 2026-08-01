@@ -5,12 +5,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"go-code-agent/internal/eval"
 	"os"
 	"time"
+
+	"go-code-agent/internal/eval"
+	"go-code-agent/internal/logging"
 )
 
 func main() {
+	logging.SetDefault(logging.New(os.Stderr, logging.LevelInfo, false))
+
 	live := flag.Bool("live", false, "run against real LLM (otherwise mock)")
 	model := flag.String("model", "", "LLM model for live mode")
 	verbose := flag.Bool("v", false, "verbose output")

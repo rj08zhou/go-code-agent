@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
@@ -32,6 +33,52 @@ func (r *Runner) emit(e event.Event) {
 		e.AgentID = r.scope.AgentID
 	}
 	r.eventSink.Emit(e)
+}
+
+// toolEventPayload exposes only non-sensitive display metadata for filesystem
+// investigation tools. It never copies file contents or mutation text.
+func toolEventPayload(tc llm.ToolCall) map[string]string {
+	var args struct {
+		Path    string `json:"path"`
+		Pattern string `json:"pattern"`
+		Offset  int    `json:"offset"`
+		Limit   int    `json:"limit"`
+	}
+	if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
+		return nil
+	}
+
+	payload := map[string]string{}
+	switch tc.Name {
+	case "read_file":
+		if args.Path == "" {
+			return nil
+		}
+		payload["path"] = args.Path
+		if args.Offset > 0 {
+			payload["offset"] = fmt.Sprintf("%d", args.Offset)
+		}
+		if args.Limit > 0 {
+			payload["limit"] = fmt.Sprintf("%d", args.Limit)
+		}
+	case "list_dir":
+		payload["path"] = args.Path
+		if args.Path == "" {
+			payload["path"] = "."
+		}
+	case "search_file", "search_content":
+		if args.Pattern == "" {
+			return nil
+		}
+		payload["pattern"] = args.Pattern
+		payload["path"] = args.Path
+		if args.Path == "" {
+			payload["path"] = "."
+		}
+	default:
+		return nil
+	}
+	return payload
 }
 
 func (r *Runner) injectTurnContext(messages []llm.Message) []llm.Message {
@@ -130,18 +177,21 @@ func (r *Runner) prepareRound(
 			if r.profile.Role == "explore" {
 				r.turn.tokens.PromptUsed += int64(r.turn.tokens.Cached)
 			}
+			before := len(messages)
 			messages = r.compress.AutoCompact(ctx, messages, r.profile.SystemPrompt)
-			// Invalidate cache after compaction since the message slice
-			// was rebuilt.
+			// Invalidate cache after a compaction attempt since the summary call
+			// and any rebuilt message slice make the estimate stale.
 			r.turn.tokens.invalidateCache()
-			r.emit(event.Event{
-				Type:    event.ContextDecision,
-				TraceID: traceID,
-				Payload: map[string]string{
-					"action": "auto_compact",
-					"rounds": fmt.Sprintf("%d", r.turn.rounds),
-				},
-			})
+			if len(messages) < before {
+				r.emit(event.Event{
+					Type:    event.ContextDecision,
+					TraceID: traceID,
+					Payload: map[string]string{
+						"action":  "auto_compact",
+						"summary": fmt.Sprintf("%d -> %d messages", before, len(messages)),
+					},
+				})
+			}
 		}
 	}
 
@@ -491,11 +541,13 @@ func (r *Runner) executeToolBatch(
 		env := &toolCallEnv{role: r.profile.Role, turn: &r.turn, key: key}
 
 		toolStart := time.Now()
+		toolPayload := toolEventPayload(tc)
 		r.emit(event.Event{
 			Type:       event.ToolStarted,
 			TraceID:    traceID,
 			ToolCallID: tc.ID,
 			ToolName:   tc.Name,
+			Payload:    toolPayload,
 		})
 
 		// Before hooks: planning guard runs first, then deferred nudges are
@@ -555,6 +607,7 @@ func (r *Runner) executeToolBatch(
 				Type: event.ToolFinished, TraceID: traceID,
 				ToolCallID: tc.ID, ToolName: tc.Name,
 				Duration: time.Since(toolStart), Status: string(result.Status), Output: result.Output,
+				Payload: toolPayload,
 			})
 			continue
 		case beforeOverride:
@@ -585,6 +638,7 @@ func (r *Runner) executeToolBatch(
 			Duration:   time.Since(toolStart),
 			Status:     string(result.Status),
 			Output:     result.Output,
+			Payload:    toolPayload,
 		})
 
 		if !result.Succeeded() {

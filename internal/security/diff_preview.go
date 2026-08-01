@@ -172,6 +172,18 @@ func printReviewHeader(action, path string) {
 	fmt.Println()
 }
 
+func readReviewChoice(prompt string) (string, error) {
+	line, err := ReadLine(prompt)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(line)), nil
+}
+
+func rejectOnInputError() {
+	fmt.Println("  Input closed or interrupted; rejecting changes")
+}
+
 func previewWholeChange(diff string, deleting bool) bool {
 	display := colorizeDiff(diff)
 	if strings.TrimSpace(diff) == "" {
@@ -184,8 +196,11 @@ func previewWholeChange(diff string, deleting bool) bool {
 		if deleting {
 			prompt = "  [D]elete file  [R]eject  [V]iew diff again  [Q]uit: "
 		}
-		line, _ := ReadLine(prompt)
-		answer := strings.ToLower(strings.TrimSpace(line))
+		answer, err := readReviewChoice(prompt)
+		if err != nil {
+			rejectOnInputError()
+			return false
+		}
 		switch answer {
 		case "y", "yes":
 			return true
@@ -216,9 +231,12 @@ func previewWholeChange(diff string, deleting bool) bool {
 func previewSingleHunk(path string, hunk diffHunk, fullDiff string) bool {
 	fmt.Println(colorizeDiff(fullDiff))
 	fmt.Println()
-	line, _ := ReadLine("  [A]pply  [R]eject  [D]iff again  [Q]uit: ")
-	ans := strings.ToLower(strings.TrimSpace(line))
-	switch ans {
+	answer, err := readReviewChoice("  [A]pply  [R]eject  [D]iff again  [Q]uit: ")
+	if err != nil {
+		rejectOnInputError()
+		return false
+	}
+	switch answer {
 	case "a", "apply", "y", "yes":
 		return true
 	case "r", "reject", "n", "no":
@@ -258,9 +276,12 @@ func previewChunkByChunk(path, oldContent, newContent string, hunks []diffHunk) 
 		fmt.Println(colorizeDiff(strings.Join(hunks[i].Lines, "\n")))
 		fmt.Println()
 
-		line, _ := ReadLine("  [A]ccept  [R]eject  a[L]l accept  [N]o all  [D]iff again  [Q]uit: ")
-		ans := strings.ToLower(strings.TrimSpace(line))
-		switch ans {
+		answer, err := readReviewChoice("  [A]ccept  [R]eject  a[L]l accept  [N]o all  [D]iff again  [Q]uit: ")
+		if err != nil {
+			rejectOnInputError()
+			return "", false
+		}
+		switch answer {
 		case "a", "accept", "y", "yes":
 			accepted[i] = true
 			fmt.Println("  Chunk accepted")
@@ -308,14 +329,22 @@ func previewChunkByChunk(path, oldContent, newContent string, hunks []diffHunk) 
 	finalContent, err := applyAcceptedHunks(oldContent, path, hunks, accepted)
 	if err != nil {
 		fmt.Printf("  Partial apply failed: %v\n", err)
-		line, _ := ReadLine("  Apply ALL changes instead? [y/N]: ")
-		if strings.ToLower(strings.TrimSpace(line)) == "y" {
+		if confirmApplyAllAfterPartialFailure() {
 			return newContent, true
 		}
 		return "", false
 	}
 	fmt.Println("  Partial apply succeeded")
 	return finalContent, true
+}
+
+func confirmApplyAllAfterPartialFailure() bool {
+	answer, err := readReviewChoice("  Apply ALL changes instead? [y/N]: ")
+	if err != nil {
+		rejectOnInputError()
+		return false
+	}
+	return answer == "y"
 }
 
 func countTrue(bs []bool) int {

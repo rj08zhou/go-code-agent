@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/chzyer/readline"
+
 	"go-code-agent/internal/application"
+	"go-code-agent/internal/history"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/session"
 )
@@ -49,5 +55,40 @@ func TestSessionSwitchCommandDefersActivationUntilBuild(t *testing.T) {
 	}
 	if index.ActiveID != first.ID {
 		t.Fatalf("active session changed before Build: got %q, want %q", index.ActiveID, first.ID)
+	}
+}
+
+func TestFormatTurnOutcomeError(t *testing.T) {
+	if got := formatTurnOutcomeError(context.Canceled, nil); !strings.Contains(got, "[interrupted]") {
+		t.Fatalf("cancelled turn feedback = %q", got)
+	}
+	if got := formatTurnOutcomeError(context.Canceled, context.Canceled); got != "" {
+		t.Fatalf("session shutdown feedback = %q, want empty", got)
+	}
+	boom := errors.New("provider failed")
+	if got := formatTurnOutcomeError(boom, nil); !strings.Contains(got, "[error]") || !strings.Contains(got, boom.Error()) {
+		t.Fatalf("ordinary error feedback = %q", got)
+	}
+}
+
+func TestReplPromptCtrlCContinuesAndCtrlDExits(t *testing.T) {
+	histStore, err := history.New(filepath.Join(t.TempDir(), history.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	r := newRepl(&application.BuiltRunner{
+		Session: application.SessionFacade{HistStore: histStore},
+	}, context.Background(), func() (string, error) {
+		reads++
+		if reads == 1 {
+			return "discard me", readline.ErrInterrupt
+		}
+		return "", io.EOF
+	})
+
+	r.run()
+	if reads != 2 {
+		t.Fatalf("read calls = %d, want Ctrl-C to continue to the next prompt", reads)
 	}
 }

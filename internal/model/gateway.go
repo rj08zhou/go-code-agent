@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"go-code-agent/internal/event"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/logging"
 	"strings"
@@ -159,9 +160,10 @@ type Gateway struct {
 	// fallbacks maps role → ordered fallback chain (tried after the primary).
 	fallbacks map[string][]Provider
 
-	usageFn  UsageRecorder
-	throttle *RoleThrottle
-	retry    retryPolicy
+	usageFn   UsageRecorder
+	eventSink event.Sink
+	throttle  *RoleThrottle
+	retry     retryPolicy
 }
 
 type UsageRecorder func(source, provider, model, traceID string, u llm.Usage, dur float64)
@@ -180,6 +182,11 @@ func (g *Gateway) SetJudgeProvider(p Provider)       { g.judgeProv = p }
 func (g *Gateway) SetSubagentProvider(p Provider)    { g.subagentProv = p }
 func (g *Gateway) SetTeamProvider(p Provider)        { g.teamProv = p }
 func (g *Gateway) SetUsageRecorder(fn UsageRecorder) { g.usageFn = fn }
+
+// SetEventSink wires the event pipeline (console, session.log, audit) so
+// retry waits and provider fallbacks are visible to the user. Same pattern
+// as Runner.SetEventSink.
+func (g *Gateway) SetEventSink(s event.Sink) { g.eventSink = s }
 
 // ProviderName returns the provider selected as the primary route for a role.
 func (g *Gateway) ProviderName(role string) string {
@@ -279,14 +286,22 @@ func nextEligibleProvider(chain []Provider, start int, params llm.CallParams) (P
 	return provider, start + offset, true
 }
 
-func logProviderFallback(role string, from, to Provider, err error) {
+func logProviderFallback(ctx context.Context, eventSink event.Sink, role string, from, to Provider, err error) {
 	reason := "permanent_error"
 	var exhausted *RetryExhaustedError
 	if errors.As(err, &exhausted) {
 		reason = "retries_exhausted"
 	}
-	logging.Default().Warn(
-		fmt.Sprintf("provider fallback: role=%s %s → %s (%s)", role, from.Name(), to.Name(), reason))
+	summary := fmt.Sprintf("provider fallback: role=%s %s → %s (%s)", role, from.Name(), to.Name(), reason)
+	if eventSink == nil {
+		logging.Default().Warn(summary)
+		return
+	}
+	eventSink.Emit(event.Event{
+		Type:    event.ModelRetry,
+		TraceID: GetTraceID(ctx),
+		Payload: map[string]string{"summary": summary},
+	})
 }
 
 // Call executes a non-streaming LLM request with retries and fallback.
@@ -298,7 +313,7 @@ func (g *Gateway) Call(ctx context.Context, role string, params llm.CallParams) 
 	}
 
 	for {
-		resp, callErr := callWithRetry(ctx, provider, prepareParamsFor(provider, params, role), g.throttle, g.usageFn, role, g.retry)
+		resp, callErr := callWithRetry(ctx, provider, prepareParamsFor(provider, params, role), g.throttle, g.usageFn, g.eventSink, role, g.retry)
 		if callErr == nil {
 			return resp, nil
 		}
@@ -309,7 +324,7 @@ func (g *Gateway) Call(ctx context.Context, role string, params llm.CallParams) 
 		if !ok {
 			return nil, callErr
 		}
-		logProviderFallback(role, provider, next, callErr)
+		logProviderFallback(ctx, g.eventSink, role, provider, next, callErr)
 		provider, idx = next, nextIdx
 	}
 }
@@ -324,7 +339,7 @@ func (g *Gateway) Stream(ctx context.Context, role string, params llm.CallParams
 
 	ts := newTrackingSink(sink)
 	for {
-		sr, callErr := streamWithRetry(ctx, provider, prepareParamsFor(provider, params, role), ts, g.throttle, g.usageFn, role, g.retry)
+		sr, callErr := streamWithRetry(ctx, provider, prepareParamsFor(provider, params, role), ts, g.throttle, g.usageFn, g.eventSink, role, g.retry)
 		if callErr == nil {
 			ts.notifyDone()
 			return sr, nil
@@ -341,7 +356,7 @@ func (g *Gateway) Stream(ctx context.Context, role string, params llm.CallParams
 		if !ok {
 			return nil, callErr
 		}
-		logProviderFallback(role, provider, next, callErr)
+		logProviderFallback(ctx, g.eventSink, role, provider, next, callErr)
 		provider, idx = next, nextIdx
 		ts.reset()
 	}
