@@ -1,8 +1,13 @@
 package agent
 
 import (
-	"go-code-agent/internal/prompt"
+	"context"
 	"testing"
+
+	"go-code-agent/internal/event"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/prompt"
+	"go-code-agent/internal/tool"
 )
 
 func TestReflection_Eval_MiniReflect(t *testing.T) {
@@ -145,5 +150,50 @@ func TestReflection_Eval_BelowThresholdNoTrigger(t *testing.T) {
 
 	if len(prompts) > 0 {
 		t.Fatalf("expected no triggers below threshold, got %d prompts", len(prompts))
+	}
+}
+
+type reflectionEventSink struct {
+	events []event.Event
+}
+
+func (s *reflectionEventSink) Emit(e event.Event) { s.events = append(s.events, e) }
+
+// Regression: reflection events must capture the counter values that satisfied
+// the trigger condition; counters are reset only after emission.
+func TestReflectionEventReportsCountersBeforeReset(t *testing.T) {
+	runner := NewRunner(NewLeadProfile("system"), nil,
+		tool.NewExecutor(tool.NewToolCatalog(), nil, nil), nil, nil)
+	runner.SetReflection(NewReflection(prompt.NewLoader()))
+	sink := &reflectionEventSink{}
+	runner.SetEventSink(sink)
+	runner.turn = newTurnState()
+	runner.turn.originalTask = "investigate the issue"
+	runner.turn.failure.RoundsSinceComplete = 12
+
+	out := &TurnOutcome{}
+	_, _, early := runner.prepareRound(
+		context.Background(), []llm.Message{llm.UserMessage("task")},
+		"model", "trace-reflect", 50, 200000, out,
+	)
+	if early != nil {
+		t.Fatalf("prepareRound ended early: %+v", early)
+	}
+
+	var reflected []event.Event
+	for _, e := range sink.events {
+		if e.Type == event.ReflectionTriggered {
+			reflected = append(reflected, e)
+		}
+	}
+	if len(reflected) == 0 {
+		t.Fatal("expected an investigation_stuck reflection event")
+	}
+	payload, _ := reflected[0].Payload.(map[string]string)
+	if payload["kind"] != reflectKindInvestigation || payload["rounds_since_complete"] != "12" {
+		t.Fatalf("payload = %#v, want kind=investigation_stuck rounds_since_complete=12", payload)
+	}
+	if runner.turn.failure.RoundsSinceComplete != 0 {
+		t.Fatalf("counter = %d, want reset after emission", runner.turn.failure.RoundsSinceComplete)
 	}
 }

@@ -4,7 +4,7 @@ go 1.25.3
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.41.0
-	github.com/chzyer/readline v1.5.1
+	github.com/chzyer/readline v1.5.2-0.20250620033330-9dfc369f8652
 	github.com/openai/openai-go v1.12.0
 	golang.org/x/net v0.57.0
 )
@@ -25,3 +25,9 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// Wide-character (CJK) backspace fix: upstream PR chzyer/readline#250 (fixes #184)
+// is unmerged; this fork tag is upstream main (9dfc369) plus only that 4-line patch
+// (verified by full module diff; content is hash-locked via go.sum).
+// Drop this replace once upstream merges the fix.
+replace github.com/chzyer/readline => github.com/rkonfj/readline v1.5.2

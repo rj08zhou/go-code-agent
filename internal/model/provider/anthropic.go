@@ -311,13 +311,27 @@ func buildAnthropicMessages(msgs []llm.Message) ([]anthropic.TextBlockParam, []a
 					{OfText: &anthropic.TextBlockParam{Text: content}},
 				},
 			}
-			if strings.HasPrefix(strings.ToLower(content), "error") {
+			if isToolResultError(content) {
 				tr.IsError = param.NewOpt(true)
 			}
 			appendUser([]anthropic.ContentBlockParamUnion{{OfToolResult: &tr}})
 		}
 	}
 	return sys, out
+}
+
+// isToolResultError reports whether a tool result content represents a
+// failed invocation. Tool outputs encode status as a leading tag, e.g.
+// "[ERROR] ...", "[TIMEOUT] ...", "[SECURITY] ...", so the previous
+// HasPrefix("error") check never matched and is_error was never set.
+func isToolResultError(content string) bool {
+	c := strings.ToLower(strings.TrimSpace(content))
+	for _, p := range []string{"[error]", "[timeout]", "[cancelled]", "[security]", "[hitl-rejected]", "[hitl-modified]", "[skipped]"} {
+		if strings.HasPrefix(c, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func toAnthropicTools(defs []llm.ToolDef) []anthropic.ToolUnionParam {

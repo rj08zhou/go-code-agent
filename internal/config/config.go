@@ -193,7 +193,9 @@ const (
 	// SubagentToolOutputMaxChars caps each tool result inside an explore
 	// subagent. Sized for a mid-size file via read_file (default 500 lines)
 	// without letting bash/list dumps balloon every subsequent prompt.
-	SubagentToolOutputMaxChars = 8000
+	// 16KB keeps a healthy multi-file investigation readable while still
+	// bounding the damage a bash dump does to the prompt prefix cache.
+	SubagentToolOutputMaxChars = 16000
 	// ExploreBudgetWarnFrac injects a "start synthesizing" nudge once the
 	// cumulative explore prompt spend crosses this fraction of
 	// SubagentPromptTokenBudget, so the model can wrap up before the hard
@@ -209,6 +211,16 @@ const (
 	KeepRecent              = 15
 	MaxOutputLen            = 64 * 1024
 	KeepRecentMessages      = 20
+	// BashOutputMaxChars caps the lead agent's bash output. Unlike read_file,
+	// bash has no offset paging, so oversized output is kept as a head/tail
+	// window (diagnostics like build errors usually land at the end) plus a
+	// hint to narrow with head/tail/grep instead of flooding context.
+	BashOutputMaxChars = 32 * 1024
+	// CompressToolOutputChars is how much of each old tool result is kept
+	// when building the compression summary handed to the LLM. 200 chars
+	// forced the model to reconstruct dropped details; 1KB preserves enough
+	// of a truncated read/bash window to stay useful after compaction.
+	CompressToolOutputChars = 1024
 	CompactionThresholdFrac = 0.75
 	// MicroCompactThresholdFrac gates the light-weight tool-result clearing on
 	// actual context pressure instead of a fixed round cadence. MicroCompact

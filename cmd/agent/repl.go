@@ -852,10 +852,7 @@ func summarizeMessages(messages []llm.Message) string {
 		if messages[i].Role == llm.RoleUser || messages[i].Role == llm.RoleAssistant {
 			text := strings.TrimSpace(messages[i].Content)
 			if text != "" {
-				if len(text) > 300 {
-					text = text[:300]
-				}
-				parts = append(parts, text)
+				parts = append(parts, utils.Truncate(text, 300))
 			}
 		}
 	}

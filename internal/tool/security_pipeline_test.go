@@ -32,6 +32,28 @@ func (a *previewApproval) DecideTool(_ string, _ json.RawMessage, preview Approv
 	}
 }
 
+func TestPreviewEditFileUsesSnakeCaseFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "file.txt")
+	if err := os.WriteFile(path, []byte("before\nunchanged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := previewEditFile(&ToolScope{Workdir: dir}, json.RawMessage(`{"path":"file.txt","old_text":"before","new_text":"after"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(preview.OriginalContent) != "before\nunchanged\n" {
+		t.Fatalf("original content = %q", preview.OriginalContent)
+	}
+	if string(preview.Content) != "after\nunchanged\n" {
+		t.Fatalf("preview content = %q, want edited content", preview.Content)
+	}
+	if string(preview.Content) == string(preview.OriginalContent) {
+		t.Fatal("edit preview did not represent a mutation")
+	}
+}
+
 func TestExecutor_DiffPreviewBeforeMutationRejects(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "file.txt")

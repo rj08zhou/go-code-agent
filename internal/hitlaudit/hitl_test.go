@@ -50,6 +50,44 @@ func TestInteractiveDecisionTrimsChoiceWhitespace(t *testing.T) {
 	}
 }
 
+func TestApprovalDetailsShowsShellCommandWithoutJSONEscaping(t *testing.T) {
+	command := `grep -rn "len(.*line\|len(.*input" . 2>/dev/null | head -20`
+	arguments, err := json.Marshal(map[string]string{"command": command})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	label, details := approvalDetails(HITLRequest{ToolName: "bash", Arguments: string(arguments)})
+	if label != "Command" {
+		t.Fatalf("label = %q, want Command", label)
+	}
+	if details != command {
+		t.Fatalf("command details = %q, want original %q", details, command)
+	}
+}
+
+func TestApprovalDetailsRemovesTerminalControlCharacters(t *testing.T) {
+	arguments, err := json.Marshal(map[string]string{"command": "echo first\n\x1b[31msecond"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, details := approvalDetails(HITLRequest{ToolName: "bash", Arguments: string(arguments)})
+	if strings.ContainsAny(details, "\n\r\x1b") {
+		t.Fatalf("command details contain terminal control characters: %q", details)
+	}
+}
+
+func TestApprovalDetailsKeepsBackgroundRunTimeout(t *testing.T) {
+	label, details := approvalDetails(HITLRequest{
+		ToolName:  "background_run",
+		Arguments: `{"command":"sleep 10","timeout":30}`,
+	})
+	if label != "Arguments" || !strings.Contains(details, `"timeout": 30`) {
+		t.Fatalf("background details = (%q, %q), want complete arguments", label, details)
+	}
+}
+
 func TestHITLApprovalAdapter_AllowsSafeTool(t *testing.T) {
 	mgr := NewHITLManager(nil)
 	mgr.SetEnabled(true)
