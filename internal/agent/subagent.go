@@ -256,15 +256,16 @@ func lastAssistantText(msgs []llm.Message) string {
 //
 //	lead   → green body, no [lead] prefix
 //	explore/teammate → cyan [sub] prefix once, then cyan body
+//	thinking → dim magenta [thinking] prefix once
 //
-// The [sub] label is printed only on the first delta of a stream. Printing
-// it on every OnTextDelta (one token/chunk) produced output like
-// `[sub] Code[sub] x[sub]  CLI` and made subagent replies unreadable.
+// The [sub]/[thinking] labels are printed only on the first delta of each
+// phase. Printing them on every chunk made streamed replies unreadable.
 type prefixedSink struct {
-	Prefix  string
-	color   string
-	isLead  bool
-	started bool
+	Prefix    string
+	color     string
+	isLead    bool
+	reasoning bool // thinking phase active / started
+	started   bool // answer text phase started
 }
 
 func newPrefixedSink(role string) *prefixedSink {
@@ -278,12 +279,28 @@ func newPrefixedSink(role string) *prefixedSink {
 	return s
 }
 
+func (s *prefixedSink) OnReasoningDelta(text string) {
+	if text == "" {
+		return
+	}
+	if !s.reasoning {
+		// Dim + magenta: visually distinct from green lead / cyan sub answers.
+		fmt.Print(utils.Dim + utils.Magenta + "[thinking] ")
+		s.reasoning = true
+	}
+	fmt.Print(text)
+}
+
 func (s *prefixedSink) OnTextDelta(text string) {
 	// Print immediately instead of buffering until OnDone.
 	// This avoids the user-perceived "hang" when the model is
 	// generating a long response: streaming content is visible in
 	// real time, and Ctrl-C during generation doesn't lose
 	// already-seen output.
+	if s.reasoning && !s.started {
+		fmt.Print(utils.Reset + "\n")
+		s.reasoning = false
+	}
 	if !s.started {
 		if s.isLead {
 			fmt.Print(s.color)
@@ -296,7 +313,7 @@ func (s *prefixedSink) OnTextDelta(text string) {
 }
 
 func (s *prefixedSink) OnDone() {
-	if s.started {
+	if s.started || s.reasoning {
 		fmt.Print(utils.Reset)
 		fmt.Println()
 	}
