@@ -142,10 +142,20 @@ func (r *Reflection) Eval(
 		prompts = append(prompts, rb.String())
 		triggered = append(triggered, reflectKindPeriodic)
 	} else if needNag {
-		prompts = append(prompts, r.promptLoader.MustLoad("todo_nag"))
+		prompts = append(prompts, r.todoNagPrompt(progressSummary))
 		resetTodoNag = true
 		triggered = append(triggered, reflectKindTodoNag)
 	}
 
 	return
+}
+
+func (r *Reflection) todoNagPrompt(progressSummary string) string {
+	promptText := r.promptLoader.MustLoad("todo_nag")
+	if strings.TrimSpace(progressSummary) == "" {
+		return promptText
+	}
+	return strings.TrimRight(promptText, "\n") +
+		"\nCurrent task state:\n" + progressSummary +
+		"\nAfter the current action, update the relevant task status."
 }

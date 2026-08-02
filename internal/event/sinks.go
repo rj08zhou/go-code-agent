@@ -141,8 +141,12 @@ func (s *ConsoleSink) Emit(e Event) {
 		case e.Status == "succeeded" && consoleResultLabel(e.ToolName) != "":
 			label := consoleResultLabel(e.ToolName)
 			var total int
-			preview, total = consoleToolPreview(e.ToolName, e.Output, 8)
-			previewOmitted = total - len(preview)
+			if isTaskStateTool(e.ToolName) {
+				preview, total = consoleFullToolOutput(e.Output)
+			} else {
+				preview, total = consoleToolPreview(e.ToolName, e.Output, 8)
+				previewOmitted = total - len(preview)
+			}
 			fmt.Fprintf(os.Stderr, " %s=%d", label, total)
 		case e.Status == "succeeded" && e.Output != "" && len(e.Output) <= 240:
 			fmt.Fprintf(os.Stderr, " %s", consoleLine(e.Output))
@@ -209,9 +213,39 @@ func consoleResultLabel(toolName string) string {
 		return "entries"
 	case "search_file", "search_content":
 		return "matches"
+	case "TodoWrite":
+		return "items"
+	case "task_dag":
+		return "nodes"
+	case "task_create", "task_list", "task_update", "task_get",
+		"task_ready", "claim_task", "task_add_dep", "task_remove_dep":
+		return "result"
 	default:
 		return ""
 	}
+}
+
+func isTaskStateTool(toolName string) bool {
+	switch toolName {
+	case "TodoWrite", "task_dag", "task_create", "task_list", "task_update",
+		"task_get", "task_ready", "claim_task", "task_add_dep", "task_remove_dep":
+		return true
+	default:
+		return false
+	}
+}
+
+func consoleFullToolOutput(text string) ([]string, int) {
+	text = strings.TrimRight(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	if text == "" {
+		return nil, 0
+	}
+	lines := strings.Split(text, "\n")
+	output := make([]string, 0, len(lines))
+	for _, line := range lines {
+		output = append(output, consoleText(line))
+	}
+	return output, len(lines)
 }
 
 func consoleToolPreview(toolName, text string, maxLines int) ([]string, int) {
@@ -289,8 +323,10 @@ func (s *SessionLogSink) reopen() error {
 func (s *SessionLogSink) Emit(e Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Cap output to prevent session.log blow-up from large file reads.
-	if len(e.Output) > 4000 {
+	// Keep structured task state complete so session replay can recover the
+	// current checklist and DAG. Other tool output remains capped to avoid
+	// allowing large file reads to grow session.log without bound.
+	if !isTaskStateTool(e.ToolName) && len(e.Output) > 4000 {
 		e.Output = e.Output[:4000] + "\n... (truncated for session.log)"
 	}
 	data, err := e.MarshalJSON()

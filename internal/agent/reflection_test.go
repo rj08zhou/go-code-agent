@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"go-code-agent/internal/event"
@@ -133,6 +134,39 @@ func TestReflection_Eval_TodoNag(t *testing.T) {
 	}
 	if !foundNag {
 		t.Fatalf("expected todo nag trigger, got: %v", triggered)
+	}
+}
+
+func TestReflection_Eval_TodoNagIncludesCurrentTaskState(t *testing.T) {
+	pl := prompt.NewLoader()
+	ref := NewReflection(pl)
+	const state = "[>] inspect files\n[ ] update tests\nDAG: 1 -> 2"
+
+	prompts, _, resetTodoNag, _, triggered := ref.Eval(
+		0, "", 3,
+		10, 0,
+		0, 4,
+		20, 20, true,
+		map[string]int{}, 1, state,
+	)
+
+	if !resetTodoNag {
+		t.Fatal("expected resetTodoNag=true")
+	}
+	foundNag := false
+	for _, k := range triggered {
+		if k == reflectKindTodoNag {
+			foundNag = true
+		}
+	}
+	if !foundNag {
+		t.Fatalf("expected todo nag trigger, got: %v", triggered)
+	}
+	if len(prompts) != 1 || !strings.Contains(prompts[0], state) {
+		t.Fatalf("todo nag prompt = %q, want current task state", prompts[0])
+	}
+	if !strings.Contains(prompts[0], "update the relevant task status") {
+		t.Fatalf("todo nag prompt lacks explicit update instruction: %q", prompts[0])
 	}
 }
 
