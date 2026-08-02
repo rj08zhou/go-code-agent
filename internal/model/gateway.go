@@ -107,15 +107,23 @@ func prepareParamsFor(p Provider, params llm.CallParams, role string) llm.CallPa
 }
 
 // StreamSink receives streaming text events.
+//
+// OnReasoningDelta is for displayable thinking/rationale streamed separately
+// from the answer. Opaque continuation state must never be sent here.
 type StreamSink interface {
 	OnTextDelta(text string)
+	OnReasoningDelta(text string)
 	OnDone()
 }
 
-// trackingSink wraps a StreamSink to track whether content was emitted to the
-// user. It intercepts OnDone from providers (which call it in finalize) so that
-// the Gateway — not the provider — controls when OnDone reaches the user.
-// This prevents duplicate OnDone across retries and fallbacks.
+// trackingSink wraps a StreamSink to track whether answer content was emitted
+// to the user. It intercepts OnDone from providers (which call it in finalize)
+// so that the Gateway — not the provider — controls when OnDone reaches the
+// user. This prevents duplicate OnDone across retries and fallbacks.
+//
+// Reasoning deltas are forwarded but do not set emitted: a thinking-only
+// stream may still need the no-content text fallback, and a display-gated
+// sink may drop reasoning without the user having seen answer text.
 type trackingSink struct {
 	inner   StreamSink
 	emitted bool
@@ -130,6 +138,10 @@ func (s *trackingSink) OnTextDelta(text string) {
 		s.emitted = true
 	}
 	s.inner.OnTextDelta(text)
+}
+
+func (s *trackingSink) OnReasoningDelta(text string) {
+	s.inner.OnReasoningDelta(text)
 }
 
 // OnDone is intercepted: providers call it in finalize, but the Gateway

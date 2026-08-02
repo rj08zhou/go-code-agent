@@ -540,7 +540,8 @@ type collectTestSink struct {
 	doneCount int
 }
 
-func (s *collectTestSink) OnTextDelta(text string) { s.text += text }
+func (s *collectTestSink) OnTextDelta(text string)      { s.text += text }
+func (s *collectTestSink) OnReasoningDelta(text string) {}
 func (s *collectTestSink) OnDone() {
 	s.done = true
 	s.doneCount++

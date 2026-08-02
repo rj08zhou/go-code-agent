@@ -13,12 +13,14 @@ import (
 )
 
 type collectSink struct {
-	deltas []string
-	done   bool
+	deltas    []string
+	reasoning []string
+	done      bool
 }
 
-func (c *collectSink) OnTextDelta(text string) { c.deltas = append(c.deltas, text) }
-func (c *collectSink) OnDone()                 { c.done = true }
+func (c *collectSink) OnTextDelta(text string)      { c.deltas = append(c.deltas, text) }
+func (c *collectSink) OnReasoningDelta(text string) { c.reasoning = append(c.reasoning, text) }
+func (c *collectSink) OnDone()                      { c.done = true }
 
 // Recorded OpenAI chat.completion.chunk payloads (SSE data= bodies).
 var openaiToolCallChunks = []string{

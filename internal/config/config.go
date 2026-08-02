@@ -28,7 +28,8 @@ type Config struct {
 
 	// ReasoningEnabled opts agent execution calls into provider-native
 	// reasoning. ReasoningEffort is a provider-interpreted hint; the OpenAI
-	// adapter validates and maps it to reasoning_effort.
+	// adapter validates and maps it to reasoning_effort. When enabled,
+	// displayable thinking streams to the terminal (dim magenta [thinking]).
 	ReasoningEnabled bool
 	ReasoningEffort  string
 

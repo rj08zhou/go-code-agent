@@ -201,10 +201,11 @@ func newOpenAIStreamAccum(providerInstanceID, modelID string) *openAIStreamAccum
 }
 
 // parseOpenAIReasoningContent reads the compatible response extension without
-// depending on a specific SDK release. reasoning_content is private model
-// rationale and therefore becomes opaque continuation state. Chat Completions
-// exposes no user-visible reasoning summary — Summary stays empty here and is
-// only populated by providers that genuinely offer one (e.g. Anthropic).
+// depending on a specific SDK release. reasoning_content becomes opaque
+// continuation state for tool loops and may be forwarded via OnReasoningDelta
+// for optional terminal display. It is never mixed into answer Content or
+// persisted in history. Chat Completions exposes no formal Summary field —
+// Summary stays empty here and is only populated by providers that offer one.
 func parseOpenAIReasoningContent(raw string) string {
 	if strings.TrimSpace(raw) == "" {
 		return ""
@@ -240,10 +241,15 @@ func newOpenAIReasoning(content, providerInstanceID, modelID string, keepContent
 
 func (a *openAIStreamAccum) apply(evt openai.ChatCompletionChunk, sink model.StreamSink) {
 	for _, choice := range evt.Choices {
-		// Compatible APIs stream private rationale separately from answer text.
-		// Accumulate it for tool-loop continuation, but never forward it to the
-		// text sink (which is user-visible).
-		a.reasoningContent.WriteString(parseOpenAIReasoningContent(choice.Delta.RawJSON()))
+		// Compatible APIs stream rationale separately from answer text.
+		// Accumulate for tool-loop continuation; also forward displayable
+		// deltas via OnReasoningDelta (UI may gate/color them). Opaque
+		// continuation state is never persisted to history.
+		reasoningDelta := parseOpenAIReasoningContent(choice.Delta.RawJSON())
+		a.reasoningContent.WriteString(reasoningDelta)
+		if reasoningDelta != "" && sink != nil {
+			sink.OnReasoningDelta(reasoningDelta)
+		}
 		a.result.Content += choice.Delta.Content
 		// Forward text immediately for real-time UX. DSML markup may
 		// appear in output for legacy DeepSeek models that lack native

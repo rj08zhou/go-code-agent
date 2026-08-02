@@ -51,10 +51,10 @@ type TeammateManager struct {
 	catalog      *tool.ToolCatalog
 	modelID      string
 	promptLoader *prompt.Loader
-	reasoning    *llm.ReasoningRequest
-	diffPreview  tool.DiffPreview
-	approval     tool.ApprovalChecker
-	eventSink    event.Sink
+	reasoning   *llm.ReasoningRequest
+	diffPreview tool.DiffPreview
+	approval    tool.ApprovalChecker
+	eventSink   event.Sink
 
 	spawnMu   sync.Mutex
 	lastSpawn time.Time
