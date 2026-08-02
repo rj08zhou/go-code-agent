@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,12 +26,7 @@ func main() {
 	os.Exit(run())
 }
 
-func run() (exitCode int) {
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags]\n\n", os.Args[0])
-		fmt.Fprintf(flag.CommandLine.Output(), "Flags:\n")
-		flag.PrintDefaults()
-		fmt.Fprintf(flag.CommandLine.Output(), `
+const providerHelpText = `
 Model / LLM environment variables (export before running):
 
   # Anthropic (default when MODEL_ID is claude-*)
@@ -59,8 +55,23 @@ Model / LLM environment variables (export before running):
   export LLM_MAX_CONCURRENCY=4
   export CONTEXT_WINDOW_TOKENS=0       # 0 = model default
 
-At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
-`)
+At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.`
+
+type runOptions struct {
+	workdir    string
+	dataDir    string
+	sessionID  string
+	newSession bool
+	human      bool
+	humanMode  string
+}
+
+func parseFlags() (*runOptions, string, error) {
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags]\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "Flags:\n")
+		flag.PrintDefaults()
+		fmt.Fprint(flag.CommandLine.Output(), providerHelpText)
 	}
 
 	workdir := flag.String("workdir", "", "Working directory (default: current directory)")
@@ -70,14 +81,13 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 	human := flag.Bool("human", false, "Use manual approval mode")
 	humanMode := flag.String("human-mode", "", "Advanced compatibility override: interactive|safe-only|auto-approve|auto-reject|notify-only")
 	flag.Parse()
+
 	if *sessionID != "" && *newSession {
-		fmt.Fprintln(os.Stderr, "Invalid options: --session and --new-session cannot be used together.")
-		return 2
+		return nil, "", fmt.Errorf("invalid options: --session and --new-session cannot be used together")
 	}
 	if *sessionID != "" {
 		if err := session.ValidateSessionID(*sessionID); err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid --session value: %v\n", err)
-			return 2
+			return nil, "", fmt.Errorf("invalid --session value: %w", err)
 		}
 	}
 
@@ -85,19 +95,30 @@ At least one of ANTHROPIC_API_KEY or OPENAI_API_KEY is required.
 	if wd == "" {
 		wd, _ = os.Getwd()
 	}
-	cfgDir := *dataDir
-	if cfgDir == "" {
-		cfgDir = os.Getenv("HOME") + "/.config"
-		if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
-			cfgDir = d
-		}
-	}
 
-	app, err := application.New(cfgDir, wd)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to initialize: %v\n", err)
-		if errors.Is(err, provider.ErrNoProvider) {
-			fmt.Fprint(os.Stderr, `
+	return &runOptions{
+		workdir:    wd,
+		dataDir:    *dataDir,
+		sessionID:  *sessionID,
+		newSession: *newSession,
+		human:      *human,
+		humanMode:  *humanMode,
+	}, wd, nil
+}
+
+func resolveConfigDir(dataDir string) string {
+	if dataDir != "" {
+		return dataDir
+	}
+	dir := os.Getenv("HOME") + "/.config"
+	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
+		dir = d
+	}
+	return dir
+}
+
+func printProviderError() {
+	fmt.Fprint(os.Stderr, `
 No usable LLM provider. Set at least one API key, e.g.:
 
   export ANTHROPIC_API_KEY="sk-ant-..."   # for claude-* models (default)
@@ -106,6 +127,84 @@ No usable LLM provider. Set at least one API key, e.g.:
 If a key is already set, make sure it matches MODEL_ID / LLM_PROVIDER.
 Run with --help for the full list of environment variables.
 `)
+}
+
+// setupTerminal initialises the diagnostic log file, readline instance,
+// history file, and the security readline hook. Callers must defer the
+// returned cleanup function to release resources in reverse order.
+func setupTerminal(dataDir string) (readFunc func(string, bool) (string, error), cleanup func(), rerr error) {
+	// Diagnostic log file — kept outside the session log to avoid
+	// interleaving structured events with model output.
+	logFile := filepath.Join(dataDir, "terminal", "agent.log")
+	lf, err := store.OpenPrivateAppend(logFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[warn] file logging disabled: %v\n", err)
+	} else {
+		logging.SetDefault(logging.New(lf, logging.LevelInfo, false))
+	}
+
+	// History file with restrictive permissions.
+	histFile := filepath.Join(dataDir, "terminal", "history")
+	if f, err := store.OpenPrivateAppend(histFile); err != nil {
+		fmt.Fprintf(os.Stderr, "[warn] repl history disabled: %v\n", err)
+		histFile = ""
+	} else {
+		f.Close()
+	}
+
+	replPrompt := utils.Blue + "> " + utils.Reset
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:                 replPrompt,
+		HistoryFile:            histFile,
+		HistorySearchFold:      true,
+		DisableAutoSaveHistory: true,
+		AutoComplete:           newCompleter(),
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("terminal: %w", err)
+	}
+
+	var terminalMu sync.Mutex
+	readFn := func(prompt string, saveHistory bool) (string, error) {
+		terminalMu.Lock()
+		defer terminalMu.Unlock()
+		rl.SetPrompt(prompt)
+		defer rl.SetPrompt(replPrompt)
+		line, err := rl.Readline()
+		if saveHistory && err == nil && strings.TrimSpace(line) != "" {
+			_ = rl.SaveHistory(line)
+		}
+		return line, err
+	}
+	security.SetReadLine(func(prompt string) (string, error) {
+		return readFn(prompt, false)
+	})
+
+	closers := []io.Closer{rl}
+	if lf != nil {
+		closers = append(closers, lf)
+	}
+	return readFn, func() {
+		security.ResetReadLine()
+		for i := len(closers) - 1; i >= 0; i-- {
+			closers[i].Close()
+		}
+	}, nil
+}
+
+func run() (exitCode int) {
+	opts, _, err := parseFlags()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	cfgDir := resolveConfigDir(opts.dataDir)
+	app, err := application.New(cfgDir, opts.workdir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize: %v\n", err)
+		if errors.Is(err, provider.ErrNoProvider) {
+			printProviderError()
 		}
 		return 1
 	}
@@ -116,60 +215,20 @@ Run with --help for the full list of environment variables.
 		}
 	}()
 
-	// Route non-event runtime diagnostics to a private file instead of
-	// stdout so they cannot interleave with streamed model output. Structured
-	// audit and usage events remain authoritative in the session log.
-	logFile := filepath.Join(app.DataDir(), "terminal", "agent.log")
-	if lf, err := store.OpenPrivateAppend(logFile); err != nil {
-		fmt.Fprintf(os.Stderr, "[warn] file logging disabled: %v\n", err)
-	} else {
-		defer lf.Close()
-		logging.SetDefault(logging.New(lf, logging.LevelInfo, false))
-	}
-
 	replPrompt := utils.Blue + "> " + utils.Reset
-
-	// Pre-create the history file with owner-only permissions (0700 dir,
-	// 0600 file); readline itself would create it world-readable (0666).
-	histFile := filepath.Join(app.DataDir(), "terminal", "history")
-	if f, err := store.OpenPrivateAppend(histFile); err != nil {
-		fmt.Fprintf(os.Stderr, "[warn] repl history disabled: %v\n", err)
-		histFile = "" // fall back to in-memory history
-	} else {
-		f.Close()
-	}
-
-	rl, err := readline.NewEx(&readline.Config{
-		Prompt:                 replPrompt,
-		HistoryFile:            histFile,
-		HistorySearchFold:      true, // case-insensitive Ctrl-R
-		DisableAutoSaveHistory: true, // approval y/n/m answers must not pollute history
-		AutoComplete:           newCompleter(),
-	})
+	readTerminal, cleanup, err := setupTerminal(app.DataDir())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize terminal: %v\n", err)
 		return 1
 	}
-	defer rl.Close()
+	defer cleanup()
 
-	var terminalMu sync.Mutex
-	readTerminal := func(prompt string, saveHistory bool) (string, error) {
-		terminalMu.Lock()
-		defer terminalMu.Unlock()
-		rl.SetPrompt(prompt)
-		defer rl.SetPrompt(replPrompt)
-		line, err := rl.Readline()
-		if saveHistory && err == nil && strings.TrimSpace(line) != "" {
-			_ = rl.SaveHistory(line) // write error only affects persistence
-		}
-		return line, err
+	next := &application.BuildOptions{
+		SessionID:  opts.sessionID,
+		NewSession: opts.newSession,
+		Human:      opts.human,
+		HumanMode:  opts.humanMode,
 	}
-	security.SetReadLine(func(prompt string) (string, error) {
-		return readTerminal(prompt, false)
-	})
-	defer security.ResetReadLine()
-
-	next := &application.BuildOptions{SessionID: *sessionID, NewSession: *newSession, Human: *human, HumanMode: *humanMode}
 	for next != nil {
 		built, rt, err := app.Build(*next)
 		if err != nil {
@@ -185,12 +244,11 @@ Run with --help for the full list of environment variables.
 		loop.run()
 		next = loop.nextBuild()
 		if next != nil {
-			closeErr := rt.Close(context.Background())
-			app.SetRuntime(nil)
-			if closeErr != nil {
+			if closeErr := rt.Close(context.Background()); closeErr != nil {
 				fmt.Fprintf(os.Stderr, "Failed to close current session: %v\n", closeErr)
 				return 1
 			}
+			app.SetRuntime(nil)
 		}
 	}
 	return 0
