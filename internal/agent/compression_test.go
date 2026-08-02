@@ -52,6 +52,42 @@ func TestMicroCompact_ClearsOldResults(t *testing.T) {
 	}
 }
 
+func TestMicroCompactPreservesLatestTaskState(t *testing.T) {
+	var msgs []llm.Message
+	msgs = append(msgs, llm.SystemMessage("system"), llm.UserMessage("task"))
+	appendTool := func(id, name, content string) {
+		msgs = append(msgs,
+			makeAssistant("", llm.ToolCall{ID: id, Name: name, Arguments: "{}"}),
+			llm.ToolMessage(content, id),
+		)
+	}
+
+	appendTool("todo-old", "TodoWrite", "old todo state "+strings.Repeat("x", 180))
+	appendTool("todo-latest", "TodoWrite", "latest todo state "+strings.Repeat("x", 180))
+	appendTool("dag-latest", "task_dag", "latest dag state "+strings.Repeat("x", 180))
+	appendTool("update-latest", "task_update", "latest task update "+strings.Repeat("x", 180))
+	for i := 4; i < 20; i++ {
+		appendTool(fmt.Sprintf("bash-%d", i), "bash", strings.Repeat("b", 200))
+	}
+
+	cleared, _ := MicroCompact(msgs, 0)
+	if cleared == 0 {
+		t.Fatal("expected old regular results to be cleared")
+	}
+	for _, id := range []string{"todo-latest", "dag-latest", "update-latest"} {
+		for _, m := range msgs {
+			if m.Role == llm.RoleTool && m.ToolCallID == id && strings.HasPrefix(m.Content, "[cleared:") {
+				t.Fatalf("latest task state %s was cleared: %q", id, m.Content)
+			}
+		}
+	}
+	for _, m := range msgs {
+		if m.Role == llm.RoleTool && m.ToolCallID == "todo-old" && !strings.HasPrefix(m.Content, "[cleared: TodoWrite]") {
+			t.Fatalf("older TodoWrite state was not compacted: %q", m.Content)
+		}
+	}
+}
+
 func TestMicroCompact_NoOpWhenFewTools(t *testing.T) {
 	msgs := []llm.Message{
 		llm.SystemMessage("system"),
@@ -62,6 +98,31 @@ func TestMicroCompact_NoOpWhenFewTools(t *testing.T) {
 	cleared, _ := MicroCompact(msgs, 0)
 	if cleared != 0 {
 		t.Fatalf("expected 0 cleared (only 1 tool result), got %d", cleared)
+	}
+}
+
+func TestBuildCompressInputPreservesLatestTaskState(t *testing.T) {
+	longTodo := "[>] inspect files\n" + strings.Repeat("todo detail ", 140) + "\nTODO-LATEST-END"
+	longDAG := "1 -> 2 -> 3\n" + strings.Repeat("dag detail ", 140) + "\nDAG-LATEST-END"
+	msgs := []llm.Message{
+		llm.SystemMessage("system"),
+		llm.UserMessage("implement the task"),
+		makeAssistant("", llm.ToolCall{ID: "todo", Name: "TodoWrite", Arguments: "{}"}),
+		llm.ToolMessage(longTodo, "todo"),
+		makeAssistant("", llm.ToolCall{ID: "dag", Name: "task_dag", Arguments: "{}"}),
+		llm.ToolMessage(longDAG, "dag"),
+	}
+
+	got := buildCompressInput(msgs)
+	for _, want := range []string{
+		"## Current TodoWrite state",
+		"TODO-LATEST-END",
+		"## Current DAG task state",
+		"DAG-LATEST-END",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("compressed input missing complete task state %q", want)
+		}
 	}
 }
 

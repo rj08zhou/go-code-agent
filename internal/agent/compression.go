@@ -93,7 +93,9 @@ func NewCompression(gw *model.Gateway, hs *history.Store, dataDir, modelID strin
 }
 
 // MicroCompact replaces old tool-result content with short placeholders,
-// keeping the most recent config.KeepRecent tool results verbatim.
+// keeping the most recent config.KeepRecent tool results verbatim. It also
+// protects the latest task-state snapshots so task progress remains available
+// after older tool results are compacted.
 //
 // minClearBytes is a clear_at_least guard: if the total bytes reclaimable from
 // the clearable (old, >100-char) tool results is below minClearBytes, nothing
@@ -122,6 +124,20 @@ func MicroCompact(msgs []llm.Message, minClearBytes int) (cleared int, reclaimed
 		return 0, 0
 	}
 
+	// Protect the latest task snapshot in each category even when it falls
+	// outside the recent-tool window. Older task snapshots remain clearable.
+	protected := map[int]bool{}
+	seenTaskState := map[string]bool{}
+	for i := len(toolIdx) - 1; i >= 0; i-- {
+		idx := toolIdx[i]
+		name := nameMap[msgs[idx].ToolCallID]
+		key := taskStateProtectionKey(name)
+		if key != "" && !seenTaskState[key] {
+			protected[idx] = true
+			seenTaskState[key] = true
+		}
+	}
+
 	// First pass: identify old, large tool results and how many bytes clearing
 	// each one would free (original length minus the placeholder length).
 	type target struct {
@@ -131,6 +147,9 @@ func MicroCompact(msgs []llm.Message, minClearBytes int) (cleared int, reclaimed
 	var targets []target
 	reclaimable := 0
 	for _, idx := range toolIdx[:len(toolIdx)-config.KeepRecent] {
+		if protected[idx] {
+			continue
+		}
 		content := msgs[idx].Content
 		if len(content) <= 100 {
 			continue
@@ -162,6 +181,33 @@ func MicroCompact(msgs []llm.Message, minClearBytes int) (cleared int, reclaimed
 	return cleared, reclaimable
 }
 
+func isTaskStateToolName(name string) bool {
+	switch name {
+	case "TodoWrite", "task_create", "task_list", "task_update", "task_get",
+		"task_ready", "claim_task", "task_add_dep", "task_remove_dep", "task_dag":
+		return true
+	default:
+		return false
+	}
+}
+
+func isTaskOverviewToolName(name string) bool {
+	return name == "task_list" || name == "task_dag"
+}
+
+func taskStateProtectionKey(name string) string {
+	switch {
+	case name == "TodoWrite":
+		return "todo"
+	case isTaskOverviewToolName(name):
+		return "overview"
+	case isTaskStateToolName(name):
+		return "mutation"
+	default:
+		return ""
+	}
+}
+
 // buildCompressInput renders a message prefix into compact structured text.
 func buildCompressInput(msgs []llm.Message) string {
 	const maxMsgChars = 500
@@ -176,6 +222,9 @@ func buildCompressInput(msgs []llm.Message) string {
 			}
 		}
 	}
+	var latestTodoState string
+	var latestTaskOverview string
+	var latestTaskMutation string
 	var b strings.Builder
 	for _, m := range msgs {
 		if m.Role == llm.RoleUser && strings.TrimSpace(m.Content) != "" {
@@ -208,18 +257,65 @@ func buildCompressInput(msgs []llm.Message) string {
 			if name == "" {
 				name = "unknown"
 			}
+			if isTaskStateToolName(name) && strings.TrimSpace(m.Content) != "" {
+				switch {
+				case name == "TodoWrite":
+					latestTodoState = m.Content
+				case isTaskOverviewToolName(name):
+					latestTaskOverview = m.Content
+				default:
+					latestTaskMutation = m.Content
+				}
+			}
 			lines = append(lines, fmt.Sprintf("  [tool:%s]: %s", name, utils.Truncate(m.Content, config.CompressToolOutputChars)))
 		}
 	}
-	all := strings.Join(lines, "\n")
-	if len(all) > maxTotalChars {
-		all = all[len(all)-maxTotalChars:]
-		if idx := strings.Index(all, "\n"); idx >= 0 {
-			all = all[idx+1:]
-		}
+
+	history := strings.Join(lines, "\n")
+	state := ""
+	if latestTodoState != "" {
+		state += "## Current TodoWrite state\n" + latestTodoState
 	}
-	b.WriteString(all)
+	if latestTaskOverview != "" {
+		if state != "" {
+			state += "\n\n"
+		}
+		state += "## Current DAG task state\n" + latestTaskOverview
+	}
+	if latestTaskMutation != "" {
+		if state != "" {
+			state += "\n\n"
+		}
+		state += "## Latest DAG task update\n" + latestTaskMutation
+	}
+	if state != "" {
+		// Reserve space for the untruncated task snapshots before trimming
+		// verbose history. This keeps task status recoverable during compaction.
+		budget := max(0, maxTotalChars-len(state)-2)
+		history = tailWithinLimit(history, budget)
+		if history != "" {
+			history += "\n\n"
+		}
+		history += state
+	} else {
+		history = tailWithinLimit(history, maxTotalChars)
+	}
+	b.WriteString(history)
 	return b.String()
+}
+
+func tailWithinLimit(text string, maxChars int) string {
+	if maxChars <= 0 {
+		return ""
+	}
+	if len(text) <= maxChars {
+		return text
+	}
+	text = text[len(text)-maxChars:]
+	if idx := strings.Index(text, "\n"); idx >= 0 {
+		text = text[idx+1:]
+	}
+	return text
 }
 
 // AutoCompact performs progressive compaction: summarizes the older prefix
