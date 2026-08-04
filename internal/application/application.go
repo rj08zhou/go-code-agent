@@ -38,9 +38,6 @@ type Application struct {
 	sessionRepo *session.Repository
 	consoleSink *event.ConsoleSink
 
-	// Embedded documentation
-	Embedded []byte
-
 	// Active runtime
 	runtime *SessionRuntime
 }

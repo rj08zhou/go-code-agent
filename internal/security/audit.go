@@ -45,22 +45,3 @@ func (s *SecretsSanitizer) Sanitize(content string) string {
 	}
 	return result
 }
-
-// RedactTokenValues removes known sensitive env var values from output.
-type Redactor struct {
-	tokens []string
-}
-
-func NewRedactor(tokens ...string) *Redactor {
-	return &Redactor{tokens: tokens}
-}
-
-func (r *Redactor) Redact(s string) string {
-	for _, tok := range r.tokens {
-		if tok == "" {
-			continue
-		}
-		s = strings.ReplaceAll(s, tok, "***")
-	}
-	return s
-}
