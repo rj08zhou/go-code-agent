@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
 	"go-code-agent/internal/hitlaudit"
 	"go-code-agent/internal/llm"
+	"go-code-agent/internal/memory"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/model/provider"
 	"go-code-agent/internal/prompt"
@@ -36,11 +38,15 @@ type Application struct {
 	gateway     *model.Gateway
 	registry    *provider.Registry
 	sessionRepo *session.Repository
+	memStore    *memory.Store
 	consoleSink *event.ConsoleSink
 
 	// Active runtime
 	runtime         *SessionRuntime
 	runtimeCloseErr error
+
+	// Background session→memory distillation (non-blocking on exit/switch).
+	backfillWG sync.WaitGroup
 }
 
 // New constructs the Application with all project-level services.
@@ -92,6 +98,7 @@ func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gatewa
 		gateway:     gw,
 		registry:    reg,
 		sessionRepo: session.NewRepository(dataDir),
+		memStore:    memory.NewStore(dataDir),
 		consoleSink: event.NewConsoleSink(),
 	}, nil
 }
@@ -339,6 +346,10 @@ func (app *Application) Build(ctx context.Context, opts BuildOptions) (*BuiltRun
 	if err := app.activateSessionRuntime(opened, rt, usageTracker); err != nil {
 		return nil, closeRuntimeAfterBuildFailure(rt, err)
 	}
+
+	// Distill inactive unsaved sessions in the background so exit/switch
+	// paths stay non-blocking (legacy SessionManager.BackfillMemory).
+	app.StartMemoryBackfill(opened.state.ID)
 
 	return built, nil
 }
