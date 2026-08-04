@@ -2,7 +2,9 @@ package repl
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 
 	"go-code-agent/internal/application"
 	"go-code-agent/internal/llm"
@@ -65,13 +67,30 @@ func formatSessionList(activeID string, sessions []session.State) string {
 	if len(sessions) == 0 {
 		return "No sessions."
 	}
+	ordered := append([]session.State(nil), sessions...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].UpdatedAt != ordered[j].UpdatedAt {
+			return ordered[i].UpdatedAt > ordered[j].UpdatedAt
+		}
+		if ordered[i].CreatedAt != ordered[j].CreatedAt {
+			return ordered[i].CreatedAt > ordered[j].CreatedAt
+		}
+		return ordered[i].ID > ordered[j].ID
+	})
 	var out strings.Builder
-	for _, st := range sessions {
+	for _, st := range ordered {
 		marker := " "
 		if st.ID == activeID {
 			marker = "*"
 		}
-		fmt.Fprintf(&out, " %s %s  %-16s %s\n", marker, st.ID, st.Status, st.Title)
+		fmt.Fprintf(&out, " %s %s  %-16s %-10s %s\n", marker, st.ID, st.Status, formatSessionTime(st.UpdatedAt), st.Title)
 	}
 	return out.String()
+}
+
+func formatSessionTime(unixSec int64) string {
+	if unixSec <= 0 {
+		return "-"
+	}
+	return time.Unix(unixSec, 0).Local().Format("2006-01-02")
 }

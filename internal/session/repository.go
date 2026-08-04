@@ -315,6 +315,7 @@ func (r *Repository) RenameSession(sessionID, title string) error {
 	for i := range idx.Sessions {
 		if idx.Sessions[i].ID == sessionID {
 			idx.Sessions[i].Title = title
+			idx.Sessions[i].UpdatedAt = st.UpdatedAt
 			if err := r.SaveIndex(idx); err != nil {
 				return fmt.Errorf("update session index: %w", err)
 			}
@@ -341,6 +342,7 @@ func (r *Repository) ArchiveSession(id string) error {
 	for i := range idx.Sessions {
 		if idx.Sessions[i].ID == id {
 			idx.Sessions[i].Status = StatusArchived
+			idx.Sessions[i].UpdatedAt = st.UpdatedAt
 			break
 		}
 	}

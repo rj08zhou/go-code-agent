@@ -144,6 +144,38 @@ func TestSwitchActiveRejectsUnknownSession(t *testing.T) {
 	}
 }
 
+func TestRenameSessionUpdatesIndexTimestamp(t *testing.T) {
+	repo := NewRepository(t.TempDir())
+	st := &State{ID: "s1", Title: "One", Status: StatusActive}
+	if err := repo.CreateSession(st); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := repo.LoadSessionMeta(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveIndex(&sessionsIndex{ActiveID: st.ID, Sessions: []State{*meta}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.RenameSession(st.ID, "Renamed"); err != nil {
+		t.Fatal(err)
+	}
+	meta, err = repo.LoadSessionMeta(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := repo.LoadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Sessions) != 1 || idx.Sessions[0].Title != "Renamed" {
+		t.Fatalf("index session = %#v", idx.Sessions)
+	}
+	if idx.Sessions[0].UpdatedAt != meta.UpdatedAt {
+		t.Fatalf("index UpdatedAt = %d, want meta %d", idx.Sessions[0].UpdatedAt, meta.UpdatedAt)
+	}
+}
+
 func TestLoadIndexReturnsShortAndGeneratedSessionIDs(t *testing.T) {
 	repo := NewRepository(t.TempDir())
 	generated := NewSessionID()
