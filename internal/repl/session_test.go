@@ -17,6 +17,21 @@ import (
 	"go-code-agent/internal/session"
 )
 
+func TestFormatSessionListPreservesActiveMarkerAndFields(t *testing.T) {
+	got := formatSessionList("active", []session.State{
+		{ID: "active", Status: session.StatusActive, Title: "Current"},
+		{ID: "old", Status: session.StatusArchived, Title: "Previous"},
+	})
+	for _, want := range []string{"* active", "active", "Current", "old", "archived", "Previous"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("formatted session list %q does not contain %q", got, want)
+		}
+	}
+	if got := formatSessionList("", nil); got != "No sessions." {
+		t.Fatalf("empty session list = %q", got)
+	}
+}
+
 func TestSessionSwitchCommandDefersActivationUntilBuild(t *testing.T) {
 	dataDir := t.TempDir()
 	repo := session.NewRepository(dataDir)

@@ -144,7 +144,7 @@ func TestSwitchActiveRejectsUnknownSession(t *testing.T) {
 	}
 }
 
-func TestListSessionsHandlesShortAndGeneratedIDs(t *testing.T) {
+func TestLoadIndexReturnsShortAndGeneratedSessionIDs(t *testing.T) {
 	repo := NewRepository(t.TempDir())
 	generated := NewSessionID()
 	idx := &sessionsIndex{
@@ -158,11 +158,21 @@ func TestListSessionsHandlesShortAndGeneratedIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := repo.ListSessions()
-	for _, want := range []string{"a", generated, "Short", "Generated"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("ListSessions output %q does not contain %q", got, want)
-		}
+	got, err := repo.LoadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ActiveID != "a" {
+		t.Fatalf("ActiveID = %q, want %q", got.ActiveID, "a")
+	}
+	if len(got.Sessions) != 2 {
+		t.Fatalf("session count = %d, want 2", len(got.Sessions))
+	}
+	if got.Sessions[0].ID != "a" || got.Sessions[0].Title != "Short" {
+		t.Fatalf("first session = %#v", got.Sessions[0])
+	}
+	if got.Sessions[1].ID != generated || got.Sessions[1].Title != "Generated" {
+		t.Fatalf("second session = %#v", got.Sessions[1])
 	}
 }
 
