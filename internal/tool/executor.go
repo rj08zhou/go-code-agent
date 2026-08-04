@@ -63,6 +63,22 @@ const (
 	ApprovalModified
 )
 
+// preparedCall is the resolved, schema-validated tool invocation.
+type preparedCall struct {
+	def     ToolDefinition
+	handler ToolHandler
+	args    json.RawMessage
+}
+
+// authorizedCall is a preparedCall that has passed capability, path, preview,
+// approval, and network gates. ReplacementContent, when set, overrides the
+// mutation body approved for the handler.
+type authorizedCall struct {
+	preparedCall
+	preview            ApprovalPreview
+	replacementContent *string
+}
+
 // WithDecisionLogger attaches a decision audit sink.
 func (e *Executor) WithDecisionLogger(l DecisionLogger) *Executor { e.decisions = l; return e }
 
@@ -91,141 +107,214 @@ func (e *Executor) Definition(name string) (ToolDefinition, bool) {
 }
 
 // Execute runs a single tool call through the full security+execution pipeline.
+// The pipeline is intentionally ordered as:
+//
+//	prepare → authorize → invoke
+//
+// so each stage has one job and early-exit semantics stay local.
 func (e *Executor) Execute(ctx context.Context, scope *ToolScope, tc llm.ToolCall) Result {
 	started := time.Now()
-	defer func() { /* duration set below */ }()
 
-	// 1. Validate JSON
+	prepared, early, ok := e.prepareExecution(scope, tc)
+	if !ok {
+		return early
+	}
+	authorized, early, ok := e.authorizeExecution(scope, tc, prepared)
+	if !ok {
+		return early
+	}
+	return e.invokeExecution(ctx, scope, tc, authorized, started)
+}
+
+// prepareExecution validates arguments and resolves the tool definition/handler.
+func (e *Executor) prepareExecution(scope *ToolScope, tc llm.ToolCall) (preparedCall, Result, bool) {
 	if tc.Arguments != "" && !json.Valid([]byte(tc.Arguments)) {
-		return InvalidArgs(fmt.Sprintf("tool call '%s' has truncated arguments", tc.Name))
+		return preparedCall{}, InvalidArgs(fmt.Sprintf("tool call '%s' has truncated arguments", tc.Name)), false
 	}
 
-	// 2. Resolve handler from immutable snapshot
 	snap := e.catalog.Load()
 	def, known := snap.Definitions[tc.Name]
 	handler, hasHandler := snap.Handlers[tc.Name]
 	if !known || !hasHandler {
-		return Unavailable(fmt.Sprintf("unknown tool %q", tc.Name))
+		return preparedCall{}, Unavailable(fmt.Sprintf("unknown tool %q", tc.Name)), false
 	}
 	if scope == nil {
-		return Denied(fmt.Sprintf("tool %q requires an execution scope", tc.Name))
+		return preparedCall{}, Denied(fmt.Sprintf("tool %q requires an execution scope", tc.Name)), false
+	}
+	if strings.HasPrefix(tc.Name, "mcp__") &&
+		(!def.Effects.Declared() || def.HasEffect(EffectUnclassified)) &&
+		e.approval == nil {
+		return preparedCall{}, Denied(fmt.Sprintf("MCP tool %q has unclassified effects and requires an approval policy", tc.Name)), false
 	}
 
-	// 3. Check capability via scope
+	return preparedCall{
+		def:     def,
+		handler: handler,
+		args:    json.RawMessage(tc.Arguments),
+	}, Result{}, true
+}
+
+// authorizeExecution enforces capability, path, preview, approval, and network
+// gates. Order matches the historical Execute pipeline and must stay stable.
+func (e *Executor) authorizeExecution(scope *ToolScope, tc llm.ToolCall, prepared preparedCall) (authorizedCall, Result, bool) {
+	def := prepared.def
+	args := prepared.args
+
+	if early, ok := e.checkCapabilities(scope, tc.Name, def); !ok {
+		return authorizedCall{}, early, false
+	}
+	if early, ok := e.checkAllowedRoots(scope, def, string(args)); !ok {
+		return authorizedCall{}, early, false
+	}
+
+	preview, early, ok := e.preparePreview(scope, def, args)
+	if !ok {
+		return authorizedCall{}, early, false
+	}
+
+	replacement, early, ok := e.decideApproval(scope, tc.Name, args, preview)
+	if !ok {
+		return authorizedCall{}, early, false
+	}
+
+	if early, ok := e.checkNetwork(scope, def, string(args)); !ok {
+		return authorizedCall{}, early, false
+	}
+
+	return authorizedCall{
+		preparedCall:       prepared,
+		preview:            preview,
+		replacementContent: replacement,
+	}, Result{}, true
+}
+
+func (e *Executor) checkCapabilities(scope *ToolScope, name string, def ToolDefinition) (Result, bool) {
 	switch {
 	case def.HasEffect(EffectExecuteProcess) && !scope.CanExecute:
-		return Denied(fmt.Sprintf("tool %q requires execute capability", tc.Name))
+		return Denied(fmt.Sprintf("tool %q requires execute capability", name)), false
 	case def.HasEffect(EffectWriteFile) && !scope.CanWrite:
-		return Denied(fmt.Sprintf("tool %q requires write capability", tc.Name))
+		return Denied(fmt.Sprintf("tool %q requires write capability", name)), false
 	case def.HasEffect(EffectDeleteFile) && !scope.CanWrite:
-		return Denied(fmt.Sprintf("tool %q requires write capability (delete)", tc.Name))
+		return Denied(fmt.Sprintf("tool %q requires write capability (delete)", name)), false
 	case def.HasEffect(EffectReadFile) && !scope.CanRead:
-		return Denied(fmt.Sprintf("tool %q requires read capability", tc.Name))
+		return Denied(fmt.Sprintf("tool %q requires read capability", name)), false
 	case def.HasEffect(EffectNetworkAccess) && !scope.CanNetwork:
-		return Denied(fmt.Sprintf("tool %q requires network capability", tc.Name))
+		return Denied(fmt.Sprintf("tool %q requires network capability", name)), false
 	case def.HasEffect(EffectMemoryMutation) && !scope.CanMemory:
-		return Denied(fmt.Sprintf("tool %q requires memory capability", tc.Name))
+		return Denied(fmt.Sprintf("tool %q requires memory capability", name)), false
 	case def.HasEffect(EffectTeamMutation) && !scope.CanTeam:
-		return Denied(fmt.Sprintf("tool %q requires team capability", tc.Name))
+		return Denied(fmt.Sprintf("tool %q requires team capability", name)), false
 	}
+	return Result{}, true
+}
 
-	// 3b. Enforce the invocation's allowed filesystem roots.
+func (e *Executor) checkAllowedRoots(scope *ToolScope, def ToolDefinition, args string) (Result, bool) {
 	if def.HasEffect(EffectReadFile) || def.HasEffect(EffectWriteFile) || def.HasEffect(EffectDeleteFile) {
-		if path := extractPath(tc.Arguments); path != "" && !pathAllowed(scope, path) {
-			return Denied(fmt.Sprintf("path %q is outside allowed roots", path))
+		if path := extractPath(args); path != "" && !pathAllowed(scope, path) {
+			return Denied(fmt.Sprintf("path %q is outside allowed roots", path)), false
 		}
 	}
+	return Result{}, true
+}
 
-	// 4. Compute a mutation preview before approval and before the handler runs.
-	approvalPreview := ApprovalPreview{}
+func (e *Executor) preparePreview(scope *ToolScope, def ToolDefinition, args json.RawMessage) (ApprovalPreview, Result, bool) {
+	preview := ApprovalPreview{}
 	if def.Preview != nil && scope.DiffPreview == nil {
-		return Denied("mutation preview service is required for this tool")
+		return ApprovalPreview{}, Denied("mutation preview service is required for this tool"), false
 	}
 	if def.Preview != nil && scope.DiffPreview != nil {
-		req, err := def.Preview(scope, json.RawMessage(tc.Arguments))
+		req, err := def.Preview(scope, args)
 		if err != nil {
-			return Denied(fmt.Sprintf("cannot create mutation preview: %v", err))
+			return ApprovalPreview{}, Denied(fmt.Sprintf("cannot create mutation preview: %v", err)), false
 		}
-		approvalPreview.Text, err = scope.DiffPreview.PreviewChange(
+		text, err := scope.DiffPreview.PreviewChange(
 			req.Path,
 			req.OriginalContent,
 			req.Content,
 		)
 		if err != nil {
-			return Denied(fmt.Sprintf("cannot create mutation preview: %v", err))
+			return ApprovalPreview{}, Denied(fmt.Sprintf("cannot create mutation preview: %v", err)), false
 		}
-		approvalPreview.Mutation = &req
+		preview.Text = text
+		preview.Mutation = &req
 	}
+	return preview, Result{}, true
+}
 
-	// 5. Approval check — preview-aware HITL runs before mutation.
+func (e *Executor) decideApproval(scope *ToolScope, name string, args json.RawMessage, preview ApprovalPreview) (*string, Result, bool) {
 	var replacementContent *string
 	if e.approval != nil {
 		if detailed, ok := e.approval.(DetailedApprovalChecker); ok {
-			approvalResult := detailed.DecideTool(tc.Name, json.RawMessage(tc.Arguments), approvalPreview)
+			approvalResult := detailed.DecideTool(name, args, preview)
 			switch approvalResult.Decision {
 			case ApprovalRejected:
-				return Rejected(approvalResult.Reason)
+				return nil, Rejected(approvalResult.Reason), false
 			case ApprovalModified:
-				return Modified(approvalResult.Feedback)
+				return nil, Modified(approvalResult.Feedback), false
 			}
 			if approvalResult.ReplacementContent != nil {
-				if approvalPreview.Mutation == nil || approvalPreview.Mutation.Delete {
-					return Denied("approval returned replacement content for a non-write mutation")
+				if preview.Mutation == nil || preview.Mutation.Delete {
+					return nil, Denied("approval returned replacement content for a non-write mutation"), false
 				}
 				replacementContent = approvalResult.ReplacementContent
 			}
 		} else if checker, ok := e.approval.(PreviewApprovalChecker); ok {
-			if allowed, reason := checker.AllowToolWithPreview(tc.Name, json.RawMessage(tc.Arguments), approvalPreview.Text); !allowed {
-				return Rejected(reason)
+			if allowed, reason := checker.AllowToolWithPreview(name, args, preview.Text); !allowed {
+				return nil, Rejected(reason), false
 			}
-		} else if allowed, reason := e.approval.AllowTool(tc.Name, json.RawMessage(tc.Arguments)); !allowed {
-			return Rejected(reason)
+		} else if allowed, reason := e.approval.AllowTool(name, args); !allowed {
+			return nil, Rejected(reason), false
 		}
 	}
 
-	// 5b. Scope-level approval check.
 	if scope.ApprovalPolicy != nil {
-		if allowed, reason := scope.ApprovalPolicy.AllowTool(tc.Name, json.RawMessage(tc.Arguments)); !allowed {
-			return Rejected(reason)
+		if allowed, reason := scope.ApprovalPolicy.AllowTool(name, args); !allowed {
+			return nil, Rejected(reason), false
 		}
 	}
+	return replacementContent, Result{}, true
+}
 
-	// 4c. Scope-level network policy (validates any URL in arguments)
-	if def.HasEffect(EffectNetworkAccess) && scope.NetworkPolicy != nil {
-		if url := extractURL(tc.Arguments); url != "" {
-			if !scope.NetworkPolicy.AllowURL(url) {
-				return Denied(fmt.Sprintf("URL %q blocked by network policy", url))
+func (e *Executor) checkNetwork(scope *ToolScope, def ToolDefinition, args string) (Result, bool) {
+	if !def.HasEffect(EffectNetworkAccess) {
+		return Result{}, true
+	}
+	if scope.NetworkPolicy != nil {
+		for _, rawURL := range extractURLs(args) {
+			if !scope.NetworkPolicy.AllowURL(rawURL) {
+				return Denied(fmt.Sprintf("URL %q blocked by network policy", rawURL)), false
 			}
 		}
 	}
-	// 4d. Global network checker
-	if def.HasEffect(EffectNetworkAccess) && e.network != nil {
-		if url := extractURL(tc.Arguments); url != "" {
-			if !e.network.AllowURL(url) {
-				return Denied(fmt.Sprintf("URL %q blocked by network policy", url))
+	if e.network != nil {
+		for _, rawURL := range extractURLs(args) {
+			if !e.network.AllowURL(rawURL) {
+				return Denied(fmt.Sprintf("URL %q blocked by network policy", rawURL)), false
 			}
 		}
 	}
+	return Result{}, true
+}
 
-	// 5. Set timeout
+// invokeExecution runs the authorized handler under timeout and finalizes the result.
+func (e *Executor) invokeExecution(ctx context.Context, scope *ToolScope, tc llm.ToolCall, call authorizedCall, started time.Time) Result {
 	toolTimeout := e.timeout
-	if def.Timeout > 0 {
-		toolTimeout = def.Timeout
+	if call.def.Timeout > 0 {
+		toolTimeout = call.def.Timeout
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, toolTimeout)
 	defer cancel()
 
-	// 6. Execute with timeout
 	resultCh := make(chan Result, 1)
 	handlerScope := *scope
 	handlerScope.Context = callCtx
-	if approvalPreview.Mutation != nil {
-		request := *approvalPreview.Mutation
+	if call.preview.Mutation != nil {
+		request := *call.preview.Mutation
 		request.OriginalContent = append([]byte(nil), request.OriginalContent...)
 		request.Content = append([]byte(nil), request.Content...)
-		if replacementContent != nil {
-			request.Content = []byte(*replacementContent)
+		if call.replacementContent != nil {
+			request.Content = []byte(*call.replacementContent)
 		}
 		handlerScope.approvedMutation = &request
 	}
@@ -236,7 +325,7 @@ func (e *Executor) Execute(ctx context.Context, scope *ToolScope, tc llm.ToolCal
 					result = Failed(fmt.Sprintf("tool panicked: %v", recovered))
 				}
 			}()
-			return handler(&handlerScope, json.RawMessage(tc.Arguments))
+			return call.handler(&handlerScope, call.args)
 		}()
 		if e.sanitizer != nil {
 			result.Output = e.sanitizer.Sanitize(result.Output)
@@ -336,20 +425,45 @@ func pathAllowed(scope *ToolScope, raw string) bool {
 	return false
 }
 
-// extractURL tries to pull a "url" or "URL" field from raw JSON tool arguments.
-func extractURL(args string) string {
+// extractURLs finds network destination fields in nested JSON arguments.
+// It intentionally inspects only URL-shaped field names so arbitrary prose
+// containing a URL does not turn every network-capable tool into a rejection.
+func extractURLs(args string) []string {
 	if args == "" {
-		return ""
+		return nil
 	}
-	var m map[string]any
-	if json.Unmarshal([]byte(args), &m) != nil {
-		return ""
+	var value any
+	if json.Unmarshal([]byte(args), &value) != nil {
+		return nil
 	}
-	if u, ok := m["url"].(string); ok && u != "" {
-		return u
+
+	keys := map[string]struct{}{
+		"url": {}, "uri": {}, "endpoint": {}, "webhook": {}, "callback_url": {},
+		"callbackurl": {},
 	}
-	if u, ok := m["URL"].(string); ok && u != "" {
-		return u
+	var urls []string
+	seen := make(map[string]struct{})
+	var walk func(any)
+	walk = func(current any) {
+		switch value := current.(type) {
+		case map[string]any:
+			for key, child := range value {
+				if _, ok := keys[strings.ToLower(key)]; ok {
+					if rawURL, ok := child.(string); ok && rawURL != "" {
+						if _, duplicate := seen[rawURL]; !duplicate {
+							seen[rawURL] = struct{}{}
+							urls = append(urls, rawURL)
+						}
+					}
+				}
+				walk(child)
+			}
+		case []any:
+			for _, child := range value {
+				walk(child)
+			}
+		}
 	}
-	return ""
+	walk(value)
+	return urls
 }

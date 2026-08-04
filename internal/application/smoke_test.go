@@ -88,7 +88,7 @@ func TestBuildExposesSanitizedRuntimeStatus(t *testing.T) {
 	}
 	defer app.Shutdown(context.Background())
 
-	built, rt, err := app.Build(application.BuildOptions{NewSession: true})
+	built, rt, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestBuildExposesSanitizedRuntimeStatus(t *testing.T) {
 func TestBuild_Smoke_NewBuildClose(t *testing.T) {
 	app, cfgDir, workdir := newTestApp(t)
 
-	built, rt, err := app.Build(application.BuildOptions{NewSession: true})
+	built, rt, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}

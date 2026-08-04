@@ -50,6 +50,17 @@ func TestInteractiveDecisionTrimsChoiceWhitespace(t *testing.T) {
 	}
 }
 
+func TestInteractiveDecisionIgnoresBlankAndInvalidChoices(t *testing.T) {
+	calls := setReviewAnswers(t, "", "please apply this", "y")
+	response := readInteractiveDecision()
+	if response.Decision != HITLApprove {
+		t.Fatalf("decision = %v, want approval after ignored invalid input", response.Decision)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("input calls = %d, want blank + invalid + approve", got)
+	}
+}
+
 func TestApprovalDetailsShowsShellCommandWithoutJSONEscaping(t *testing.T) {
 	command := `grep -rn "len(.*line\|len(.*input" . 2>/dev/null | head -20`
 	arguments, err := json.Marshal(map[string]string{"command": command})
@@ -96,6 +107,69 @@ func TestHITLApprovalAdapter_AllowsSafeTool(t *testing.T) {
 	allowed, reason := adapter.AllowTool("read_file", json.RawMessage(`{}`))
 	if !allowed {
 		t.Errorf("expected read_file to be allowed, got: %s", reason)
+	}
+}
+
+func TestHITLApprovalAdapter_UsesDefinitionRiskForMCP(t *testing.T) {
+	t.Setenv("HITL_NON_TTY_FALLBACK", "")
+	mgr := NewHITLManager(nil)
+	mgr.SetEnabled(true)
+	mgr.SetMode(HITLModeSafeOnly)
+	adapter := NewHITLApprovalAdapter(mgr)
+
+	catalog := tool.NewToolCatalog()
+	catalog.RegisterAll([]tool.ToolDefinition{{
+		Name:      "mcp__demo__delete_user",
+		RiskLevel: tool.RiskDanger,
+		Effects:   tool.Effects(tool.EffectNetworkAccess),
+		Handler: func(scope *tool.ToolScope, args json.RawMessage) tool.Result {
+			return tool.Succeeded("deleted")
+		},
+	}})
+	adapter.SetCatalog(catalog)
+
+	allowed, reason := adapter.AllowTool("mcp__demo__delete_user", json.RawMessage(`{"id":"42"}`))
+	if allowed {
+		t.Fatalf("dangerous MCP tool bypassed HITL: %q", reason)
+	}
+}
+
+func TestHITLApprovalAdapter_EnforcesMCPPermissionRules(t *testing.T) {
+	dir := t.TempDir()
+	permissionsPath := filepath.Join(dir, "permissions.json")
+	if err := os.WriteFile(permissionsPath, []byte(`[
+		{"tool":"mcp__demo__write","level":"block"},
+		{"tool":"mcp__demo__read","level":"confirm"}
+	]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	permissions := security.NewPermissions()
+	if err := permissions.Load(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	blockedMgr := NewHITLManager(nil)
+	blockedAdapter := NewHITLApprovalAdapter(blockedMgr)
+	blockedAdapter.SetPermissions(permissions)
+	if allowed, reason := blockedAdapter.AllowTool("mcp__demo__write", json.RawMessage(`{}`)); allowed {
+		t.Fatalf("blocked MCP tool was allowed: %q", reason)
+	}
+
+	confirmMgr := NewHITLManager(nil)
+	confirmMgr.SetEnabled(true)
+	confirmMgr.SetMode(HITLModeAutoReject)
+	confirmAdapter := NewHITLApprovalAdapter(confirmMgr)
+	confirmAdapter.SetPermissions(permissions)
+	catalog := tool.NewToolCatalog()
+	catalog.RegisterAll([]tool.ToolDefinition{{
+		Name:      "mcp__demo__read",
+		RiskLevel: tool.RiskAuto,
+		Effects:   tool.Effects(tool.EffectNetworkAccess),
+		Handler:   func(scope *tool.ToolScope, args json.RawMessage) tool.Result { return tool.Succeeded("read") },
+	}})
+	confirmAdapter.SetCatalog(catalog)
+	if allowed, reason := confirmAdapter.AllowTool("mcp__demo__read", json.RawMessage(`{}`)); allowed {
+		t.Fatalf("confirm MCP tool was auto-allowed: %q", reason)
 	}
 }
 

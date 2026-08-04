@@ -76,11 +76,40 @@ func TestDiffReviewRejectsAmbiguousMultiWordChoices(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			setSecurityReadLine(t, func(string) (string, error) { return test.answer, nil })
+			calls := 0
+			setSecurityReadLine(t, func(string) (string, error) {
+				calls++
+				if calls == 1 {
+					return test.answer, nil
+				}
+				return "r", nil
+			})
 			if test.review() {
 				t.Fatalf("ambiguous choice %q approved changes", test.answer)
 			}
+			if calls < 2 {
+				t.Fatalf("ambiguous input calls = %d, want re-prompt then explicit reject", calls)
+			}
 		})
+	}
+}
+
+func TestDiffReviewRePromptsOnEmptyOrInvalidInput(t *testing.T) {
+	answers := []string{"", "zzz", "a"}
+	idx := 0
+	setSecurityReadLine(t, func(string) (string, error) {
+		if idx >= len(answers) {
+			return "", io.EOF
+		}
+		answer := answers[idx]
+		idx++
+		return answer, nil
+	})
+	if !previewSingleHunk("file.txt", diffHunk{}, "diff") {
+		t.Fatal("empty/invalid input should re-prompt and accept a later A")
+	}
+	if idx != 3 {
+		t.Fatalf("input calls consumed = %d, want 3", idx)
 	}
 }
 
@@ -109,10 +138,20 @@ func TestDiffReviewFailsClosedWhenInputEnds(t *testing.T) {
 func TestChunkReviewRejectsAmbiguousChoiceAndStopsOnInputError(t *testing.T) {
 	hunks := []diffHunk{{Header: "@@ -1 +1 @@", Lines: []string{"-old", "+new"}}}
 
-	t.Run("ambiguous choice", func(t *testing.T) {
-		setSecurityReadLine(t, func(string) (string, error) { return "all maybe", nil })
+	t.Run("ambiguous choice re-prompts then rejects", func(t *testing.T) {
+		calls := 0
+		setSecurityReadLine(t, func(string) (string, error) {
+			calls++
+			if calls == 1 {
+				return "all maybe", nil
+			}
+			return "r", nil
+		})
 		if _, ok := previewChunkByChunk("file.txt", "old\n", "new\n", hunks); ok {
 			t.Fatal("ambiguous apply-all choice approved changes")
+		}
+		if calls < 2 {
+			t.Fatalf("input calls = %d, want re-prompt then reject", calls)
 		}
 	})
 
@@ -278,6 +317,88 @@ func TestSecurePathRejectsAbsolutePathOutsideWorkdir(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "escapes workdir") {
 		t.Fatalf("error = %v, want escapes workdir", err)
+	}
+}
+
+// Regression: when the target file does not exist and allowWrite=true,
+// SecurePath must still resolve symlinks in the parent directory chain.
+// Without this, a symlinked parent directory can be used to escape the
+// sandbox while the final leaf (a new file) does not yet exist.
+func TestSecurePathSymlinkedParentWithNonExistentTarget(t *testing.T) {
+	wd := t.TempDir()
+
+	// Create a real directory outside the workdir, then symlink into it.
+	outsideDir := t.TempDir()
+	symlinkDir := filepath.Join(wd, "inside_link")
+	if err := os.Symlink(outsideDir, symlinkDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// A path through the symlinked parent into a non-existent file should be
+	// rejected because the resolved parent escapes the workdir.
+	_, err := SecurePath(wd, filepath.Join("inside_link", "new_file.txt"), true)
+	if err == nil {
+		t.Fatal("expected escape error for symlinked parent path to non-existent file")
+	}
+	if !strings.Contains(err.Error(), "escapes workdir") && !strings.Contains(err.Error(), "symlink escapes workdir via parent") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSecurePathSymlinkedAncestorWithMissingIntermediateDirectory(t *testing.T) {
+	wd := t.TempDir()
+	outsideDir := t.TempDir()
+	symlinkDir := filepath.Join(wd, "inside_link")
+	if err := os.Symlink(outsideDir, symlinkDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// The immediate parent does not exist, so SecurePath must walk upward
+	// until it resolves inside_link rather than accepting the textual prefix.
+	target := filepath.Join("inside_link", "missing_dir", "new_file.txt")
+	if _, err := SecurePath(wd, target, true); err == nil {
+		t.Fatal("expected escape error through symlinked ancestor with missing intermediate directory")
+	} else if !strings.Contains(err.Error(), "escapes workdir") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// SecurePath must accept a symlinked parent path when the target file
+// already exists and the resolved path stays within the workdir.
+func TestSecurePathAcceptsSymlinkedParentExistingFile(t *testing.T) {
+	wd := t.TempDir()
+
+	// Create a real directory inside the workdir and a symlink pointing to it.
+	realDir := filepath.Join(wd, "real_sub")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkDir := filepath.Join(wd, "link_sub")
+	if err := os.Symlink(realDir, symlinkDir); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(symlinkDir, "existing.txt")
+	if err := os.WriteFile(target, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := SecurePath(wd, filepath.Join("link_sub", "existing.txt"), false)
+	if err != nil {
+		t.Fatalf("SecurePath(symlinked parent, existing file) err: %v", err)
+	}
+	// The resolved path must be within the workdir (after resolving macOS
+	// /var→/private/var and other symlinks). Compare both sides through
+	// EvalSymlinks so the check is symlink-aware.
+	resolved, err := filepath.EvalSymlinks(got)
+	if err != nil {
+		t.Fatalf("EvalSymlinks on result: %v", err)
+	}
+	resolvedWd, err := filepath.EvalSymlinks(wd)
+	if err != nil {
+		t.Fatalf("EvalSymlinks on workdir: %v", err)
+	}
+	if !strings.HasPrefix(resolved, resolvedWd+string(filepath.Separator)) && resolved != resolvedWd {
+		t.Fatalf("resolved path %q does not start with resolved workdir %q", resolved, resolvedWd)
 	}
 }
 

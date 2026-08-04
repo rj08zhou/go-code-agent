@@ -1,6 +1,7 @@
 package application
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -37,6 +38,7 @@ type RunnerParams struct {
 	BGSvc        *background.Supervisor
 	Bus          *team.MessageBus
 	WebService   tool.WebService
+	Console      *event.ConsoleSink
 	HITLMgr      *hitlaudit.HITLManager
 	Approval     *security.ApprovalState
 	MCPMgr       *mcp.Manager
@@ -78,7 +80,8 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams, sessionDir string) (*
 	wireTools(rt, params, wb)
 	wb.sysPrompt = wireSystemPrompt(rt, params)
 	wb.runner, wb.judge = wireAgent(rt, params, wb, st.ID, sessionDir)
-	wireObservability(rt, params, wb, sessionDir)
+	sessionLog := wireObservability(rt, params, wb, sessionDir)
+	registerSessionShutdownHooks(rt, params, wb, sessionLog)
 
 	providerName := rt.gateway.ProviderName("lead")
 	return &BuiltRunner{
@@ -169,9 +172,11 @@ func safeEndpointHost(rawURL, defaultHost string) string {
 }
 
 func wireSecurity(rt *SessionRuntime, params RunnerParams) (*tool.Executor, *hitlaudit.HITLApprovalAdapter) {
-	hitlApproval := hitlaudit.NewHITLApprovalAdapter(params.HITLMgr)
+	hitlApproval := hitlaudit.NewHITLApprovalAdapter(params.HITLMgr, params.Console)
 	hitlApproval.SetApproval(params.Approval)
-	exec := tool.NewExecutor(rt.catalog, hitlApproval, nil).
+	hitlApproval.SetCatalog(rt.catalog)
+	hitlApproval.SetPermissions(params.Permissions)
+	exec := tool.NewExecutor(rt.catalog, hitlApproval, security.NewSSRFNetworkChecker()).
 		WithSanitizer(security.NewSecretsSanitizer()).
 		WithDecisionLogger(params.DecisionLog)
 	return exec, hitlApproval
@@ -299,31 +304,56 @@ func wireAgent(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionI
 	return runner, judgeInst
 }
 
-func wireObservability(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionDir string) {
+func wireObservability(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionDir string) *event.SessionLogSink {
 	// session.log is the authoritative structured event record. Keep the
 	// terminal sink for user-facing summaries; audit and usage events are
 	// already captured by SessionLogSink and should not be duplicated in
 	// agent.log.
-	sinks := []event.Sink{event.NewConsoleSink()}
-	if sessionLog, logErr := event.NewSessionLogSink(filepath.Join(sessionDir, "session.log")); logErr != nil {
+	consoleSink := params.Console
+	if consoleSink == nil {
+		consoleSink = event.NewConsoleSink()
+	}
+	sinks := []event.Sink{consoleSink}
+	var sessionLog *event.SessionLogSink
+	if logSink, logErr := event.NewSessionLogSink(filepath.Join(sessionDir, "session.log")); logErr != nil {
 		fmt.Fprintf(os.Stderr, "[warn] session.log: %v\n", logErr)
 	} else {
+		sessionLog = logSink
 		sinks = append(sinks, sessionLog)
-		rt.AddHook("session-log", sessionLog.Close)
 	}
 	allEvents := event.NewMultiSink(sinks...)
 	wb.runner.SetEventSink(allEvents)
 	wb.subagent.SetEventSink(allEvents)
 	wb.teamMgr.SetEventSink(allEvents)
 	rt.gateway.SetEventSink(allEvents)
+	return sessionLog
+}
 
-	rt.AddHook("team", func() error { wb.teamMgr.ShutdownAll(); wb.teamMgr.Wait(); return nil })
-	rt.AddHook("mcp", func() error { params.MCPMgr.Shutdown(); return nil })
-	rt.AddHook("background", func() error { params.BGSvc.StopAll(); return nil })
-	rt.AddHook("worktree", func() error { params.WorktreeSvc.RemoveAll(); return nil })
-	if wb.histStore != nil {
-		rt.AddHook("history", func() error { return wb.histStore.Close() })
+// registerSessionShutdownHooks records all runner-owned resources in creation
+// order. SessionRuntime closes hooks in reverse, so teammates and background
+// work stop before MCP, worktrees, history, and the event log are released.
+func registerSessionShutdownHooks(
+	rt *SessionRuntime,
+	params RunnerParams,
+	wb *wireBundle,
+	sessionLog *event.SessionLogSink,
+) {
+	if sessionLog != nil {
+		rt.AddHook("session-log", func(context.Context) error { return sessionLog.Close() })
 	}
+	if wb.histStore != nil {
+		rt.AddHook("history", func(context.Context) error { return wb.histStore.Close() })
+	}
+	rt.AddHook("worktree", func(context.Context) error { params.WorktreeSvc.RemoveAll(); return nil })
+	rt.AddHook("mcp", func(context.Context) error { params.MCPMgr.Shutdown(); return nil })
+	rt.AddHook("background", func(ctx context.Context) error {
+		params.BGSvc.StopAll()
+		return params.BGSvc.Wait(ctx)
+	})
+	rt.AddHook("team", func(ctx context.Context) error {
+		wb.teamMgr.ShutdownAll()
+		return wb.teamMgr.Wait(ctx)
+	})
 }
 
 func diffPreviewConcrete(dp tool.DiffPreview) *security.DiffPreview {
@@ -350,6 +380,7 @@ func newSessionParams(
 		TaskSvc:     task.NewService(filepath.Join(sessionDir, "tasks")),
 		TodoSvc:     &task.TodoManager{},
 		DiffPreview: diffPreview,
+		Console:     app.consoleSink,
 		DecisionLog: decisionLog,
 		MemoryStore: memory.NewStore(app.dataDir),
 		SkillLoader: skill.NewLoader(filepath.Join(workdir, "skills")),
