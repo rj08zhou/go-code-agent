@@ -236,7 +236,7 @@ func run() (exitCode int) {
 		HumanMode:  opts.humanMode,
 	}
 	for next != nil {
-		built, rt, err := app.Build(rootCtx, *next)
+		built, err := app.Build(rootCtx, *next)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to start session: %v\n", err)
 			if next.SessionID != "" {
@@ -244,17 +244,16 @@ func run() (exitCode int) {
 			}
 			return 1
 		}
-		loop := repl.New(built, rt.Ctx, func() (string, error) {
+		loop := repl.New(built, built.Session.Context, func() (string, error) {
 			return readTerminal(replPrompt, true)
 		})
 		loop.Run()
 		next = loop.NextBuild()
 		if next != nil {
-			if closeErr := rt.Close(context.Background()); closeErr != nil {
+			if closeErr := app.CloseSession(context.Background()); closeErr != nil {
 				fmt.Fprintf(os.Stderr, "Failed to close current session: %v\n", closeErr)
 				return 1
 			}
-			app.SetRuntime(nil)
 		}
 	}
 	return 0

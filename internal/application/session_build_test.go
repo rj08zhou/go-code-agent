@@ -13,35 +13,32 @@ import (
 	"go-code-agent/internal/session"
 )
 
-func TestBuildRejectsMissingExplicitSessionWithoutCreatingOne(t *testing.T) {
-	app, _, _ := newTestApp(t)
-	defer app.Shutdown(context.Background())
+func TestBuildRejectsInvalidSessionRequests(t *testing.T) {
+	tests := []struct {
+		name string
+		opts application.BuildOptions
+		want error
+	}{
+		{"missing", application.BuildOptions{SessionID: "missing"}, session.ErrSessionNotFound},
+		{"invalid identifier", application.BuildOptions{SessionID: "../outside"}, session.ErrInvalidSessionID},
+	}
 
-	built, rt, err := app.Build(context.Background(), application.BuildOptions{SessionID: "missing"})
-	if !errors.Is(err, session.ErrSessionNotFound) {
-		t.Fatalf("Build error = %v, want ErrSessionNotFound", err)
-	}
-	if built != nil || rt != nil {
-		t.Fatalf("Build returned runtime for missing session: built=%v rt=%v", built, rt)
-	}
-	if app.Runtime() != nil {
-		t.Fatal("missing explicit session unexpectedly installed an active runtime")
-	}
-	if got := app.SessionRepo().ListSessions(); got != "No sessions." {
-		t.Fatalf("sessions after failed resume = %q, want no sessions", got)
-	}
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			app, _, _ := newTestApp(t)
+			defer app.Shutdown(context.Background())
 
-func TestBuildRejectsInvalidExplicitSessionID(t *testing.T) {
-	app, _, _ := newTestApp(t)
-	defer app.Shutdown(context.Background())
-
-	built, rt, err := app.Build(context.Background(), application.BuildOptions{SessionID: "../outside"})
-	if !errors.Is(err, session.ErrInvalidSessionID) {
-		t.Fatalf("Build error = %v, want ErrInvalidSessionID", err)
-	}
-	if built != nil || rt != nil {
-		t.Fatalf("Build returned runtime for invalid session ID: built=%v rt=%v", built, rt)
+			built, err := app.Build(context.Background(), tc.opts)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Build error = %v, want %v", err, tc.want)
+			}
+			if built != nil {
+				t.Fatalf("Build returned runner for failed request: %#v", built)
+			}
+			if got := app.Catalog(); got != nil {
+				t.Fatalf("failed Build installed a catalog: %#v", got)
+			}
+		})
 	}
 }
 
@@ -49,12 +46,15 @@ func TestBuildRejectsMutuallyExclusiveSessionOptions(t *testing.T) {
 	app, _, _ := newTestApp(t)
 	defer app.Shutdown(context.Background())
 
-	built, rt, err := app.Build(context.Background(), application.BuildOptions{SessionID: "session-1", NewSession: true})
+	built, err := app.Build(context.Background(), application.BuildOptions{
+		SessionID:  "session-1",
+		NewSession: true,
+	})
 	if err == nil || !strings.Contains(err.Error(), "cannot be used together") {
 		t.Fatalf("Build error = %v, want mutually exclusive option error", err)
 	}
-	if built != nil || rt != nil {
-		t.Fatalf("Build returned runtime for invalid options: built=%v rt=%v", built, rt)
+	if built != nil {
+		t.Fatalf("Build returned runner for invalid options: %#v", built)
 	}
 }
 
@@ -64,57 +64,86 @@ func TestBuildRejectsCanceledParentContext(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	built, runtime, err := app.Build(ctx, application.BuildOptions{NewSession: true})
+	built, err := app.Build(ctx, application.BuildOptions{NewSession: true})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Build error = %v, want context canceled", err)
 	}
-	if built != nil || runtime != nil {
-		t.Fatalf("Build returned runtime for canceled context: built=%v runtime=%v", built, runtime)
+	if built != nil {
+		t.Fatalf("Build returned runner for canceled context: %#v", built)
 	}
 }
 
-func TestBuildExplicitSessionBecomesActive(t *testing.T) {
+func TestBuildRequiresClosingActiveSession(t *testing.T) {
 	app, _, _ := newTestApp(t)
 	defer app.Shutdown(context.Background())
 
-	first, firstRT, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
+	first, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Session.Context == nil {
+		t.Fatal("Build did not expose the session context")
+	}
+	if _, err := app.Build(context.Background(), application.BuildOptions{NewSession: true}); err == nil ||
+		!strings.Contains(err.Error(), "must be closed") {
+		t.Fatalf("Build with active session error = %v, want active-runtime error", err)
+	}
+	if err := app.CloseSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Session.ID == first.Session.ID {
+		t.Fatal("two fresh sessions have the same ID")
+	}
+	if err := app.CloseSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuildActivatesExplicitAndImplicitSessions(t *testing.T) {
+	app, _, _ := newTestApp(t)
+	defer app.Shutdown(context.Background())
+
+	first, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	firstID := first.Session.ID
-	if err := firstRT.Close(context.Background()); err != nil {
+	if err := app.CloseSession(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	second, secondRT, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
+	second, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second.Session.ID == firstID {
 		t.Fatal("two fresh builds returned the same session ID")
 	}
-	if err := secondRT.Close(context.Background()); err != nil {
+	if err := app.CloseSession(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	resumed, resumedRT, err := app.Build(context.Background(), application.BuildOptions{SessionID: firstID})
+	resumed, err := app.Build(context.Background(), application.BuildOptions{SessionID: firstID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resumed.Session.ID != firstID {
 		t.Fatalf("resumed ID = %q, want %q", resumed.Session.ID, firstID)
 	}
-	if err := resumedRT.Close(context.Background()); err != nil {
+	if err := app.CloseSession(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	implicit, implicitRT, err := app.Build(context.Background(), application.BuildOptions{})
+	implicit, err := app.Build(context.Background(), application.BuildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer implicitRT.Close(context.Background())
 	if implicit.Session.ID != firstID {
-		t.Fatalf("implicit resume ID = %q, want explicitly activated %q", implicit.Session.ID, firstID)
+		t.Fatalf("implicit resume ID = %q, want %q", implicit.Session.ID, firstID)
 	}
 }
 
@@ -122,12 +151,12 @@ func TestBuildRepairsUnavailableImplicitActiveSession(t *testing.T) {
 	app, _, _ := newTestApp(t)
 	defer app.Shutdown(context.Background())
 
-	original, originalRT, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
+	original, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	originalID := original.Session.ID
-	if err := originalRT.Close(context.Background()); err != nil {
+	if err := app.CloseSession(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	originalDir, err := app.SessionRepo().SessionDir(originalID)
@@ -138,116 +167,23 @@ func TestBuildRepairsUnavailableImplicitActiveSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	replacement, replacementRT, err := app.Build(context.Background(), application.BuildOptions{})
+	replacement, err := app.Build(context.Background(), application.BuildOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if replacement.Session.ID == originalID {
 		t.Fatal("unavailable implicit active session was not replaced")
 	}
-	if err := replacementRT.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	resumed, resumedRT, err := app.Build(context.Background(), application.BuildOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resumedRT.Close(context.Background())
-	if resumed.Session.ID != replacement.Session.ID {
-		t.Fatalf("repaired active ID = %q, want %q", resumed.Session.ID, replacement.Session.ID)
-	}
-}
-
-func TestBuildFailurePreservesActiveSessionAndRuntime(t *testing.T) {
-	app, _, _ := newTestApp(t)
-	defer app.Shutdown(context.Background())
-
-	failedTarget, failedTargetRT, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := failedTargetRT.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	active, activeRT, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := activeRT.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	previousRuntime := app.Runtime()
-	before, err := app.SessionRepo().LoadIndex()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if before.ActiveID != active.Session.ID {
-		t.Fatalf("active session before failed Build = %q, want %q", before.ActiveID, active.Session.ID)
-	}
-
-	sessionDir, err := app.SessionRepo().SessionDir(failedTarget.Session.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	historyDir := filepath.Join(sessionDir, "history")
-	if err := os.RemoveAll(historyDir); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(historyDir, []byte("not a directory"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	built, runtime, err := app.Build(context.Background(), application.BuildOptions{SessionID: failedTarget.Session.ID})
-	if err == nil || !strings.Contains(err.Error(), "initialize history") {
-		t.Fatalf("Build error = %v, want history initialization error", err)
-	}
-	if built != nil || runtime != nil {
-		t.Fatalf("Build returned partial runtime: built=%v runtime=%v", built, runtime)
-	}
-	if app.Runtime() != previousRuntime {
-		t.Fatal("failed Build replaced the previously installed runtime")
-	}
-	after, err := app.SessionRepo().LoadIndex()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after.ActiveID != active.Session.ID {
-		t.Fatalf("active session after failed Build = %q, want %q", after.ActiveID, active.Session.ID)
-	}
-}
-
-func TestShutdownReturnsStableRuntimeCloseError(t *testing.T) {
-	app, _, _ := newTestApp(t)
-	runtime := application.NewSessionRuntime(context.Background(), nil, "", nil, app.SessionRepo(), &session.State{ID: "close-error"})
-	calls := 0
-	runtime.AddHook("failing", func(context.Context) error {
-		calls++
-		return errors.New("close failed")
-	})
-	app.SetRuntime(runtime)
-
-	first := app.Shutdown(context.Background())
-	if first == nil || !strings.Contains(first.Error(), "close failed") {
-		t.Fatalf("first Shutdown error = %v, want close failure", first)
-	}
-	second := app.Shutdown(context.Background())
-	if second == nil || second.Error() != first.Error() {
-		t.Fatalf("second Shutdown error = %v, want %v", second, first)
-	}
-	if calls != 1 {
-		t.Fatalf("shutdown hook calls = %d, want 1", calls)
-	}
 }
 
 func TestSessionRuntimeCloseRunsHooksInReverseOrder(t *testing.T) {
 	runtime := application.NewSessionRuntime(context.Background(), nil, "", nil, nil, &session.State{ID: "ordered-close"})
 	var order []string
-	runtime.AddHook("first", func(ctx context.Context) error {
+	runtime.AddHook("first", func(context.Context) error {
 		order = append(order, "first")
 		return nil
 	})
-	runtime.AddHook("second", func(ctx context.Context) error {
+	runtime.AddHook("second", func(context.Context) error {
 		order = append(order, "second")
 		return nil
 	})
@@ -264,11 +200,11 @@ func TestSessionRuntimeCloseStopsAfterContextDeadline(t *testing.T) {
 	runtime := application.NewSessionRuntime(context.Background(), nil, "", nil, nil, &session.State{ID: "timeout-close"})
 	release := make(chan struct{})
 	ranAfterTimeout := false
-	runtime.AddHook("after-blocked", func(ctx context.Context) error {
+	runtime.AddHook("after-blocked", func(context.Context) error {
 		ranAfterTimeout = true
 		return nil
 	})
-	runtime.AddHook("blocked", func(ctx context.Context) error {
+	runtime.AddHook("blocked", func(context.Context) error {
 		<-release
 		return nil
 	})

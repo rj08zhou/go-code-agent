@@ -30,6 +30,7 @@ type BuiltRunner struct {
 
 // SessionFacade covers identity, history, catalog, and compaction.
 type SessionFacade struct {
+	Context   context.Context
 	ID        string
 	Title     string
 	AgentID   string
