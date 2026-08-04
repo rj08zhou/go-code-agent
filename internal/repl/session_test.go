@@ -1,4 +1,4 @@
-package main
+package repl
 
 import (
 	"context"
@@ -30,7 +30,6 @@ func TestSessionSwitchCommandDefersActivationUntilBuild(t *testing.T) {
 	if err := os.WriteFile(
 		filepath.Join(dataDir, "sessions.json"),
 		[]byte(`{"active_id":"","sessions":[]}`),
-
 		0o600,
 	); err != nil {
 		t.Fatal(err)
@@ -39,7 +38,7 @@ func TestSessionSwitchCommandDefersActivationUntilBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := &repl{built: &application.BuiltRunner{
+	r := &Loop{built: &application.BuiltRunner{
 		Session: application.SessionFacade{ID: first.ID, Repo: repo},
 	}}
 	messages := []llm.Message{}
@@ -77,7 +76,7 @@ func TestReplPromptCtrlCContinuesAndCtrlDExits(t *testing.T) {
 		t.Fatal(err)
 	}
 	reads := 0
-	r := newRepl(&application.BuiltRunner{
+	r := New(&application.BuiltRunner{
 		Session: application.SessionFacade{HistStore: histStore},
 	}, context.Background(), func() (string, error) {
 		reads++
@@ -87,7 +86,7 @@ func TestReplPromptCtrlCContinuesAndCtrlDExits(t *testing.T) {
 		return "", io.EOF
 	})
 
-	r.run()
+	r.Run()
 	if reads != 2 {
 		t.Fatalf("read calls = %d, want Ctrl-C to continue to the next prompt", reads)
 	}

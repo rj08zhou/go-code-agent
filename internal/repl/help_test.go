@@ -1,4 +1,4 @@
-package main
+package repl
 
 import (
 	"context"
@@ -14,49 +14,14 @@ import (
 func TestRenderHelpListsEveryREPLCommand(t *testing.T) {
 	help := renderHelp()
 	commands := []string{
-		"/help",
-		"/task clear",
-		"/task reset",
-		"/tasks",
-		"/dag",
-		"/memory",
-		"/mcp",
-		"/mcp pending",
-		"/mcp approve <name>",
-		"/mcp connect <name> <cmd> [args...]",
-		"/mcp disconnect <name>",
-		"/team",
-		"/team spawn <name> <role> <prompt>",
-		"/team shutdown <name>",
-		"/team message <name> <content>",
-		"/team inbox",
-		"/session",
-		"/session list",
-		"/session switch <id>",
-		"/session new",
-		"/session rename <title>",
-		"/session archive",
-		"/judge",
-		"/approval",
-		"/approval manual",
-		"/approval safe-auto",
-		"/approval all-auto confirm",
-		"/approval reject",
-		"/approval notify-only",
-		"/approve ...",
-		"/hitl ...",
-		"/inbox",
-		"/search <query>",
-		"/permissions",
-		"/permissions reload",
-		"/usage",
-		"/security",
-		"/security test-bash <command>",
-		"/decisions",
-		"/compact",
-		"/exit, /quit",
+		"/help", "/task clear", "/task reset", "/tasks", "/dag", "/memory",
+		"/mcp", "/mcp pending", "/mcp approve <name>", "/mcp connect <name> <cmd> [args...]", "/mcp disconnect <name>",
+		"/team", "/team spawn <name> <role> <prompt>", "/team shutdown <name>", "/team message <name> <content>", "/team inbox",
+		"/session", "/session list", "/session switch <id>", "/session new", "/session rename <title>", "/session archive",
+		"/judge", "/approval", "/approval manual", "/approval safe-auto", "/approval all-auto confirm", "/approval reject", "/approval notify-only",
+		"/approve ...", "/hitl ...", "/inbox", "/search <query>", "/permissions", "/permissions reload", "/usage",
+		"/security", "/security test-bash <command>", "/decisions", "/compact", "/exit, /quit",
 	}
-
 	for _, command := range commands {
 		if !strings.Contains(help, command) {
 			t.Errorf("help does not list %q", command)
@@ -79,8 +44,7 @@ func TestRenderHelpExplainsApprovalSafety(t *testing.T) {
 }
 
 func TestHandleApprovalRequiresConfirmationForAllAuto(t *testing.T) {
-	r := newApprovalTestRepl()
-
+	r := newApprovalTestLoop()
 	got := r.handleApproval([]string{"/approval", "all-auto"})
 	if !strings.Contains(got, "/approval all-auto confirm") {
 		t.Fatalf("missing confirmation guidance: %q", got)
@@ -88,7 +52,6 @@ func TestHandleApprovalRequiresConfirmationForAllAuto(t *testing.T) {
 	if mode := effectiveApprovalMode(r.built); mode != "safe-auto" {
 		t.Fatalf("unconfirmed command changed mode to %q", mode)
 	}
-
 	got = r.handleApproval([]string{"/approval", "all-auto", "confirm"})
 	if !strings.Contains(got, "Approval mode: all-auto") {
 		t.Fatalf("confirmed response = %q", got)
@@ -102,7 +65,7 @@ func TestHandleApprovalRequiresConfirmationForAllAuto(t *testing.T) {
 }
 
 func TestHandleApprovalCanonicalModes(t *testing.T) {
-	r := newApprovalTestRepl()
+	r := newApprovalTestLoop()
 	cases := []struct {
 		command []string
 		want    string
@@ -128,14 +91,13 @@ func TestHandleApprovalCanonicalModes(t *testing.T) {
 }
 
 func TestLegacyApprovalAliasesUseCanonicalSafety(t *testing.T) {
-	r := newApprovalTestRepl()
+	r := newApprovalTestLoop()
 	if got := r.handleApproval([]string{"/approve", "off"}); !strings.Contains(got, "use /approval manual") {
 		t.Fatalf("legacy manual alias = %q", got)
 	}
 	if mode := effectiveApprovalMode(r.built); mode != "manual" {
 		t.Fatalf("legacy /approve off mode = %q", mode)
 	}
-
 	got := r.handleApproval([]string{"/hitl", "off"})
 	if !strings.Contains(got, "/approval all-auto confirm") {
 		t.Fatalf("legacy HITL off bypassed confirmation: %q", got)
@@ -145,13 +107,13 @@ func TestLegacyApprovalAliasesUseCanonicalSafety(t *testing.T) {
 	}
 }
 
-func newApprovalTestRepl() *repl {
+func newApprovalTestLoop() *Loop {
 	hitl := hitlaudit.NewHITLManager(nil)
 	hitl.SetEnabled(true)
 	hitl.SetMode(hitlaudit.HITLModeSafeOnly)
 	approval := security.NewApprovalState()
 	approval.ApplyPreset("safe-auto")
-	return &repl{built: &application.BuiltRunner{Security: application.SecurityFacade{
+	return &Loop{built: &application.BuiltRunner{Security: application.SecurityFacade{
 		HITL: hitl, Approval: approval,
 	}}}
 }
@@ -180,7 +142,7 @@ func TestRunSearchAlwaysReturnsFeedback(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			r := &repl{built: &application.BuiltRunner{}}
+			r := &Loop{built: &application.BuiltRunner{}}
 			if tc.set {
 				r.built.Runtime.Web = tc.web
 			}

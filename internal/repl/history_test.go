@@ -1,4 +1,4 @@
-package main
+package repl
 
 import (
 	"context"
@@ -33,7 +33,6 @@ func TestAppendHistoryMessagesPersistsAssistantAndTool(t *testing.T) {
 		},
 		llm.ToolMessage("result", "call-1"),
 	}
-
 	if err := appendHistoryMessages(store, messages); err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +58,6 @@ func TestAppendHistoryMessagesReturnsWriteError(t *testing.T) {
 	if err := os.WriteFile(historyDir, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
 	err = appendHistoryMessages(store, []llm.Message{llm.AssistantMessage("answer")})
 	if err == nil || !strings.Contains(err.Error(), "append assistant message") {
 		t.Fatalf("error = %v, want assistant persistence error", err)
@@ -88,7 +86,6 @@ func TestReplContinuesInMemoryAfterUserHistoryFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	catalog := tool.NewToolCatalog()
 	runner := agent.NewRunner(
 		agent.NewLeadProfile("system"),
@@ -97,9 +94,8 @@ func TestReplContinuesInMemoryAfterUserHistoryFailure(t *testing.T) {
 		nil,
 		nil,
 	)
-
 	reads := 0
-	r := newRepl(&application.BuiltRunner{
+	r := New(&application.BuiltRunner{
 		Session: application.SessionFacade{
 			ID: "session-1", AgentID: "lead", Workdir: root,
 			SysPrompt: "system", HistStore: histStore,
@@ -119,8 +115,7 @@ func TestReplContinuesInMemoryAfterUserHistoryFailure(t *testing.T) {
 		}
 		return "continue despite save failure", nil
 	})
-
-	stderr := captureReplStderr(t, r.run)
+	stderr := captureReplStderr(t, r.Run)
 	if reads != 2 {
 		t.Fatalf("read calls = %d, want REPL to continue to the next prompt", reads)
 	}
@@ -144,7 +139,6 @@ func captureReplStderr(t *testing.T, run func()) string {
 	_ = writer.Close()
 	os.Stderr = previous
 	defer reader.Close()
-
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
