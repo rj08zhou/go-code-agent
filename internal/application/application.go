@@ -39,7 +39,8 @@ type Application struct {
 	consoleSink *event.ConsoleSink
 
 	// Active runtime
-	runtime *SessionRuntime
+	runtime         *SessionRuntime
+	runtimeCloseErr error
 }
 
 // New constructs the Application with all project-level services.
@@ -118,18 +119,20 @@ func (a *Application) DataDir() string { return a.dataDir }
 // Config returns the process-wide configuration.
 func (a *Application) Config() *config.Config { return a.cfg }
 
-// Runtime returns the active session runtime or nil.
-func (a *Application) Runtime() *SessionRuntime { return a.runtime }
-
-// SetRuntime sets the active session runtime.
-func (a *Application) SetRuntime(rt *SessionRuntime) { a.runtime = rt }
+// CloseSession stops the active session runtime and releases its ownership.
+func (a *Application) CloseSession(ctx context.Context) error {
+	rt := a.runtime
+	if rt == nil {
+		return a.runtimeCloseErr
+	}
+	a.runtime = nil
+	a.runtimeCloseErr = rt.Close(ctx)
+	return a.runtimeCloseErr
+}
 
 // Shutdown gracefully stops all services.
 func (a *Application) Shutdown(ctx context.Context) error {
-	if a.runtime == nil {
-		return nil
-	}
-	return a.runtime.Close(ctx)
+	return a.CloseSession(ctx)
 }
 
 // resolveDataDir computes a stable, isolated state directory from the
@@ -266,21 +269,24 @@ type sessionSecurity struct {
 	cfg          *config.Config
 }
 
-// Build creates the session under ctx, wires all services, assembles the runner,
-// and returns a fully-configured BuiltRunner together with the SessionRuntime.
+// Build creates the session under ctx, wires all services, and returns a
+// fully-configured BuiltRunner. Application owns the resulting SessionRuntime.
 // Canceling ctx cancels the session lifetime; a user turn must use its own
 // child context so interrupting one turn does not tear down the session.
-// The caller (main / repl) owns the REPL loop and shutdown.
-func (app *Application) Build(ctx context.Context, opts BuildOptions) (*BuiltRunner, *SessionRuntime, error) {
+// The caller owns the REPL loop and requests teardown through CloseSession.
+func (app *Application) Build(ctx context.Context, opts BuildOptions) (*BuiltRunner, error) {
 	ctx, err := validateBuildContext(ctx, opts)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+	if app.runtime != nil {
+		return nil, errors.New("active session runtime must be closed before building another session")
 	}
 	app.reportConfigWarnings()
 
 	opened, err := app.openSession(opts)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Each session gets its own ToolCatalog so MCP/builtin registration
@@ -314,10 +320,10 @@ func (app *Application) Build(ctx context.Context, opts BuildOptions) (*BuiltRun
 
 	built, err := rt.BuildRunner(params, opened.dir)
 	if err != nil {
-		return nil, nil, closeRuntimeAfterBuildFailure(rt, fmt.Errorf("build runner: %w", err))
+		return nil, closeRuntimeAfterBuildFailure(rt, fmt.Errorf("build runner: %w", err))
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, closeRuntimeAfterBuildFailure(rt, err)
+		return nil, closeRuntimeAfterBuildFailure(rt, err)
 	}
 
 	usageTracker, usageErr := agent.NewUsageTracker(opened.dir)
@@ -331,10 +337,10 @@ func (app *Application) Build(ctx context.Context, opts BuildOptions) (*BuiltRun
 	}
 
 	if err := app.activateSessionRuntime(opened, rt, usageTracker); err != nil {
-		return nil, nil, closeRuntimeAfterBuildFailure(rt, err)
+		return nil, closeRuntimeAfterBuildFailure(rt, err)
 	}
 
-	return built, rt, nil
+	return built, nil
 }
 
 func validateBuildContext(ctx context.Context, opts BuildOptions) (context.Context, error) {
@@ -465,7 +471,8 @@ func (app *Application) activateSessionRuntime(opened openedSession, rt *Session
 			usageTracker.Record(providerName, role, modelID, traceID, usage, duration)
 		})
 	}
-	app.SetRuntime(rt)
+	app.runtime = rt
+	app.runtimeCloseErr = nil
 	return nil
 }
 

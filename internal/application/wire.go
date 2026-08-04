@@ -86,6 +86,7 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams, sessionDir string) (*
 	providerName := rt.gateway.ProviderName("lead")
 	return &BuiltRunner{
 		Session: SessionFacade{
+			Context:   rt.Ctx,
 			ID:        st.ID,
 			Title:     st.Title,
 			AgentID:   "lead",

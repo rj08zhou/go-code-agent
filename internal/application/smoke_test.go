@@ -88,11 +88,10 @@ func TestBuildExposesSanitizedRuntimeStatus(t *testing.T) {
 	}
 	defer app.Shutdown(context.Background())
 
-	built, rt, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
+	built, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	defer rt.Close(context.Background())
 
 	if built.Runtime.ProviderName != "openai" {
 		t.Fatalf("ProviderName = %q, want openai", built.Runtime.ProviderName)
@@ -109,12 +108,12 @@ func TestBuildExposesSanitizedRuntimeStatus(t *testing.T) {
 func TestBuild_Smoke_NewBuildClose(t *testing.T) {
 	app, cfgDir, workdir := newTestApp(t)
 
-	built, rt, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
+	built, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if built == nil || rt == nil {
-		t.Fatal("Build returned nil BuiltRunner or SessionRuntime")
+	if built == nil || built.Session.Context == nil {
+		t.Fatal("Build returned nil BuiltRunner or session context")
 	}
 
 	// --- critical deps non-nil ---
@@ -201,11 +200,11 @@ func TestBuild_Smoke_NewBuildClose(t *testing.T) {
 
 	// --- Close idempotent ---
 	ctx := context.Background()
-	if err := rt.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := app.CloseSession(ctx); err != nil {
+		t.Fatalf("CloseSession: %v", err)
 	}
-	if err := rt.Close(ctx); err != nil {
-		t.Fatalf("second Close: %v", err)
+	if err := app.CloseSession(ctx); err != nil {
+		t.Fatalf("second CloseSession: %v", err)
 	}
 	if err := app.Shutdown(ctx); err != nil {
 		t.Fatalf("Shutdown after Close: %v", err)
