@@ -51,10 +51,10 @@ type TeammateManager struct {
 	catalog      *tool.ToolCatalog
 	modelID      string
 	promptLoader *prompt.Loader
-	reasoning   *llm.ReasoningRequest
-	diffPreview tool.DiffPreview
-	approval    tool.ApprovalChecker
-	eventSink   event.Sink
+	reasoning    *llm.ReasoningRequest
+	diffPreview  tool.DiffPreview
+	approval     tool.ApprovalChecker
+	eventSink    event.Sink
 
 	spawnMu   sync.Mutex
 	lastSpawn time.Time
@@ -144,7 +144,23 @@ func (tm *TeammateManager) getSessionCtx() context.Context {
 	return tm.sessCtx
 }
 
-func (tm *TeammateManager) Wait() { tm.wg.Wait() }
+// Wait waits for all teammate goroutines to exit or until ctx is canceled.
+func (tm *TeammateManager) Wait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	go func() {
+		tm.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // Spawn starts a persistent autonomous teammate with worktree isolation.
 // If worktree creation fails, fail-closed: no teammate starts and error is returned.
@@ -459,18 +475,12 @@ func (tm *TeammateManager) ShutdownByName(name string) string {
 		return fmt.Sprintf("Error: no teammate named '%s'", name)
 	}
 	team.PostShutdownRequest(tm.protocols, tm.bus, name)
-	if tm.worktrees != nil {
-		_ = tm.worktrees.Release(name)
-	}
 	return fmt.Sprintf("Shutdown request sent to '%s'", name)
 }
 
 func (tm *TeammateManager) ShutdownAll() {
 	for _, name := range tm.MemberNames() {
 		_ = team.PostShutdownRequest(tm.protocols, tm.bus, name)
-		if tm.worktrees != nil {
-			_ = tm.worktrees.Release(name)
-		}
 	}
 }
 

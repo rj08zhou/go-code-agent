@@ -11,6 +11,7 @@ import (
 
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/config"
+	"go-code-agent/internal/event"
 	"go-code-agent/internal/hitlaudit"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
@@ -35,6 +36,7 @@ type Application struct {
 	gateway     *model.Gateway
 	registry    *provider.Registry
 	sessionRepo *session.Repository
+	consoleSink *event.ConsoleSink
 
 	// Embedded documentation
 	Embedded []byte
@@ -92,6 +94,7 @@ func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gatewa
 		gateway:     gw,
 		registry:    reg,
 		sessionRepo: session.NewRepository(dataDir),
+		consoleSink: event.NewConsoleSink(),
 	}, nil
 }
 
@@ -159,7 +162,7 @@ func resolveDataDir(cfgDir, workdir string) string {
 // Hooks run in reverse registration order.
 type ShutdownHook struct {
 	Name string
-	Fn   func() error
+	Fn   func(context.Context) error
 }
 
 // SessionRuntime supervises a single session's running resources.
@@ -181,8 +184,11 @@ type SessionRuntime struct {
 
 // NewSessionRuntime creates a runtime for the given session state.
 // It receives only the shared services it uses — no Application pointer.
-func NewSessionRuntime(gw *model.Gateway, workdir string, catalog *tool.ToolCatalog, repo *session.Repository, st *session.State) *SessionRuntime {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewSessionRuntime(parent context.Context, gw *model.Gateway, workdir string, catalog *tool.ToolCatalog, repo *session.Repository, st *session.State) *SessionRuntime {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
 	return &SessionRuntime{
 		gateway:      gw,
 		workdir:      workdir,
@@ -195,7 +201,7 @@ func NewSessionRuntime(gw *model.Gateway, workdir string, catalog *tool.ToolCata
 }
 
 // AddHook registers a cleanup hook. Hooks run in reverse registration order on Close.
-func (rt *SessionRuntime) AddHook(name string, fn func() error) {
+func (rt *SessionRuntime) AddHook(name string, fn func(context.Context) error) {
 	rt.hooks = append(rt.hooks, ShutdownHook{Name: name, Fn: fn})
 }
 
@@ -206,6 +212,9 @@ func (rt *SessionRuntime) Close(ctx context.Context) error {
 	if rt.closed {
 		return rt.closeErr
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	rt.closed = true
 	if rt.Cancel != nil {
 		rt.Cancel()
@@ -214,8 +223,21 @@ func (rt *SessionRuntime) Close(ctx context.Context) error {
 	var errs []string
 	for i := len(rt.hooks) - 1; i >= 0; i-- {
 		h := rt.hooks[i]
-		if err := h.Fn(); err != nil {
+		done := make(chan error, 1)
+		go func() {
+			done <- h.Fn(ctx)
+		}()
+		var err error
+		select {
+		case err = <-done:
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", h.Name, err))
+		}
+		if ctx.Err() != nil {
+			break
 		}
 	}
 	if len(errs) > 0 {
@@ -232,21 +254,116 @@ type BuildOptions struct {
 	HumanMode  string // interactive / auto-approve / auto-reject
 }
 
-// Build creates the session, wires all services, assembles the runner,
+type openedSession struct {
+	state              *session.State
+	dir                string
+	requiresActivation bool
+}
+
+type sessionSecurity struct {
+	hitlMgr      *hitlaudit.HITLManager
+	approval     *security.ApprovalState
+	permissions  *security.Permissions
+	diffPreview  *security.DiffPreview
+	promptLoader *prompt.Loader
+	cfg          *config.Config
+}
+
+// Build creates the session under ctx, wires all services, assembles the runner,
 // and returns a fully-configured BuiltRunner together with the SessionRuntime.
+// Canceling ctx cancels the session lifetime; a user turn must use its own
+// child context so interrupting one turn does not tear down the session.
 // The caller (main / repl) owns the REPL loop and shutdown.
-func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime, error) {
-	if opts.NewSession && opts.SessionID != "" {
-		return nil, nil, errors.New("--session and --new-session cannot be used together")
+func (app *Application) Build(ctx context.Context, opts BuildOptions) (*BuiltRunner, *SessionRuntime, error) {
+	ctx, err := validateBuildContext(ctx, opts)
+	if err != nil {
+		return nil, nil, err
 	}
-	for _, w := range app.Config().Validate() {
-		fmt.Fprintf(os.Stderr, "[warn] %s\n", w)
+	app.reportConfigWarnings()
+
+	opened, err := app.openSession(opts)
+	if err != nil {
+		return nil, nil, err
 	}
 
+	// Each session gets its own ToolCatalog so MCP/builtin registration
+	// cannot leak across session switches.
+	catalog := tool.NewToolCatalog()
+	rt := NewSessionRuntime(ctx, app.gateway, app.workdir, catalog, app.sessionRepo, opened.state)
+	var usageTracker *agent.UsageTracker
+	rt.AddHook("usage", func(context.Context) error {
+		if usageTracker == nil {
+			return nil
+		}
+		return usageTracker.Close()
+	})
+
+	securitySetup := app.configureSessionSecurity(opts)
+	decisionLog, _ := agent.NewDecisionLog(opened.dir)
+	msgBus := team.NewBus(filepath.Join(opened.dir, "team", "inbox"))
+	params := newSessionParams(
+		app,
+		opened.dir,
+		app.workdir,
+		securitySetup.hitlMgr,
+		securitySetup.approval,
+		securitySetup.permissions,
+		securitySetup.diffPreview,
+		decisionLog,
+		msgBus,
+		securitySetup.promptLoader,
+		securitySetup.cfg,
+	)
+
+	built, err := rt.BuildRunner(params, opened.dir)
+	if err != nil {
+		return nil, nil, closeRuntimeAfterBuildFailure(rt, fmt.Errorf("build runner: %w", err))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, closeRuntimeAfterBuildFailure(rt, err)
+	}
+
+	usageTracker, usageErr := agent.NewUsageTracker(opened.dir)
+	if usageErr != nil {
+		fmt.Fprintf(os.Stderr, "[warn] usage tracker: %v\n", usageErr)
+	}
+	built.Session.Usage = usageTracker
+	built.Security.ReloadPermissions = func() error {
+		// In-place reload: bash handler closes over this same pointer.
+		return securitySetup.permissions.Load(app.dataDir)
+	}
+
+	if err := app.activateSessionRuntime(opened, rt, usageTracker); err != nil {
+		return nil, nil, closeRuntimeAfterBuildFailure(rt, err)
+	}
+
+	return built, rt, nil
+}
+
+func validateBuildContext(ctx context.Context, opts BuildOptions) (context.Context, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if opts.NewSession && opts.SessionID != "" {
+		return nil, errors.New("--session and --new-session cannot be used together")
+	}
+	return ctx, nil
+}
+
+func (app *Application) reportConfigWarnings() {
+	for _, warning := range app.Config().Validate() {
+		fmt.Fprintf(os.Stderr, "[warn] %s\n", warning)
+	}
+}
+
+func (app *Application) openSession(opts BuildOptions) (openedSession, error) {
 	repo := app.SessionRepo()
 	idx, err := repo.LoadIndex()
 	if err != nil {
-		return nil, nil, fmt.Errorf("load sessions: %w", err)
+		return openedSession{}, fmt.Errorf("load sessions: %w", err)
 	}
 
 	var st *session.State
@@ -256,7 +373,7 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime,
 	case opts.SessionID != "":
 		st, err = repo.LoadSessionMeta(opts.SessionID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("resume session %q: %w", opts.SessionID, err)
+			return openedSession{}, fmt.Errorf("resume session %q: %w", opts.SessionID, err)
 		}
 	case idx.ActiveID != "":
 		st, err = repo.LoadSessionMeta(idx.ActiveID)
@@ -273,41 +390,35 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime,
 			Status: session.StatusActive,
 		}
 		if err := repo.CreateSession(st); err != nil {
-			return nil, nil, fmt.Errorf("create session %q: %w", st.ID, err)
+			return openedSession{}, fmt.Errorf("create session %q: %w", st.ID, err)
 		}
 		idx.Sessions = append(idx.Sessions, *st)
 		if err := repo.SaveIndex(idx); err != nil {
-			return nil, nil, fmt.Errorf("save sessions index: %w", err)
+			return openedSession{}, fmt.Errorf("save sessions index: %w", err)
 		}
 	}
 	if err := repo.EnsureSessionDir(st.ID); err != nil {
-		return nil, nil, fmt.Errorf("ensure session directory: %w", err)
+		return openedSession{}, fmt.Errorf("ensure session directory: %w", err)
 	}
 	sessionDir, err := repo.SessionDir(st.ID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve session directory: %w", err)
+		return openedSession{}, fmt.Errorf("resolve session directory: %w", err)
 	}
+	return openedSession{
+		state:              st,
+		dir:                sessionDir,
+		requiresActivation: idx.ActiveID != st.ID,
+	}, nil
+}
 
-	// Each session gets its own ToolCatalog so MCP/builtin registration
-	// cannot leak across session switches.
-	catalog := tool.NewToolCatalog()
-	rt := NewSessionRuntime(app.gateway, app.workdir, catalog, repo, st)
-	var usageTracker *agent.UsageTracker
-	rt.AddHook("usage", func() error {
-		if usageTracker == nil {
-			return nil
-		}
-		return usageTracker.Close()
-	})
-
-	workdir := app.workdir
+func (app *Application) configureSessionSecurity(opts BuildOptions) sessionSecurity {
 	promptLoader := prompt.NewLoader()
 	cfg := app.cfg
 	if cfg == nil {
 		cfg = &config.Config{ModelID: "default"}
 	}
 
-	hitlMgr := hitlaudit.NewHITLManager(promptLoader)
+	hitlMgr := hitlaudit.NewHITLManager(promptLoader, app.consoleSink)
 	approval := security.NewApprovalState()
 	// Default approval mode is safe-auto. --human alone escalates to manual.
 	// --human-mode is retained as the advanced compatibility override.
@@ -319,48 +430,37 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime,
 		approval.ApplyPreset("manual")
 	}
 	if opts.HumanMode != "" {
-		if mode, modeErr := hitlaudit.ParseMode(opts.HumanMode); modeErr == nil {
+		if mode, err := hitlaudit.ParseMode(opts.HumanMode); err == nil {
 			hitlMgr.SetMode(mode)
 			syncApprovalWithHITLMode(approval, mode)
 		} else {
-			fmt.Fprintf(os.Stderr, "[warn] %v\n", modeErr)
+			fmt.Fprintf(os.Stderr, "[warn] %v\n", err)
 		}
 	}
-	// Permissions + DiffPreview
-	perms := security.NewPermissions()
-	_ = perms.Load(app.dataDir)
 
-	diffPreview := security.NewDiffPreview(workdir)
-	decisionLog, _ := agent.NewDecisionLog(sessionDir)
-	msgBus := team.NewBus(filepath.Join(sessionDir, "team", "inbox"))
-	params := newSessionParams(app, sessionDir, workdir, hitlMgr, approval, perms, diffPreview, decisionLog, msgBus, promptLoader, cfg)
-
-	built, err := rt.BuildRunner(params, sessionDir)
-	if err != nil {
-		buildErr := fmt.Errorf("build runner: %w", err)
-		if closeErr := rt.Close(context.Background()); closeErr != nil {
-			return nil, nil, fmt.Errorf("%w; cleanup runtime: %v", buildErr, closeErr)
-		}
-		return nil, nil, buildErr
+	permissions := security.NewPermissions()
+	_ = permissions.Load(app.dataDir)
+	return sessionSecurity{
+		hitlMgr:      hitlMgr,
+		approval:     approval,
+		permissions:  permissions,
+		diffPreview:  security.NewDiffPreview(app.workdir),
+		promptLoader: promptLoader,
+		cfg:          cfg,
 	}
+}
 
-	usageTracker, usageErr := agent.NewUsageTracker(sessionDir)
-	if usageErr != nil {
-		fmt.Fprintf(os.Stderr, "[warn] usage tracker: %v\n", usageErr)
+func closeRuntimeAfterBuildFailure(rt *SessionRuntime, buildErr error) error {
+	if closeErr := rt.Close(context.Background()); closeErr != nil {
+		return fmt.Errorf("%w; cleanup runtime: %v", buildErr, closeErr)
 	}
-	built.Session.Usage = usageTracker
-	built.Security.ReloadPermissions = func() error {
-		// In-place reload: bash handler closes over this same pointer.
-		return perms.Load(app.dataDir)
-	}
+	return buildErr
+}
 
-	if idx.ActiveID != st.ID {
-		if err := repo.SwitchActive(st.ID); err != nil {
-			activateErr := fmt.Errorf("activate session %q: %w", st.ID, err)
-			if closeErr := rt.Close(context.Background()); closeErr != nil {
-				return nil, nil, fmt.Errorf("%w; cleanup runtime: %v", activateErr, closeErr)
-			}
-			return nil, nil, activateErr
+func (app *Application) activateSessionRuntime(opened openedSession, rt *SessionRuntime, usageTracker *agent.UsageTracker) error {
+	if opened.requiresActivation {
+		if err := app.sessionRepo.SwitchActive(opened.state.ID); err != nil {
+			return fmt.Errorf("activate session %q: %w", opened.state.ID, err)
 		}
 	}
 	if usageTracker != nil {
@@ -369,8 +469,7 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime,
 		})
 	}
 	app.SetRuntime(rt)
-
-	return built, rt, nil
+	return nil
 }
 
 // syncApprovalWithHITLMode keeps ApprovalState (diff-preview skip) aligned

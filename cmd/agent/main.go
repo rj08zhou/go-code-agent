@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/chzyer/readline"
 
@@ -223,6 +225,9 @@ func run() (exitCode int) {
 	}
 	defer cleanup()
 
+	rootCtx, stopRoot := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	defer stopRoot()
+
 	next := &application.BuildOptions{
 		SessionID:  opts.sessionID,
 		NewSession: opts.newSession,
@@ -230,7 +235,7 @@ func run() (exitCode int) {
 		HumanMode:  opts.humanMode,
 	}
 	for next != nil {
-		built, rt, err := app.Build(*next)
+		built, rt, err := app.Build(rootCtx, *next)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to start session: %v\n", err)
 			if next.SessionID != "" {

@@ -129,6 +129,28 @@ func TestExecutor_ScopeNetworkPolicyBlocks(t *testing.T) {
 	}
 }
 
+func TestExecutor_NetworkPolicyChecksNestedDestinations(t *testing.T) {
+	catalog := NewToolCatalog()
+	catalog.RegisterAll([]ToolDefinition{{
+		Name: "mcp__demo__fetch", Description: "", Effects: Effects(EffectNetworkAccess),
+		Handler: func(scope *ToolScope, args json.RawMessage) Result { return Succeeded("ok") },
+	}})
+	exec := NewExecutor(catalog, nil, nil)
+	scope := &ToolScope{Role: "lead", CanNetwork: true, NetworkPolicy: &testNetwork{allow: false}}
+
+	result := exec.Execute(
+		context.Background(),
+		scope,
+		llm.ToolCall{
+			Name:      "mcp__demo__fetch",
+			Arguments: `{"request":{"endpoint":"https://example.com/api"}}`,
+		},
+	)
+	if result.Status != StatusDenied {
+		t.Fatalf("status = %s, want denied for nested endpoint", result.Status)
+	}
+}
+
 // --- Invalid input ---
 
 func TestExecutor_RejectsTruncatedJSON(t *testing.T) {
@@ -149,6 +171,32 @@ func TestExecutor_ReturnsUnavailableForUnknownTool(t *testing.T) {
 	r := exec.Execute(context.Background(), scope, llm.ToolCall{Name: "nonexistent", Arguments: `{}`})
 	if r.Status != StatusUnavailable {
 		t.Fatalf("expected StatusUnavailable, got %s", r.Status)
+	}
+}
+
+func TestExecutor_MCPUnclassifiedRequiresApprovalPolicy(t *testing.T) {
+	catalog := NewToolCatalog()
+	called := false
+	catalog.RegisterAll([]ToolDefinition{{
+		Name:    "mcp__demo__unknown",
+		Effects: Effects(EffectNetworkAccess, EffectUnclassified),
+		Handler: func(scope *ToolScope, args json.RawMessage) Result {
+			called = true
+			return Succeeded("should not run")
+		},
+	}})
+	exec := NewExecutor(catalog, nil, nil)
+
+	result := exec.Execute(
+		context.Background(),
+		&ToolScope{Role: "lead", CanNetwork: true},
+		llm.ToolCall{Name: "mcp__demo__unknown", Arguments: `{}`},
+	)
+	if result.Status != StatusDenied {
+		t.Fatalf("status = %s, want denied", result.Status)
+	}
+	if called {
+		t.Fatal("unclassified MCP handler ran without an approval policy")
 	}
 }
 
