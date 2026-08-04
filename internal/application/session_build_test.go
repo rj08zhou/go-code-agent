@@ -35,8 +35,20 @@ func TestBuildRejectsInvalidSessionRequests(t *testing.T) {
 			if built != nil {
 				t.Fatalf("Build returned runner for failed request: %#v", built)
 			}
-			if got := app.Catalog(); got != nil {
-				t.Fatalf("failed Build installed a catalog: %#v", got)
+			idx, idxErr := app.SessionRepo().LoadIndex()
+			if idxErr != nil {
+				t.Fatal(idxErr)
+			}
+			if len(idx.Sessions) != 0 {
+				t.Fatalf("failed Build created sessions: %#v", idx.Sessions)
+			}
+			// Public contract: leftover runtime would block the next Build.
+			built, err = app.Build(context.Background(), application.BuildOptions{NewSession: true})
+			if err != nil {
+				t.Fatalf("failed Build left an active runtime: %v", err)
+			}
+			if built == nil {
+				t.Fatal("expected a fresh session after failed Build")
 			}
 		})
 	}

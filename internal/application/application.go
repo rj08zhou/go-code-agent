@@ -106,14 +106,6 @@ func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gatewa
 // Gateway returns the model gateway.
 func (a *Application) Gateway() *model.Gateway { return a.gateway }
 
-// Catalog returns the active session's tool catalog, or nil if no session.
-func (a *Application) Catalog() *tool.ToolCatalog {
-	if a.runtime == nil {
-		return nil
-	}
-	return a.runtime.catalog
-}
-
 // SessionRepo returns the session repository.
 func (a *Application) SessionRepo() *session.Repository { return a.sessionRepo }
 

@@ -19,13 +19,17 @@ import (
 
 func TestFormatSessionListPreservesActiveMarkerAndFields(t *testing.T) {
 	got := formatSessionList("active", []session.State{
-		{ID: "active", Status: session.StatusActive, Title: "Current"},
-		{ID: "old", Status: session.StatusArchived, Title: "Previous"},
+		{ID: "old", Status: session.StatusArchived, Title: "Previous", CreatedAt: 100, UpdatedAt: 100},
+		{ID: "active", Status: session.StatusActive, Title: "Current", CreatedAt: 200, UpdatedAt: 300},
 	})
-	for _, want := range []string{"* active", "active", "Current", "old", "archived", "Previous"} {
+	for _, want := range []string{"* active", "Current", "old", "archived", "Previous", formatSessionTime(300), formatSessionTime(100)} {
 		if !strings.Contains(got, want) {
 			t.Errorf("formatted session list %q does not contain %q", got, want)
 		}
+	}
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], "active") || !strings.Contains(lines[1], "old") {
+		t.Fatalf("expected newer session before older one: %q", got)
 	}
 	if got := formatSessionList("", nil); got != "No sessions." {
 		t.Fatalf("empty session list = %q", got)
