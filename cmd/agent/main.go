@@ -18,6 +18,7 @@ import (
 	"go-code-agent/internal/application"
 	"go-code-agent/internal/logging"
 	"go-code-agent/internal/model/provider"
+	"go-code-agent/internal/repl"
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/session"
 	"go-code-agent/internal/store"
@@ -160,7 +161,7 @@ func setupTerminal(dataDir string) (readFunc func(string, bool) (string, error),
 		HistoryFile:            histFile,
 		HistorySearchFold:      true,
 		DisableAutoSaveHistory: true,
-		AutoComplete:           newCompleter(),
+		AutoComplete:           repl.NewCompleter(),
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("terminal: %w", err)
@@ -243,11 +244,11 @@ func run() (exitCode int) {
 			}
 			return 1
 		}
-		loop := newRepl(built, rt.Ctx, func() (string, error) {
+		loop := repl.New(built, rt.Ctx, func() (string, error) {
 			return readTerminal(replPrompt, true)
 		})
-		loop.run()
-		next = loop.nextBuild()
+		loop.Run()
+		next = loop.NextBuild()
 		if next != nil {
 			if closeErr := rt.Close(context.Background()); closeErr != nil {
 				fmt.Fprintf(os.Stderr, "Failed to close current session: %v\n", closeErr)
