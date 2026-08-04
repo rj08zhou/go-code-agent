@@ -383,7 +383,7 @@ func newSessionParams(
 		DiffPreview: diffPreview,
 		Console:     app.consoleSink,
 		DecisionLog: decisionLog,
-		MemoryStore: memory.NewStore(app.dataDir),
+		MemoryStore: app.memStore,
 		SkillLoader: skill.NewLoader(filepath.Join(workdir, "skills")),
 		BGSvc:       background.New(workdir),
 		Bus:         msgBus,

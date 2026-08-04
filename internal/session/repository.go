@@ -352,3 +352,59 @@ func (r *Repository) ArchiveSession(id string) error {
 	}
 	return nil
 }
+
+// MarkMemorySaved records that a session has already been distilled into
+// long-term memory so later startups skip it.
+func (r *Repository) MarkMemorySaved(id string) error {
+	st, err := r.LoadSessionMeta(id)
+	if err != nil {
+		return fmt.Errorf("load session %q: %w", id, err)
+	}
+	if st.MemorySaved {
+		return nil
+	}
+	st.MemorySaved = true
+	if err := r.SaveSessionMeta(st); err != nil {
+		return fmt.Errorf("save session %q metadata: %w", id, err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	idx, err := r.loadIndexLocked()
+	if err != nil {
+		return fmt.Errorf("load sessions index: %w", err)
+	}
+	for i := range idx.Sessions {
+		if idx.Sessions[i].ID == id {
+			idx.Sessions[i].MemorySaved = true
+			if err := r.saveIndexLocked(idx); err != nil {
+				return fmt.Errorf("update session index: %w", err)
+			}
+			break
+		}
+	}
+	return nil
+}
+
+// ListBackfillCandidates returns non-archived, unsaved sessions excluding
+// activeID. Metadata is loaded from disk so MemorySaved/Status stay accurate.
+func (r *Repository) ListBackfillCandidates(activeID string) ([]State, error) {
+	idx, err := r.LoadIndex()
+	if err != nil {
+		return nil, err
+	}
+	var out []State
+	for _, entry := range idx.Sessions {
+		if entry.ID == "" || entry.ID == activeID {
+			continue
+		}
+		st, err := r.LoadSessionMeta(entry.ID)
+		if err != nil {
+			continue
+		}
+		if st.Status == StatusArchived || st.MemorySaved {
+			continue
+		}
+		out = append(out, *st)
+	}
+	return out, nil
+}

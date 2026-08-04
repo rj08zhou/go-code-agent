@@ -57,6 +57,7 @@ func newTestApp(t *testing.T) (*application.Application, string, string) {
 	if err != nil {
 		t.Fatalf("NewWithGateway: %v", err)
 	}
+	t.Cleanup(app.WaitMemoryBackfill)
 	return app, cfgDir, workdir
 }
 
@@ -86,6 +87,7 @@ func TestBuildExposesSanitizedRuntimeStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWithGateway: %v", err)
 	}
+	t.Cleanup(app.WaitMemoryBackfill)
 	defer app.Shutdown(context.Background())
 
 	built, err := app.Build(context.Background(), application.BuildOptions{NewSession: true})

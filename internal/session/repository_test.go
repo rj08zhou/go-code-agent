@@ -176,6 +176,61 @@ func TestLoadIndexReturnsShortAndGeneratedSessionIDs(t *testing.T) {
 	}
 }
 
+func TestListBackfillCandidatesSkipsActiveArchivedAndSaved(t *testing.T) {
+	repo := NewRepository(t.TempDir())
+	active := &State{ID: "active", Title: "Active", Status: StatusActive}
+	saved := &State{ID: "saved", Title: "Saved", Status: StatusActive, MemorySaved: true}
+	archived := &State{ID: "archived", Title: "Archived", Status: StatusArchived}
+	pending := &State{ID: "pending", Title: "Pending", Status: StatusActive}
+	for _, st := range []*State{active, saved, archived, pending} {
+		if err := repo.CreateSession(st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.SaveIndex(&sessionsIndex{
+		ActiveID: active.ID,
+		Sessions: []State{*active, *saved, *archived, *pending},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.ListBackfillCandidates(active.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != pending.ID {
+		t.Fatalf("candidates = %#v, want only pending", got)
+	}
+}
+
+func TestMarkMemorySavedUpdatesMetaAndIndex(t *testing.T) {
+	repo := NewRepository(t.TempDir())
+	st := &State{ID: "s1", Title: "One", Status: StatusActive}
+	if err := repo.CreateSession(st); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveIndex(&sessionsIndex{ActiveID: st.ID, Sessions: []State{*st}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkMemorySaved(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := repo.LoadSessionMeta(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !meta.MemorySaved {
+		t.Fatal("meta MemorySaved not set")
+	}
+	idx, err := repo.LoadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Sessions) != 1 || !idx.Sessions[0].MemorySaved {
+		t.Fatalf("index MemorySaved not set: %#v", idx.Sessions)
+	}
+}
+
 func TestLoadIndexDoesNotHideCorruption(t *testing.T) {
 	repo := NewRepository(t.TempDir())
 	if err := os.WriteFile(repo.indexPath(), []byte("{"), 0o600); err != nil {
