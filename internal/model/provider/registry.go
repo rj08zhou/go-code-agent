@@ -23,10 +23,15 @@ type Registry struct {
 }
 
 func NewRegistry() *Registry {
-	return &Registry{
+	r := &Registry{
 		providers: make(map[string]model.Provider),
 		builders:  make(map[string]func(apiKey, baseURL string) model.Provider),
 	}
+	// Builders let JudgeProvider construct an isolated instance when
+	// JUDGE_API_KEY / JUDGE_BASE_URL differ from the main agent credentials.
+	r.builders["openai"] = NewOpenAI
+	r.builders["anthropic"] = NewAnthropic
+	return r
 }
 
 func (r *Registry) Register(p model.Provider) {
@@ -76,11 +81,15 @@ func (r *Registry) JudgeProvider(cfg *config.Config) model.Provider {
 		return nil
 	}
 
-	// Dedicated credentials -> build isolated instance
+	// Dedicated credentials -> build isolated instance so Judge can use a
+	// different account or proxy than the lead agent.
 	if cfg.JudgeAPIKey != "" || cfg.JudgeBaseURL != "" {
 		if build, ok := r.builders[name]; ok {
 			return build(cfg.JudgeAPIKey, cfg.JudgeBaseURL)
 		}
+		// No builder for this provider name: refuse to silently reuse the
+		// main-agent credentials when the caller asked for isolation.
+		return nil
 	}
 	if p, ok := r.providers[name]; ok {
 		return p
