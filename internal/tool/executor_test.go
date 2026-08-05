@@ -352,3 +352,53 @@ type maskSecretSanitizer struct{}
 func (maskSecretSanitizer) Sanitize(value string) string {
 	return strings.ReplaceAll(value, "secret-token", "[REDACTED]")
 }
+
+func TestChainSanitizersAppliesInOrderAndSkipsNil(t *testing.T) {
+	first := stringReplaceSanitizer{old: "secret-token", next: "[REDACTED]"}
+	second := stringReplaceSanitizer{old: "[REDACTED]", next: "[SAFE]"}
+	chained := ChainSanitizers(nil, first, nil, second, nil)
+	got := chained.Sanitize("prefix secret-token suffix")
+	if got != "prefix [SAFE] suffix" {
+		t.Fatalf("Sanitize() = %q, want redaction before rewrite", got)
+	}
+	if ChainSanitizers(nil, nil) != nil {
+		t.Fatal("ChainSanitizers(nil...) should return nil")
+	}
+	if ChainSanitizers(first) != first {
+		t.Fatal("single non-nil sanitizer should be returned as-is")
+	}
+}
+
+func TestChainSanitizersRedactsBeforeTruncate(t *testing.T) {
+	redact := maskSecretSanitizer{}
+	truncate := truncateAt{max: 24}
+	chained := ChainSanitizers(redact, truncate)
+	got := chained.Sanitize("secret-token " + strings.Repeat("x", 40))
+	if strings.Contains(got, "secret-token") {
+		t.Fatalf("secret survived truncation: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("expected redacted marker before truncate, got %q", got)
+	}
+	if len(got) > 24 {
+		t.Fatalf("len=%d, want <= 24 after truncate", len(got))
+	}
+}
+
+type stringReplaceSanitizer struct {
+	old  string
+	next string
+}
+
+func (s stringReplaceSanitizer) Sanitize(value string) string {
+	return strings.ReplaceAll(value, s.old, s.next)
+}
+
+type truncateAt struct{ max int }
+
+func (t truncateAt) Sanitize(value string) string {
+	if len(value) <= t.max {
+		return value
+	}
+	return value[:t.max]
+}

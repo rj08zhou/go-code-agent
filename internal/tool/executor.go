@@ -27,6 +27,35 @@ type OutputSanitizer interface {
 	Sanitize(s string) string
 }
 
+// ChainSanitizers applies sanitizers in declaration order. Use it when a
+// role needs both a safety transform (such as secret redaction) and a
+// role-specific presentation transform (such as output truncation).
+func ChainSanitizers(sanitizers ...OutputSanitizer) OutputSanitizer {
+	filtered := make([]OutputSanitizer, 0, len(sanitizers))
+	for _, sanitizer := range sanitizers {
+		if sanitizer != nil {
+			filtered = append(filtered, sanitizer)
+		}
+	}
+	switch len(filtered) {
+	case 0:
+		return nil
+	case 1:
+		return filtered[0]
+	default:
+		return chainedSanitizer(filtered)
+	}
+}
+
+type chainedSanitizer []OutputSanitizer
+
+func (s chainedSanitizer) Sanitize(output string) string {
+	for _, sanitizer := range s {
+		output = sanitizer.Sanitize(output)
+	}
+	return output
+}
+
 // DecisionLogger records authorization and approval decisions.
 type DecisionLogger interface {
 	Record(tool, action, reason string, round int)

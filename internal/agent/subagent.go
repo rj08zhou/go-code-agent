@@ -57,6 +57,8 @@ type SubagentRunner struct {
 	approval     tool.ApprovalChecker
 	eventSink    event.Sink
 	compress     *Compression
+	network      tool.NetworkChecker
+	sanitizer    tool.OutputSanitizer
 }
 
 func NewSubagentRunner(gw *model.Gateway, catalog *tool.ToolCatalog, cfg *config.Config, pl *prompt.Loader) *SubagentRunner {
@@ -75,6 +77,14 @@ func (s *SubagentRunner) SetEventSink(sink event.Sink) {
 // the same way as lead tools.
 func (s *SubagentRunner) SetApproval(a tool.ApprovalChecker) {
 	s.approval = a
+}
+
+// SetExecutorSecurity applies the session's shared preflight and redaction
+// policy to every subagent executor. Subagents add output truncation after
+// the shared sanitizer to keep their prompt budget bounded.
+func (s *SubagentRunner) SetExecutorSecurity(network tool.NetworkChecker, sanitizer tool.OutputSanitizer) {
+	s.network = network
+	s.sanitizer = sanitizer
 }
 
 // SetCompression enables auto-compaction for subagent runners.
@@ -126,8 +136,7 @@ func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir str
 	// collapse DeepSeek's prefix cache (each read_file appends
 	// thousands of chars to the message list, reshuffling the
 	// entire prefix for subsequent requests).
-	exec := tool.NewExecutor(exploreCatalog, s.approval, nil).
-		WithSanitizer(&truncateSanitizer{maxLen: config.SubagentToolOutputMaxChars})
+	exec := s.newExecutor(exploreCatalog)
 	runner := NewRunner(profile, s.gateway, exec, scope, s.cfg)
 	runner.SetEventSink(s.eventSink)
 	if s.compress != nil {
@@ -179,6 +188,14 @@ func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir str
 		return finalText
 	}
 	return formatSubagentTimeoutSummary(steps, finalText)
+}
+
+func (s *SubagentRunner) newExecutor(catalog *tool.ToolCatalog) *tool.Executor {
+	sanitizer := tool.ChainSanitizers(
+		s.sanitizer,
+		&truncateSanitizer{maxLen: config.SubagentToolOutputMaxChars},
+	)
+	return tool.NewExecutor(catalog, s.approval, s.network).WithSanitizer(sanitizer)
 }
 
 func (s *SubagentRunner) buildSubagentSystemPrompt(role, agentType string) string {
