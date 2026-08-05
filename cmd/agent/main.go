@@ -19,7 +19,6 @@ import (
 	"go-code-agent/internal/logging"
 	"go-code-agent/internal/model/provider"
 	"go-code-agent/internal/repl"
-	"go-code-agent/internal/security"
 	"go-code-agent/internal/session"
 	"go-code-agent/internal/store"
 	"go-code-agent/internal/utils"
@@ -132,9 +131,17 @@ Run with --help for the full list of environment variables.
 `)
 }
 
+func isTerminalTTY() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 // setupTerminal initialises the diagnostic log file, readline instance,
-// history file, and the security readline hook. Callers must defer the
-// returned cleanup function to release resources in reverse order.
+// and history file. Callers must defer the returned cleanup function to
+// release resources in reverse order.
 func setupTerminal(dataDir string) (readFunc func(string, bool) (string, error), cleanup func(), rerr error) {
 	// Diagnostic log file — kept outside the session log to avoid
 	// interleaving structured events with model output.
@@ -179,16 +186,11 @@ func setupTerminal(dataDir string) (readFunc func(string, bool) (string, error),
 		}
 		return line, err
 	}
-	security.SetReadLine(func(prompt string) (string, error) {
-		return readFn(prompt, false)
-	})
-
 	closers := []io.Closer{rl}
 	if lf != nil {
 		closers = append(closers, lf)
 	}
 	return readFn, func() {
-		security.ResetReadLine()
 		for i := len(closers) - 1; i >= 0; i-- {
 			closers[i].Close()
 		}
@@ -203,7 +205,21 @@ func run() (exitCode int) {
 	}
 
 	cfgDir := resolveConfigDir(opts.dataDir)
-	app, err := application.New(cfgDir, opts.workdir)
+	dataDir := application.ResolveDataDir(cfgDir, opts.workdir)
+
+	replPrompt := utils.Blue + "> " + utils.Reset
+	readTerminal, cleanup, err := setupTerminal(dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize terminal: %v\n", err)
+		return 1
+	}
+	defer cleanup()
+
+	app, err := application.New(cfgDir, opts.workdir,
+		application.WithInteractiveReader(func(prompt string) (string, error) {
+			return readTerminal(prompt, false)
+		}, isTerminalTTY()),
+	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize: %v\n", err)
 		if errors.Is(err, provider.ErrNoProvider) {
@@ -217,14 +233,6 @@ func run() (exitCode int) {
 			exitCode = 1
 		}
 	}()
-
-	replPrompt := utils.Blue + "> " + utils.Reset
-	readTerminal, cleanup, err := setupTerminal(app.DataDir())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to initialize terminal: %v\n", err)
-		return 1
-	}
-	defer cleanup()
 
 	rootCtx, stopRoot := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stopRoot()

@@ -59,8 +59,8 @@ func colorizeDiff(diff string) string {
 }
 
 // PreviewCreateAndConfirm reviews a newly-created file as one operation.
-func PreviewCreateAndConfirm(path, newContent, diff string, consoles ...InteractiveConsole) (string, bool) {
-	console := resolveInteractiveConsole(consoles...)
+func PreviewCreateAndConfirm(path, newContent, diff string, consoles ...InteractiveIO) (string, bool) {
+	console := resolveInteractiveIO(consoles...)
 	printReviewHeader("Proposed new file", path, console)
 	if previewWholeChange(diff, false, console) {
 		return newContent, true
@@ -69,16 +69,16 @@ func PreviewCreateAndConfirm(path, newContent, diff string, consoles ...Interact
 }
 
 // PreviewDeleteAndConfirm reviews deletion of the entire file as one operation.
-func PreviewDeleteAndConfirm(path, diff string, consoles ...InteractiveConsole) bool {
-	console := resolveInteractiveConsole(consoles...)
+func PreviewDeleteAndConfirm(path, diff string, consoles ...InteractiveIO) bool {
+	console := resolveInteractiveIO(consoles...)
 	printReviewHeader("Proposed deletion of", path, console)
 	return previewWholeChange(diff, true, console)
 }
 
 // PreviewAndConfirm reviews edits to an existing file, including per-hunk review.
 // Returns (finalContent, ok). ok=true means apply the returned content.
-func PreviewAndConfirm(path, oldContent, newContent, diff string, consoles ...InteractiveConsole) (string, bool) {
-	console := resolveInteractiveConsole(consoles...)
+func PreviewAndConfirm(path, oldContent, newContent, diff string, consoles ...InteractiveIO) (string, bool) {
+	console := resolveInteractiveIO(consoles...)
 	printReviewHeader("Proposed changes to", path, console)
 
 	hunks := parseHunks(diff)
@@ -95,34 +95,34 @@ func PreviewAndConfirm(path, oldContent, newContent, diff string, consoles ...In
 	return previewChunkByChunk(path, oldContent, newContent, hunks, console)
 }
 
-func resolveInteractiveConsole(consoles ...InteractiveConsole) InteractiveConsole {
+func resolveInteractiveIO(consoles ...InteractiveIO) InteractiveIO {
 	if len(consoles) > 0 && consoles[0] != nil {
 		return consoles[0]
 	}
-	return DefaultInteractiveConsole()
+	return DefaultInteractiveIO()
 }
 
-func printReviewHeader(action, path string, consoles ...InteractiveConsole) {
-	console := resolveInteractiveConsole(consoles...)
+func printReviewHeader(action, path string, consoles ...InteractiveIO) {
+	console := resolveInteractiveIO(consoles...)
 	console.WriteInteractive("\n")
 	console.WriteInteractive(fmt.Sprintf("%s─── %s %s ───%s\n", utils.Bold, action, path, utils.Reset))
 	console.WriteInteractive("\n")
 }
 
-func readReviewChoice(prompt string) (string, error) {
-	line, err := ReadLine(prompt)
+func readReviewChoice(io InteractiveIO, prompt string) (string, error) {
+	line, err := io.ReadLine(prompt)
 	if err != nil {
 		return "", err
 	}
 	return strings.ToLower(strings.TrimSpace(line)), nil
 }
 
-func rejectOnInputError(consoles ...InteractiveConsole) {
-	resolveInteractiveConsole(consoles...).WriteInteractive("  Input closed or interrupted; rejecting changes\n")
+func rejectOnInputError(consoles ...InteractiveIO) {
+	resolveInteractiveIO(consoles...).WriteInteractive("  Input closed or interrupted; rejecting changes\n")
 }
 
-func previewWholeChange(diff string, deleting bool, consoles ...InteractiveConsole) bool {
-	console := resolveInteractiveConsole(consoles...)
+func previewWholeChange(diff string, deleting bool, consoles ...InteractiveIO) bool {
+	console := resolveInteractiveIO(consoles...)
 	display := colorizeDiff(diff)
 	if strings.TrimSpace(diff) == "" {
 		display = "  (empty file)"
@@ -137,7 +137,7 @@ func previewWholeChange(diff string, deleting bool, consoles ...InteractiveConso
 		if deleting {
 			prompt = "  [D]elete file  [R]eject  [V]iew diff again  [Q]uit: "
 		}
-		answer, err := readReviewChoice(prompt)
+		answer, err := readReviewChoice(console, prompt)
 		if err != nil {
 			rejectOnInputError(console)
 			return false
@@ -173,15 +173,15 @@ func previewWholeChange(diff string, deleting bool, consoles ...InteractiveConso
 	}
 }
 
-func previewSingleHunk(path string, hunk diffHunk, fullDiff string, consoles ...InteractiveConsole) bool {
-	console := resolveInteractiveConsole(consoles...)
+func previewSingleHunk(path string, hunk diffHunk, fullDiff string, consoles ...InteractiveIO) bool {
+	console := resolveInteractiveIO(consoles...)
 	showDiff := true
 	for {
 		if showDiff {
 			console.WriteInteractive(colorizeDiff(fullDiff) + "\n\n")
 			showDiff = false
 		}
-		answer, err := readReviewChoice("  [A]pply  [R]eject  [D]iff again  [Q]uit: ")
+		answer, err := readReviewChoice(console, "  [A]pply  [R]eject  [D]iff again  [Q]uit: ")
 		if err != nil {
 			rejectOnInputError(console)
 			return false
@@ -208,8 +208,8 @@ func previewSingleHunk(path string, hunk diffHunk, fullDiff string, consoles ...
 	}
 }
 
-func previewChunkByChunk(path, oldContent, newContent string, hunks []diffHunk, consoles ...InteractiveConsole) (string, bool) {
-	console := resolveInteractiveConsole(consoles...)
+func previewChunkByChunk(path, oldContent, newContent string, hunks []diffHunk, consoles ...InteractiveIO) (string, bool) {
+	console := resolveInteractiveIO(consoles...)
 	console.WriteInteractive(fmt.Sprintf("  Found %d change blocks (hunks). Reviewing chunk by chunk...\n\n", len(hunks)))
 
 	accepted := make([]bool, len(hunks))
@@ -229,7 +229,7 @@ func previewChunkByChunk(path, oldContent, newContent string, hunks []diffHunk, 
 		console.WriteInteractive(fmt.Sprintf("  Chunk %d/%d:\n\n", i+1, len(hunks)))
 		console.WriteInteractive(colorizeDiff(strings.Join(hunks[i].Lines, "\n")) + "\n\n")
 
-		answer, err := readReviewChoice("  [A]ccept  [R]eject  a[L]l accept  [N]o all  [D]iff again  [Q]uit: ")
+		answer, err := readReviewChoice(console, "  [A]ccept  [R]eject  a[L]l accept  [N]o all  [D]iff again  [Q]uit: ")
 		if err != nil {
 			rejectOnInputError(console)
 			return "", false
@@ -297,9 +297,9 @@ func previewChunkByChunk(path, oldContent, newContent string, hunks []diffHunk, 
 	return finalContent, true
 }
 
-func confirmApplyAllAfterPartialFailure(consoles ...InteractiveConsole) bool {
-	console := resolveInteractiveConsole(consoles...)
-	answer, err := readReviewChoice("  Apply ALL changes instead? [y/N]: ")
+func confirmApplyAllAfterPartialFailure(consoles ...InteractiveIO) bool {
+	console := resolveInteractiveIO(consoles...)
+	answer, err := readReviewChoice(console, "  Apply ALL changes instead? [y/N]: ")
 	if err != nil {
 		rejectOnInputError(console)
 		return false
