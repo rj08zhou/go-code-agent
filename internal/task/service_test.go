@@ -3,9 +3,39 @@ package task
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
+
+func TestService_PrivateFileMode(t *testing.T) {
+	dir := t.TempDir()
+	svc := NewService(dir)
+	if msg := svc.Create("private task", "", nil); strings.HasPrefix(msg, "Error:") {
+		t.Fatalf("Create: %s", msg)
+	}
+	info, err := os.Stat(filepath.Join(dir, "task_1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("task file mode = %o, want 0600", perm)
+	}
+	if msg := svc.Create("second", "", nil); strings.HasPrefix(msg, "Error:") {
+		t.Fatalf("Create second: %s", msg)
+	}
+	if msg := svc.AddEdge(1, 2); strings.HasPrefix(msg, "Error:") {
+		t.Fatalf("AddEdge: %s", msg)
+	}
+	edgeInfo, err := os.Stat(filepath.Join(dir, "dag_edges.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := edgeInfo.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("edges file mode = %o, want 0600", perm)
+	}
+}
 
 func TestService_CreateGetUpdate(t *testing.T) {
 	svc := NewService(t.TempDir())
@@ -109,6 +139,38 @@ func TestService_EdgeCachePersists(t *testing.T) {
 	svc2 := NewService(dir)
 	if svc2.EdgeCount() != 1 {
 		t.Fatalf("expected 1 edge visible from fresh instance, got %d", svc2.EdgeCount())
+	}
+}
+
+func TestService_SaveFailureDoesNotUpdateCache(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+
+	// Bypass NewService so the unwritable parent is not chmod'd back to 0700.
+	svc := &Service{dir: filepath.Join(parent, "tasks")}
+	msg := svc.Create("should-fail", "", nil)
+	if !strings.HasPrefix(msg, "Error:") {
+		t.Fatalf("Create on readonly parent = %q, want Error", msg)
+	}
+	if n := svc.TaskCount(); n != 0 {
+		t.Fatalf("TaskCount = %d, want 0 (failed create must not update cache)", n)
+	}
+}
+
+func TestService_SaveMarshalFailureDoesNotUpdateCache(t *testing.T) {
+	svc := NewService(t.TempDir())
+	bad := map[string]any{
+		"id":  float64(1),
+		"bad": make(chan int), // not JSON-serializable
+	}
+	if err := svc.save(bad); err == nil {
+		t.Fatal("expected marshal error")
+	}
+	if n := svc.TaskCount(); n != 0 {
+		t.Fatalf("TaskCount = %d, want 0 after marshal failure", n)
 	}
 }
 

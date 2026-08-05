@@ -346,7 +346,7 @@ func registerSessionShutdownHooks(
 	if wb.histStore != nil {
 		rt.AddHook("history", func(context.Context) error { return wb.histStore.Close() })
 	}
-	rt.AddHook("worktree", func(context.Context) error { params.WorktreeSvc.RemoveAll(); return nil })
+	rt.AddHook("worktree", func(context.Context) error { return params.WorktreeSvc.RemoveAll() })
 	rt.AddHook("mcp", func(context.Context) error { params.MCPMgr.Shutdown(); return nil })
 	rt.AddHook("background", func(ctx context.Context) error {
 		params.BGSvc.StopAll()

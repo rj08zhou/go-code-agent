@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"go-code-agent/internal/store"
 )
 
 // Actor represents a teammate's runtime state.
@@ -26,17 +28,56 @@ type MessageBus struct {
 }
 
 func NewBus(dir string) *MessageBus {
-	os.MkdirAll(dir, 0o755)
+	_ = store.EnsurePrivateDir(dir)
 	return &MessageBus{dir: dir}
 }
 
-func (b *MessageBus) inboxPath(id string) string {
-	return filepath.Join(b.dir, id+".jsonl")
+// validateBusAgentID rejects empty IDs and any value that could escape the
+// inbox directory when used as a path component.
+func validateBusAgentID(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("empty agent id")
+	}
+	if id == "." || id == ".." {
+		return fmt.Errorf("invalid agent id %q", id)
+	}
+	if strings.ContainsRune(id, 0) {
+		return fmt.Errorf("invalid agent id %q: null byte", id)
+	}
+	if strings.ContainsAny(id, `/\`) || strings.ContainsRune(id, filepath.Separator) {
+		return fmt.Errorf("invalid agent id %q: path separators not allowed", id)
+	}
+	return nil
+}
+
+func (b *MessageBus) inboxPath(id string) (string, error) {
+	if err := validateBusAgentID(id); err != nil {
+		return "", err
+	}
+	root := filepath.Clean(b.dir)
+	path := filepath.Join(root, id+".jsonl")
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid agent id %q: path escapes inbox", id)
+	}
+	if filepath.Base(path) != id+".jsonl" {
+		return "", fmt.Errorf("invalid agent id %q", id)
+	}
+	return path, nil
 }
 
 func (b *MessageBus) Send(from, to, content, msgType string, meta map[string]any) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.sendLocked(from, to, content, msgType, meta)
+}
+
+func (b *MessageBus) sendLocked(from, to, content, msgType string, meta map[string]any) string {
+	path, err := b.inboxPath(to)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
 	if msgType == "" {
 		msgType = "message"
 	}
@@ -51,20 +92,29 @@ func (b *MessageBus) Send(from, to, content, msgType string, meta map[string]any
 			msg[k] = v
 		}
 	}
-	data, _ := json.Marshal(msg)
-	f, err := os.OpenFile(b.inboxPath(to), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
+	f, err := store.OpenPrivateAppend(path)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
 	defer f.Close()
-	f.Write(append(data, '\n'))
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
 	return fmt.Sprintf("Sent to %s", to)
 }
 
 func (b *MessageBus) ReadInbox(id string) []map[string]any {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	f, err := os.Open(b.inboxPath(id))
+	path, err := b.inboxPath(id)
+	if err != nil {
+		return nil
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
@@ -78,14 +128,16 @@ func (b *MessageBus) ReadInbox(id string) []map[string]any {
 		}
 	}
 	// Drain inbox
-	os.Truncate(b.inboxPath(id), 0)
+	_ = os.Truncate(path, 0)
 	return msgs
 }
 
 func (b *MessageBus) Broadcast(from, content string, recipients []string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	var results []string
 	for _, to := range recipients {
-		results = append(results, b.Send(from, to, content, "broadcast", nil))
+		results = append(results, b.sendLocked(from, to, content, "broadcast", nil))
 	}
 	return strings.Join(results, "\n")
 }
