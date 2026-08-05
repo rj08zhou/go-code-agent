@@ -1,6 +1,9 @@
 package team
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -33,6 +36,33 @@ func TestMessageBus_SendAndRead(t *testing.T) {
 	}
 }
 
+func TestMessageBus_RejectsPathEscapeRecipient(t *testing.T) {
+	dir := t.TempDir()
+	bus := NewBus(dir)
+
+	outside := filepath.Join(dir, "..", "escaped.jsonl")
+	for _, to := range []string{"../escaped", "..", ".", "a/b", `a\b`, ""} {
+		result := bus.Send("alice", to, "payload", "message", nil)
+		if !strings.HasPrefix(result, "Error:") {
+			t.Fatalf("Send(%q) = %q, want Error", to, result)
+		}
+		if _, err := os.Stat(outside); err == nil {
+			t.Fatalf("Send(%q) created file outside inbox", to)
+		}
+		if msgs := bus.ReadInbox(to); len(msgs) != 0 {
+			t.Fatalf("ReadInbox(%q) should be empty for invalid id, got %d", to, len(msgs))
+		}
+	}
+
+	// Valid send still works after rejected attempts.
+	if got := bus.Send("alice", "bob", "ok", "", nil); strings.HasPrefix(got, "Error:") {
+		t.Fatalf("valid send failed: %s", got)
+	}
+	if n := len(bus.ReadInbox("bob")); n != 1 {
+		t.Fatalf("expected 1 message for bob, got %d", n)
+	}
+}
+
 func TestMessageBus_MultipleMessages(t *testing.T) {
 	dir := t.TempDir()
 	bus := NewBus(dir)
@@ -61,6 +91,22 @@ func TestMessageBus_Broadcast(t *testing.T) {
 		if len(msgs) != 1 {
 			t.Errorf("%s: expected 1 message, got %d", name, len(msgs))
 		}
+	}
+}
+
+func TestMessageBus_BroadcastRejectsBadRecipient(t *testing.T) {
+	dir := t.TempDir()
+	bus := NewBus(dir)
+
+	result := bus.Broadcast("lead", "hi", []string{"alice", "../x", "bob"})
+	if !strings.Contains(result, "Error:") {
+		t.Fatalf("expected Error in broadcast result, got %q", result)
+	}
+	if n := len(bus.ReadInbox("alice")); n != 1 {
+		t.Fatalf("alice should still receive message, got %d", n)
+	}
+	if n := len(bus.ReadInbox("bob")); n != 1 {
+		t.Fatalf("bob should still receive message, got %d", n)
 	}
 }
 

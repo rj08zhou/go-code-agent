@@ -1,9 +1,11 @@
 package worktree
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -30,6 +32,19 @@ func New(workdir, dataDir string) *Service {
 	}
 }
 
+func (s *Service) runGit(dir string, args ...string) error {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	detail := strings.TrimSpace(string(out))
+	if detail == "" {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, detail)
+}
+
 func (s *Service) Acquire(agentID string) (*Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -39,19 +54,14 @@ func (s *Service) Acquire(agentID string) (*Lease, error) {
 	branchName := fmt.Sprintf("agent_%s", agentID)
 	worktreeDir := filepath.Join(s.dataDir, "worktrees", agentID)
 
-	err := exec.Command("git",
-		"-C", s.workdir,
-		"worktree", "add", "--detach", worktreeDir,
-		"HEAD",
-	).Run()
-	if err != nil {
+	if err := s.runGit(s.workdir, "worktree", "add", "--detach", worktreeDir, "HEAD"); err != nil {
 		return nil, fmt.Errorf("git worktree add: %w", err)
 	}
 
-	exec.Command("git",
-		"-C", worktreeDir,
-		"checkout", "-b", branchName,
-	).Run()
+	if err := s.runGit(worktreeDir, "checkout", "-b", branchName); err != nil {
+		_ = s.runGit(s.workdir, "worktree", "remove", "--force", worktreeDir)
+		return nil, fmt.Errorf("git checkout -b %s: %w", branchName, err)
+	}
 
 	l := &Lease{AgentID: agentID, WorktreeDir: worktreeDir, BranchName: branchName}
 	s.leases[agentID] = l
@@ -65,22 +75,25 @@ func (s *Service) Release(agentID string) error {
 	if !ok {
 		return nil
 	}
+	if err := s.runGit(s.workdir, "worktree", "remove", "--force", l.WorktreeDir); err != nil {
+		return fmt.Errorf("git worktree remove %s: %w", agentID, err)
+	}
 	delete(s.leases, agentID)
-	exec.Command("git",
-		"-C", s.workdir,
-		"worktree", "remove", "--force", l.WorktreeDir,
-	).Run()
 	return nil
 }
 
-func (s *Service) RemoveAll() {
+// RemoveAll removes every tracked worktree. Leases that fail to remove are
+// retained so a later attempt can retry; successful removals are forgotten.
+func (s *Service) RemoveAll() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var errs []error
 	for id, l := range s.leases {
-		exec.Command("git",
-			"-C", s.workdir,
-			"worktree", "remove", "--force", l.WorktreeDir,
-		).Run()
+		if err := s.runGit(s.workdir, "worktree", "remove", "--force", l.WorktreeDir); err != nil {
+			errs = append(errs, fmt.Errorf("git worktree remove %s: %w", id, err))
+			continue
+		}
 		delete(s.leases, id)
 	}
+	return errors.Join(errs...)
 }
