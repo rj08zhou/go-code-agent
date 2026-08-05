@@ -54,20 +54,6 @@ func AllowPrivateIPs() bool {
 	return false
 }
 
-// AllowPrivateNetworkAccess is an alias kept for callers that used the
-// master-branch name.
-func AllowPrivateNetworkAccess() bool { return AllowPrivateIPs() }
-
-// IsPrivateIP reports whether ip is in a private/reserved range that is
-// blocked by default (including always-blocked ranges). Prefer IsBlockedIP
-// for dial-time decisions.
-func IsPrivateIP(ip net.IP) bool {
-	if ip == nil {
-		return true
-	}
-	return IsBlockedIP(ip)
-}
-
 // IsBlockedIP reports whether ip must never be dialed by web tools:
 // always-blocked ranges are denied even with WEB_ALLOW_PRIVATE_IPS=1;
 // other private ranges are denied unless that override is set.
@@ -131,15 +117,4 @@ func ValidateHost(host string) error {
 		}
 	}
 	return nil
-}
-
-// RedactSecretsInLog replaces known env secrets with ***.
-func RedactSecretsInLog(s string, secrets ...string) string {
-	for _, sec := range secrets {
-		if sec == "" {
-			continue
-		}
-		s = strings.ReplaceAll(s, sec, "***")
-	}
-	return s
 }

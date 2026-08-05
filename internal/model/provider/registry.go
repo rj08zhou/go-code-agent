@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"go-code-agent/internal/config"
-	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
 	"strings"
 	"sync"
@@ -110,22 +109,6 @@ func inferName(modelID string) string {
 	return ""
 }
 
-func (r *Registry) ForModel(cfg *config.Config, modelID string) model.Provider {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if name := strings.ToLower(cfg.LLMProvider); name != "" {
-		if p, ok := r.providers[name]; ok {
-			return p
-		}
-	}
-	if name := inferName(modelID); name != "" {
-		if p, ok := r.providers[name]; ok {
-			return p
-		}
-	}
-	return nil
-}
-
 // --- Helper: centralize provider selection ---
 
 func BuildGateway(cfg *config.Config, registry *Registry) (*model.Gateway, *model.RoleThrottle, error) {
@@ -142,13 +125,4 @@ func BuildGateway(cfg *config.Config, registry *Registry) (*model.Gateway, *mode
 		}
 	}
 	return gw, throttle, nil
-}
-
-// MkOk / MkErr helpers
-func MkOk(output string) llm.Completion {
-	return llm.Completion{Content: output, FinishReason: "stop"}
-}
-
-func MkErr(msg string) llm.Completion {
-	return llm.Completion{Content: "[ERROR] " + msg, FinishReason: "stop"}
 }

@@ -45,10 +45,6 @@ func (s *Store) evergreenPath() string {
 	return filepath.Join(s.dataDir, "MEMORY.md")
 }
 
-func (s *Store) dailyFilePath(t time.Time) string {
-	return filepath.Join(s.dailyDir, t.Format("2006-01-02")+".jsonl")
-}
-
 // --- TTL cleanup ---
 
 func (s *Store) cleanExpired() {
