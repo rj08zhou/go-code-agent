@@ -118,35 +118,6 @@ func ReviewPlan(ps *ProtocolStore, bus *MessageBus, requestID string, approve bo
 	return fmt.Sprintf("Plan %s for %s", status, teammate)
 }
 
-// ApprovePlan marks a teammate's latest plan as approved. Kept for compatibility.
-func ApprovePlan(ps *ProtocolStore, name string) string {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	pr, exists := ps.plans[name]
-	if !exists {
-		return fmt.Sprintf("No pending plan from %s", name)
-	}
-	if pr.Status != planPending {
-		return fmt.Sprintf("Plan from %s is already %s", name, pr.Status)
-	}
-	pr.Status = planApproved
-	return fmt.Sprintf("Plan from %s approved", name)
-}
-
-// RejectPlan marks a teammate's latest plan as rejected. Kept for compatibility.
-func RejectPlan(ps *ProtocolStore, name, reason string) string {
-	ps.mu.Lock()
-	pr, exists := ps.plans[name]
-	if exists && pr.Status == planPending {
-		pr.Status = planRejected
-	}
-	ps.mu.Unlock()
-	if !exists {
-		return fmt.Sprintf("No pending plan from %s", name)
-	}
-	return fmt.Sprintf("Plan from %s rejected: %s", name, reason)
-}
-
 // PostShutdownRequest sends a shutdown message to a teammate.
 func PostShutdownRequest(ps *ProtocolStore, bus *MessageBus, name string) string {
 	bus.Send("lead", name, "shutdown", "shutdown_request", nil)

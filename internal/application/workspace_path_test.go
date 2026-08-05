@@ -18,12 +18,12 @@ func TestResolveDataDirSeparatesSameNamedWorkspaces(t *testing.T) {
 		}
 	}
 
-	firstData := resolveDataDir(cfgDir, first)
-	secondData := resolveDataDir(cfgDir, second)
+	firstData := ResolveDataDir(cfgDir, first)
+	secondData := ResolveDataDir(cfgDir, second)
 	if firstData == secondData {
 		t.Fatalf("same-named workspaces share state directory %q", firstData)
 	}
-	if firstData != resolveDataDir(cfgDir, first) {
+	if firstData != ResolveDataDir(cfgDir, first) {
 		t.Fatal("state directory is not deterministic")
 	}
 	for _, dataDir := range []string{firstData, secondData} {
@@ -51,7 +51,7 @@ func TestResolveDataDirNormalizesWorkspacePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := resolveDataDir(cfgDir, relative), resolveDataDir(cfgDir, workdir); got != want {
+	if got, want := ResolveDataDir(cfgDir, relative), ResolveDataDir(cfgDir, workdir); got != want {
 		t.Fatalf("relative and absolute paths resolve differently: got %q, want %q", got, want)
 	}
 }

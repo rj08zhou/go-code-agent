@@ -162,7 +162,10 @@ func TestOpenAIReasoningStreamingIsOpaqueAndCounted(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Join(sink.deltas, "") != "checking" {
-		t.Fatalf("user-visible deltas leaked reasoning: %#v", sink.deltas)
+		t.Fatalf("answer deltas leaked reasoning: %#v", sink.deltas)
+	}
+	if strings.Join(sink.reasoning, "") != "private analysis" {
+		t.Fatalf("reasoning deltas = %#v", sink.reasoning)
 	}
 	if result.Content != "checking" || result.Usage.ReasoningTokens != 3 {
 		t.Fatalf("stream result = %#v", result)

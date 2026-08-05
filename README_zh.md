@@ -233,7 +233,7 @@ REPL 将新消息追加到 HistoryStore
 | `ANTHROPIC_BASE_URL` | SDK 默认 | Anthropic 网关/代理 |
 | `OPENAI_API_KEY` | — | OpenAI / 兼容接口必需 |
 | `OPENAI_BASE_URL` | SDK 默认 | 代理或本地模型端点 |
-| `REASONING_ENABLED` | 关闭 | 为 Agent 调用启用 Provider 原生推理；原始推理不会展示或持久化 |
+| `REASONING_ENABLED` | 关闭 | 为 Agent 调用启用 Provider 原生推理；思考过程以暗色品红 `[thinking]` 流式展示，不透明状态不会写入会话历史 |
 | `REASONING_EFFORT` | `medium` | OpenAI 兼容推理强度：`minimal` \| `low` \| `medium` \| `high` |
 | `LLM_MAX_QPS` | `4.0` | 进程级 LLM 请求/秒 |
 | `LLM_MAX_BURST` | `8` | 令牌桶突发容量 |
@@ -371,7 +371,6 @@ go-code-agent/
 | `/inbox` | 读取 lead inbox |
 | `/judge` | 开关 LLM-as-Judge |
 | `/approval [manual\|safe-auto\|all-auto\|reject\|notify-only]` | 查看或设置最终审批模式（`all-auto` 需附加 `confirm`） |
-| `/approve ...` / `/hitl ...` | 旧命令兼容别名 |
 | `/permissions [reload]` | 查看 / 重载 permissions.json |
 | `/security` | 安全状态 |
 | `/security test-bash <cmd>` | 干跑 bash 策略 |
@@ -478,7 +477,7 @@ MCP 服务器启动/批准后，以 `mcp__<server>__<tool>` 形式注册到会�
 
 | 组件 | 作用 |
 |------|------|
-| `security.ApprovalState` | 会话 `/approve` 姿态：`off` / `safe` / `danger`；控制自动放行与是否展示 diff preview |
+| `security.ApprovalState` | 会话 `/approval` 姿态：`manual` / `safe-auto` / `all-auto`；控制自动放行与是否展示 diff preview |
 | `hitlaudit.HITLManager` | 交互模式：`safe-only`、`interactive`、`auto-approve`、`auto-reject`、`notify-only` |
 
 `HITLApprovalAdapter` 将二者适配为 executor 使用的 `tool.ApprovalChecker`（含分块 diff 确认）。

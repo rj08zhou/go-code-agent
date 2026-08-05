@@ -57,6 +57,8 @@ type SubagentRunner struct {
 	approval     tool.ApprovalChecker
 	eventSink    event.Sink
 	compress     *Compression
+	network      tool.NetworkChecker
+	sanitizer    tool.OutputSanitizer
 }
 
 func NewSubagentRunner(gw *model.Gateway, catalog *tool.ToolCatalog, cfg *config.Config, pl *prompt.Loader) *SubagentRunner {
@@ -75,6 +77,14 @@ func (s *SubagentRunner) SetEventSink(sink event.Sink) {
 // the same way as lead tools.
 func (s *SubagentRunner) SetApproval(a tool.ApprovalChecker) {
 	s.approval = a
+}
+
+// SetExecutorSecurity applies the session's shared preflight and redaction
+// policy to every subagent executor. Subagents add output truncation after
+// the shared sanitizer to keep their prompt budget bounded.
+func (s *SubagentRunner) SetExecutorSecurity(network tool.NetworkChecker, sanitizer tool.OutputSanitizer) {
+	s.network = network
+	s.sanitizer = sanitizer
 }
 
 // SetCompression enables auto-compaction for subagent runners.
@@ -126,8 +136,7 @@ func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir str
 	// collapse DeepSeek's prefix cache (each read_file appends
 	// thousands of chars to the message list, reshuffling the
 	// entire prefix for subsequent requests).
-	exec := tool.NewExecutor(exploreCatalog, s.approval, nil).
-		WithSanitizer(&truncateSanitizer{maxLen: config.SubagentToolOutputMaxChars})
+	exec := s.newExecutor(exploreCatalog)
 	runner := NewRunner(profile, s.gateway, exec, scope, s.cfg)
 	runner.SetEventSink(s.eventSink)
 	if s.compress != nil {
@@ -179,6 +188,14 @@ func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir str
 		return finalText
 	}
 	return formatSubagentTimeoutSummary(steps, finalText)
+}
+
+func (s *SubagentRunner) newExecutor(catalog *tool.ToolCatalog) *tool.Executor {
+	sanitizer := tool.ChainSanitizers(
+		s.sanitizer,
+		&truncateSanitizer{maxLen: config.SubagentToolOutputMaxChars},
+	)
+	return tool.NewExecutor(catalog, s.approval, s.network).WithSanitizer(sanitizer)
 }
 
 func (s *SubagentRunner) buildSubagentSystemPrompt(role, agentType string) string {
@@ -256,15 +273,16 @@ func lastAssistantText(msgs []llm.Message) string {
 //
 //	lead   → green body, no [lead] prefix
 //	explore/teammate → cyan [sub] prefix once, then cyan body
+//	thinking → dim magenta [thinking] prefix once
 //
-// The [sub] label is printed only on the first delta of a stream. Printing
-// it on every OnTextDelta (one token/chunk) produced output like
-// `[sub] Code[sub] x[sub]  CLI` and made subagent replies unreadable.
+// The [sub]/[thinking] labels are printed only on the first delta of each
+// phase. Printing them on every chunk made streamed replies unreadable.
 type prefixedSink struct {
-	Prefix  string
-	color   string
-	isLead  bool
-	started bool
+	Prefix    string
+	color     string
+	isLead    bool
+	reasoning bool // thinking phase active / started
+	started   bool // answer text phase started
 }
 
 func newPrefixedSink(role string) *prefixedSink {
@@ -278,12 +296,28 @@ func newPrefixedSink(role string) *prefixedSink {
 	return s
 }
 
+func (s *prefixedSink) OnReasoningDelta(text string) {
+	if text == "" {
+		return
+	}
+	if !s.reasoning {
+		// Dim + magenta: visually distinct from green lead / cyan sub answers.
+		fmt.Print(utils.Dim + utils.Magenta + "[thinking] ")
+		s.reasoning = true
+	}
+	fmt.Print(text)
+}
+
 func (s *prefixedSink) OnTextDelta(text string) {
 	// Print immediately instead of buffering until OnDone.
 	// This avoids the user-perceived "hang" when the model is
 	// generating a long response: streaming content is visible in
 	// real time, and Ctrl-C during generation doesn't lose
 	// already-seen output.
+	if s.reasoning && !s.started {
+		fmt.Print(utils.Reset + "\n")
+		s.reasoning = false
+	}
 	if !s.started {
 		if s.isLead {
 			fmt.Print(s.color)
@@ -296,7 +330,7 @@ func (s *prefixedSink) OnTextDelta(text string) {
 }
 
 func (s *prefixedSink) OnDone() {
-	if s.started {
+	if s.started || s.reasoning {
 		fmt.Print(utils.Reset)
 		fmt.Println()
 	}

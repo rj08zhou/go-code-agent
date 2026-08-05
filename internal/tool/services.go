@@ -44,6 +44,9 @@ type SkillLoader interface {
 type TeamService interface {
 	Spawn(ctx context.Context, name, role, prompt string) string
 	ListAll() string
+	// MemberNames returns current teammate names for routing (e.g. broadcast).
+	// Prefer this over parsing ListAll() display text.
+	MemberNames() []string
 }
 
 // MessageBus is the interface for inter-agent messaging.

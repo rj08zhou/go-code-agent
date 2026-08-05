@@ -28,7 +28,8 @@ type Config struct {
 
 	// ReasoningEnabled opts agent execution calls into provider-native
 	// reasoning. ReasoningEffort is a provider-interpreted hint; the OpenAI
-	// adapter validates and maps it to reasoning_effort.
+	// adapter validates and maps it to reasoning_effort. When enabled,
+	// displayable thinking streams to the terminal (dim magenta [thinking]).
 	ReasoningEnabled bool
 	ReasoningEffort  string
 
@@ -257,6 +258,9 @@ const (
 	DeduplicateThreshold = 0.7
 	MaxMemoryContentLen  = 2000
 	MaxEvergreenChars    = 8000
+	// MaxProjectDocChars caps AGENT.md / CLAUDE.md / AGENTS.md injection
+	// into the system prompt (rune count).
+	MaxProjectDocChars = 16000
 )
 
 const (

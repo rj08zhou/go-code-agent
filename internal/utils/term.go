@@ -53,6 +53,3 @@ func terminalStyle(code string) string {
 	}
 	return code
 }
-
-// Color wraps s in ANSI color codes when terminal styling is enabled.
-func Color(s, code string) string { return code + s + Reset }

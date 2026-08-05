@@ -1,6 +1,7 @@
 package application
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -14,8 +15,10 @@ import (
 	"go-code-agent/internal/event"
 	"go-code-agent/internal/history"
 	"go-code-agent/internal/hitlaudit"
+	"go-code-agent/internal/llm"
 	"go-code-agent/internal/mcp"
 	"go-code-agent/internal/memory"
+	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/skill"
@@ -37,6 +40,8 @@ type RunnerParams struct {
 	BGSvc        *background.Supervisor
 	Bus          *team.MessageBus
 	WebService   tool.WebService
+	Console      *event.ConsoleSink
+	Interactive  security.InteractiveIO
 	HITLMgr      *hitlaudit.HITLManager
 	Approval     *security.ApprovalState
 	MCPMgr       *mcp.Manager
@@ -45,19 +50,22 @@ type RunnerParams struct {
 	PromptLoader *prompt.Loader
 	Permissions  *security.Permissions
 	Config       *config.Config
+	Usage        *agent.UsageTracker
 }
 
 // wireBundle is the intermediate product of staged wiring.
 type wireBundle struct {
-	catalog   *tool.ToolCatalog
-	executor  *tool.Executor
-	subagent  *agent.SubagentRunner
-	teamMgr   *agent.TeammateManager
-	sysPrompt string
-	runner    *agent.Runner
-	histStore *history.Store
-	judge     *agent.Judge
-	hitlAdpt  *hitlaudit.HITLApprovalAdapter
+	catalog      *tool.ToolCatalog
+	executor     *tool.Executor
+	subagent     *agent.SubagentRunner
+	teamMgr      *agent.TeammateManager
+	sysPrompt    string
+	runner       *agent.Runner
+	histStore    *history.Store
+	judge        *agent.Judge
+	hitlAdpt     *hitlaudit.HITLApprovalAdapter
+	network      tool.NetworkChecker
+	outputSafety tool.OutputSanitizer
 }
 
 // BuildRunner wires a single session run via staged helpers.
@@ -73,16 +81,18 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams, sessionDir string) (*
 		return nil, fmt.Errorf("initialize history: %w", err)
 	}
 	wb := &wireBundle{catalog: rt.catalog, histStore: histStore}
-	wb.executor, wb.hitlAdpt = wireSecurity(rt, params)
-	wb.subagent, wb.teamMgr = wireTeam(rt, params, sessionDir, wb.hitlAdpt)
+	wb.executor, wb.hitlAdpt, wb.network, wb.outputSafety = wireSecurity(rt, params)
+	wb.subagent, wb.teamMgr = wireTeam(rt, params, sessionDir, wb.hitlAdpt, wb.network, wb.outputSafety)
 	wireTools(rt, params, wb)
 	wb.sysPrompt = wireSystemPrompt(rt, params)
 	wb.runner, wb.judge = wireAgent(rt, params, wb, st.ID, sessionDir)
-	wireObservability(rt, params, wb, sessionDir)
+	sessionLog := wireObservability(rt, params, wb, sessionDir)
+	registerSessionShutdownHooks(rt, params, wb, sessionLog)
 
 	providerName := rt.gateway.ProviderName("lead")
 	return &BuiltRunner{
 		Session: SessionFacade{
+			Context:   rt.Ctx,
 			ID:        st.ID,
 			Title:     st.Title,
 			AgentID:   "lead",
@@ -168,13 +178,17 @@ func safeEndpointHost(rawURL, defaultHost string) string {
 	return host
 }
 
-func wireSecurity(rt *SessionRuntime, params RunnerParams) (*tool.Executor, *hitlaudit.HITLApprovalAdapter) {
-	hitlApproval := hitlaudit.NewHITLApprovalAdapter(params.HITLMgr)
+func wireSecurity(rt *SessionRuntime, params RunnerParams) (*tool.Executor, *hitlaudit.HITLApprovalAdapter, tool.NetworkChecker, tool.OutputSanitizer) {
+	hitlApproval := hitlaudit.NewHITLApprovalAdapter(params.HITLMgr, params.Interactive)
 	hitlApproval.SetApproval(params.Approval)
-	exec := tool.NewExecutor(rt.catalog, hitlApproval, nil).
-		WithSanitizer(security.NewSecretsSanitizer()).
+	hitlApproval.SetCatalog(rt.catalog)
+	hitlApproval.SetPermissions(params.Permissions)
+	network := security.NewSSRFNetworkChecker()
+	outputSafety := security.NewSecretsSanitizer()
+	exec := tool.NewExecutor(rt.catalog, hitlApproval, network).
+		WithSanitizer(outputSafety).
 		WithDecisionLogger(params.DecisionLog)
-	return exec, hitlApproval
+	return exec, hitlApproval, network, outputSafety
 }
 
 func wireTeam(
@@ -182,11 +196,14 @@ func wireTeam(
 	params RunnerParams,
 	sessionDir string,
 	hitlApproval *hitlaudit.HITLApprovalAdapter,
+	network tool.NetworkChecker,
+	outputSafety tool.OutputSanitizer,
 ) (*agent.SubagentRunner, *agent.TeammateManager) {
 	cfg := params.Config
 	subagentRunner := agent.NewSubagentRunner(rt.gateway, rt.catalog, cfg, params.PromptLoader)
 	subagentRunner.SetCompression(agent.NewCompression(rt.gateway, nil, sessionDir, cfg.ModelID, params.PromptLoader))
 	subagentRunner.SetApproval(hitlApproval)
+	subagentRunner.SetExecutorSecurity(network, outputSafety)
 
 	teamMgr := agent.NewTeammateManager(
 		filepath.Join(sessionDir, "team"), rt.gateway,
@@ -196,6 +213,7 @@ func wireTeam(
 	teamMgr.SetSessionCtx(rt.Ctx)
 	teamMgr.SetDiffPreview(params.DiffPreview)
 	teamMgr.SetApproval(hitlApproval)
+	teamMgr.SetExecutorSecurity(network, outputSafety)
 	teamMgr.SetReasoningConfig(cfg)
 	return subagentRunner, teamMgr
 }
@@ -222,7 +240,7 @@ func wireTools(rt *SessionRuntime, params RunnerParams, wb *wireBundle) {
 
 func wireSystemPrompt(rt *SessionRuntime, params RunnerParams) string {
 	return agent.NewSystemPromptBuilder(
-		params.PromptLoader, params.SkillLoader, nil,
+		params.PromptLoader, params.SkillLoader, agent.LoadProjectDocumentation(rt.workdir),
 	).Build(rt.workdir)
 }
 
@@ -251,39 +269,31 @@ func wireAgent(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionI
 			return params.TodoSvc.HasOpenItems(), params.TodoSvc.Render()
 		})
 	}
+	renderTaskProgress := func() string {
+		var parts []string
+		if params.TodoSvc != nil {
+			parts = append(parts, params.TodoSvc.Render())
+		}
+		if params.TaskSvc != nil {
+			if progress := params.TaskSvc.ProgressSummary(); progress != "" {
+				parts = append(parts, progress)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
 	if params.TaskSvc != nil || params.TodoSvc != nil {
-		runner.SetTaskProgress(func() string {
-			var parts []string
-			if params.TodoSvc != nil {
-				parts = append(parts, params.TodoSvc.Render())
-			}
-			if params.TaskSvc != nil {
-				if progress := params.TaskSvc.ProgressSummary(); progress != "" {
-					parts = append(parts, progress)
-				}
-			}
-			return strings.Join(parts, "\n")
-		})
+		runner.SetTaskProgress(renderTaskProgress)
 	}
 	runner.SetDynamicContext(func() string {
 		evergreen := ""
 		if params.MemoryStore != nil {
 			evergreen = params.MemoryStore.GetEvergreen()
 		}
-		var taskParts []string
-		if params.TodoSvc != nil {
-			taskParts = append(taskParts, params.TodoSvc.Render())
-		}
-		if params.TaskSvc != nil {
-			if progress := params.TaskSvc.ProgressSummary(); progress != "" {
-				taskParts = append(taskParts, progress)
-			}
-		}
 		mcp := ""
 		if params.MCPMgr != nil {
 			mcp = strings.TrimSpace(params.MCPMgr.List() + "\n" + params.MCPMgr.ServerInstructions())
 		}
-		return agent.BuildSessionContext(evergreen, strings.Join(taskParts, "\n"), mcp)
+		return agent.BuildSessionContext(evergreen, renderTaskProgress(), mcp)
 	})
 
 	runner.SetCompression(agent.NewCompression(rt.gateway, wb.histStore, sessionDir, cfg.ModelID, params.PromptLoader))
@@ -299,31 +309,66 @@ func wireAgent(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionI
 	return runner, judgeInst
 }
 
-func wireObservability(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionDir string) {
+func wireObservability(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionDir string) *event.SessionLogSink {
 	// session.log is the authoritative structured event record. Keep the
 	// terminal sink for user-facing summaries; audit and usage events are
 	// already captured by SessionLogSink and should not be duplicated in
 	// agent.log.
-	sinks := []event.Sink{event.NewConsoleSink()}
-	if sessionLog, logErr := event.NewSessionLogSink(filepath.Join(sessionDir, "session.log")); logErr != nil {
+	consoleSink := params.Console
+	if consoleSink == nil {
+		consoleSink = event.NewConsoleSink()
+	}
+	sinks := []event.Sink{consoleSink}
+	var sessionLog *event.SessionLogSink
+	if logSink, logErr := event.NewSessionLogSink(filepath.Join(sessionDir, "session.log")); logErr != nil {
 		fmt.Fprintf(os.Stderr, "[warn] session.log: %v\n", logErr)
 	} else {
+		sessionLog = logSink
 		sinks = append(sinks, sessionLog)
-		rt.AddHook("session-log", sessionLog.Close)
 	}
 	allEvents := event.NewMultiSink(sinks...)
 	wb.runner.SetEventSink(allEvents)
 	wb.subagent.SetEventSink(allEvents)
 	wb.teamMgr.SetEventSink(allEvents)
-	rt.gateway.SetEventSink(allEvents)
-
-	rt.AddHook("team", func() error { wb.teamMgr.ShutdownAll(); wb.teamMgr.Wait(); return nil })
-	rt.AddHook("mcp", func() error { params.MCPMgr.Shutdown(); return nil })
-	rt.AddHook("background", func() error { params.BGSvc.StopAll(); return nil })
-	rt.AddHook("worktree", func() error { params.WorktreeSvc.RemoveAll(); return nil })
-	if wb.histStore != nil {
-		rt.AddHook("history", func() error { return wb.histStore.Close() })
+	// Gateway is process-scoped; observers are session-scoped. Carry them on
+	// the runtime context so every call made by this session sees the same
+	// event sink and usage recorder without mutating shared Gateway state.
+	observers := model.CallObservers{Events: allEvents}
+	if params.Usage != nil {
+		observers.Usage = func(role, providerName, modelID, traceID string, usage llm.Usage, duration float64) {
+			params.Usage.Record(providerName, role, modelID, traceID, usage, duration)
+		}
 	}
+	rt.Ctx = model.WithCallObservers(rt.Ctx, observers)
+	wb.teamMgr.SetSessionCtx(rt.Ctx)
+	return sessionLog
+}
+
+// registerSessionShutdownHooks records all runner-owned resources in creation
+// order. SessionRuntime closes hooks in reverse, so teammates and background
+// work stop before MCP, worktrees, history, and the event log are released.
+func registerSessionShutdownHooks(
+	rt *SessionRuntime,
+	params RunnerParams,
+	wb *wireBundle,
+	sessionLog *event.SessionLogSink,
+) {
+	if sessionLog != nil {
+		rt.AddHook("session-log", func(context.Context) error { return sessionLog.Close() })
+	}
+	if wb.histStore != nil {
+		rt.AddHook("history", func(context.Context) error { return wb.histStore.Close() })
+	}
+	rt.AddHook("worktree", func(context.Context) error { return params.WorktreeSvc.RemoveAll() })
+	rt.AddHook("mcp", func(context.Context) error { params.MCPMgr.Shutdown(); return nil })
+	rt.AddHook("background", func(ctx context.Context) error {
+		params.BGSvc.StopAll()
+		return params.BGSvc.Wait(ctx)
+	})
+	rt.AddHook("team", func(ctx context.Context) error {
+		wb.teamMgr.ShutdownAll()
+		return wb.teamMgr.Wait(ctx)
+	})
 }
 
 func diffPreviewConcrete(dp tool.DiffPreview) *security.DiffPreview {
@@ -350,8 +395,10 @@ func newSessionParams(
 		TaskSvc:     task.NewService(filepath.Join(sessionDir, "tasks")),
 		TodoSvc:     &task.TodoManager{},
 		DiffPreview: diffPreview,
+		Console:     app.consoleSink,
+		Interactive: app.interactive(),
 		DecisionLog: decisionLog,
-		MemoryStore: memory.NewStore(app.dataDir),
+		MemoryStore: app.memStore,
 		SkillLoader: skill.NewLoader(filepath.Join(workdir, "skills")),
 		BGSvc:       background.New(workdir),
 		Bus:         msgBus,

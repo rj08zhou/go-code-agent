@@ -48,7 +48,7 @@ type Service struct {
 }
 
 func NewService(dir string) *Service {
-	os.MkdirAll(dir, 0o755)
+	_ = store.EnsurePrivateDir(dir)
 	return &Service{dir: dir}
 }
 
@@ -81,14 +81,20 @@ func (s *Service) loadEdges() []dagEdge {
 	return out
 }
 
-func (s *Service) saveEdges(edges []dagEdge) {
-	data, _ := json.MarshalIndent(edges, "", "  ")
-	store.AtomicWrite(s.edgesPath(), data)
+func (s *Service) saveEdges(edges []dagEdge) error {
+	data, err := json.MarshalIndent(edges, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := store.AtomicWritePrivate(s.edgesPath(), data); err != nil {
+		return err
+	}
 	s.edgesMu.Lock()
 	s.edges = make([]dagEdge, len(edges))
 	copy(s.edges, edges)
 	s.edgesLoaded = true
 	s.edgesMu.Unlock()
+	return nil
 }
 
 func (s *Service) ensureCache() {
@@ -146,10 +152,15 @@ func (s *Service) load(id int) (map[string]any, error) {
 	return c, nil
 }
 
-func (s *Service) save(t map[string]any) {
+func (s *Service) save(t map[string]any) error {
 	id := int(t["id"].(float64))
-	data, _ := json.MarshalIndent(t, "", "  ")
-	store.AtomicWrite(s.taskPath(id), data)
+	data, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := store.AtomicWritePrivate(s.taskPath(id), data); err != nil {
+		return err
+	}
 	s.cacheMu.Lock()
 	if s.cache == nil {
 		s.cache = make(map[int]map[string]any)
@@ -160,6 +171,7 @@ func (s *Service) save(t map[string]any) {
 	}
 	s.cache[id] = cp
 	s.cacheMu.Unlock()
+	return nil
 }
 
 func (s *Service) loadAll() []map[string]any {
@@ -195,7 +207,10 @@ func (s *Service) Create(subject, desc string, dependsOn []int) string {
 		"id": float64(id), "subject": subject, "description": desc,
 		"status": StatusPending, "owner": nil,
 	}
-	s.save(t)
+	if err := s.save(t); err != nil {
+		s.mu.Unlock()
+		return fmt.Sprintf("Error: %v", err)
+	}
 	s.mu.Unlock()
 
 	if len(dependsOn) > 0 {
@@ -214,7 +229,10 @@ func (s *Service) Create(subject, desc string, dependsOn []int) string {
 			}
 			edges = append(edges, dagEdge{From: dep, To: id})
 		}
-		s.saveEdges(edges)
+		if err := s.saveEdges(edges); err != nil {
+			s.mu.Unlock()
+			return fmt.Sprintf("Error: created task #%d but failed to save dependencies: %v", id, err)
+		}
 		s.mu.Unlock()
 		if len(warn) > 0 {
 			return fmt.Sprintf("Created task #%d: %s\n[WARN] %s", id, subject, strings.Join(warn, "; "))
@@ -283,12 +301,18 @@ func (s *Service) Update(id int, status string) string {
 				filtered = append(filtered, e)
 			}
 		}
-		s.saveEdges(filtered)
+		if err := s.saveEdges(filtered); err != nil {
+			s.mu.Unlock()
+			return fmt.Sprintf("Error: task %d deleted but failed to update edges: %v", id, err)
+		}
 		s.mu.Unlock()
 		return fmt.Sprintf("Task %d deleted", id)
 	}
 	t["status"] = status
-	s.save(t)
+	if err := s.save(t); err != nil {
+		s.mu.Unlock()
+		return fmt.Sprintf("Error: %v", err)
+	}
 	if status == StatusCompleted {
 		// Trigger OnComplete
 		ready := s.onComplete(id)
@@ -356,7 +380,9 @@ func (s *Service) Claim(id int, owner string) (string, bool) {
 	}
 	t["owner"] = owner
 	t["status"] = StatusInProgress
-	s.save(t)
+	if err := s.save(t); err != nil {
+		return fmt.Sprintf("Error: %v", err), false
+	}
 	return fmt.Sprintf("Claimed task #%d for %s", id, owner), true
 }
 
@@ -461,7 +487,9 @@ func (s *Service) ClearCompleted() string {
 	for _, t := range tasks {
 		if st, _ := t["status"].(string); st == StatusCompleted {
 			t["status"] = StatusDeleted
-			s.save(t)
+			if err := s.save(t); err != nil {
+				return fmt.Sprintf("Error: cleared %d then failed: %v", count, err)
+			}
 			count++
 		}
 	}
@@ -557,7 +585,9 @@ func (s *Service) AddEdge(from, to int) string {
 		return fmt.Sprintf("Error: adding %d -> %d would create a cycle", from, to)
 	}
 	edges = append(edges, dagEdge{From: from, To: to})
-	s.saveEdges(edges)
+	if err := s.saveEdges(edges); err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
 	return fmt.Sprintf("Added dependency: #%d -> #%d", from, to)
 }
 
@@ -577,7 +607,9 @@ func (s *Service) RemoveEdge(from, to int) string {
 	if !found {
 		return fmt.Sprintf("Edge %d -> %d not found", from, to)
 	}
-	s.saveEdges(filtered)
+	if err := s.saveEdges(filtered); err != nil {
+		return fmt.Sprintf("Error: %v", err)
+	}
 	return fmt.Sprintf("Removed dependency: %d -> %d", from, to)
 }
 

@@ -2,9 +2,9 @@ package tool
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"go-code-agent/internal/security"
 )
@@ -52,22 +52,12 @@ func previewEditFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, er
 	if err != nil {
 		return PreviewRequest{}, err
 	}
-	content, old := string(data), a.OldText
-	if !strings.Contains(content, old) {
-		for _, line := range strings.Split(content, "\n") {
-			if security.WhitespaceNormalize(line) == security.WhitespaceNormalize(old) {
-				old = line
-				break
-			}
-		}
-	}
-	if !strings.Contains(content, old) {
+	content, err := replaceFileContent(string(data), a.OldText, a.NewText, a.ReplaceAll)
+	if errors.Is(err, errMutationTextNotFound) {
 		return PreviewRequest{}, fmt.Errorf("text not found")
 	}
-	if a.ReplaceAll {
-		content = strings.ReplaceAll(content, old, a.NewText)
-	} else {
-		content = strings.Replace(content, old, a.NewText, 1)
+	if err != nil {
+		return PreviewRequest{}, err
 	}
 	return PreviewRequest{
 		Path:            a.Path,
@@ -94,21 +84,10 @@ func previewInsertFile(scope *ToolScope, args json.RawMessage) (PreviewRequest, 
 	if err != nil {
 		return PreviewRequest{}, err
 	}
-	lines := strings.Split(string(data), "\n")
-	idx := a.InsertAt - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx > len(lines) {
-		idx = len(lines)
-	}
-	updated := append([]string{}, lines[:idx]...)
-	updated = append(updated, strings.Split(a.Content, "\n")...)
-	updated = append(updated, lines[idx:]...)
 	return PreviewRequest{
 		Path:            a.Path,
 		OriginalContent: data,
-		Content:         []byte(strings.Join(updated, "\n")),
+		Content:         []byte(insertFileContent(string(data), a.InsertAt, a.Content)),
 		Existed:         true,
 	}, nil
 }

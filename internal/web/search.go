@@ -395,8 +395,6 @@ func NewSearchProvider(cfg SearchConfig) SearchProvider {
 	return &chainSearchProvider{backends: chain}
 }
 
-func NewDefaultSearchProvider() SearchProvider { return NewSearchProvider(SearchConfigFromEnv()) }
-
 func splitTrim(s, sep string) []string {
 	parts := strings.Split(s, sep)
 	out := make([]string, 0, len(parts))

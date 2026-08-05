@@ -138,3 +138,22 @@ func TestFilesystemWriteTools(t *testing.T) {
 		})
 	}
 }
+
+func TestWriteFileRejectsSymlinkedAncestorForNewFile(t *testing.T) {
+	workdir := t.TempDir()
+	outsideDir := t.TempDir()
+	if err := os.Symlink(outsideDir, filepath.Join(workdir, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	defs := filesystemWriteTools(builtinDeps{})
+	scope := &ToolScope{Workdir: workdir, AgentID: "lead"}
+	write := mustTool(t, defs, "write_file")
+	result := write.Handler(scope, json.RawMessage(`{"path":"link/missing/new.txt","content":"escape"}`))
+	if result.Status != StatusFailed {
+		t.Fatalf("status = %s, want failed (output=%q)", result.Status, result.Output)
+	}
+	if _, err := os.Stat(filepath.Join(outsideDir, "missing", "new.txt")); !os.IsNotExist(err) {
+		t.Fatalf("write escaped through symlink: stat error = %v", err)
+	}
+}

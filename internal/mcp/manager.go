@@ -54,31 +54,34 @@ func (m *Manager) SetRegistry(registry ToolRegistry) {
 	m.registry = registry
 }
 
-// LoadAndStart parses MCP_SERVERS env var and .mcp.json, starts approved servers,
-// discovering and registering their tools into the ToolCatalog.
-// MCP_SERVERS servers auto-start; .mcp.json servers require /mcp approve first.
+// LoadAndStart parses MCP_SERVERS env var and .mcp.json, staging configured
+// servers for explicit approval before starting subprocesses.
 func (m *Manager) LoadAndStart(ctx context.Context) error {
-	var startupErrors []error
+	var configErrors []error
 
-	// 1. Auto-start from MCP_SERVERS env var.
+	// 1. Stage MCP_SERVERS entries for explicit approval.
 	for _, cfg := range parseMCPConfigEnv() {
+		if err := validateServerConfig(cfg); err != nil {
+			configErrors = append(configErrors, err)
+			continue
+		}
 		m.mu.Lock()
 		_, active := m.clients[cfg.Name]
 		_, connecting := m.connecting[cfg.Name]
+		if !active && !connecting {
+			m.pendingServers[cfg.Name] = cfg
+		}
 		m.mu.Unlock()
 		if active || connecting {
 			continue
 		}
-		if _, err := m.startServer(ctx, cfg); err != nil {
-			startupErrors = append(startupErrors, fmt.Errorf("%s: %w", cfg.Name, err))
-		}
 	}
 
-	// 2. Load .mcp.json into the pending list (require /mcp approve).
+	// 2. Stage .mcp.json entries into the same approval queue.
 	pendingCount := 0
 	for _, cfg := range parseMCPConfigFile(m.workdir) {
 		if err := validateServerConfig(cfg); err != nil {
-			startupErrors = append(startupErrors, err)
+			configErrors = append(configErrors, err)
 			continue
 		}
 		m.mu.Lock()
@@ -89,9 +92,9 @@ func (m *Manager) LoadAndStart(ctx context.Context) error {
 		m.mu.Unlock()
 	}
 	if pendingCount > 0 {
-		log.Printf("[MCP] %d server(s) pending approval from .mcp.json", pendingCount)
+		log.Printf("[MCP] %d configured server(s) pending approval", pendingCount)
 	}
-	return errors.Join(startupErrors...)
+	return errors.Join(configErrors...)
 }
 
 func validateServerConfig(cfg ServerConfig) error {
@@ -190,8 +193,8 @@ func (m *Manager) startServer(ctx context.Context, cfg ServerConfig) (toolCount 
 	return len(tools), nil
 }
 
-// Approve starts a pending MCP server from .mcp.json. A failed server remains
-// retryable with the same command and is exposed through Status as failed.
+// Approve starts a pending MCP server. A failed server remains retryable with
+// the same command and is exposed through Status as failed.
 func (m *Manager) Approve(ctx context.Context, name string) (int, error) {
 	m.mu.Lock()
 	cfg, ok := m.pendingServers[name]
@@ -212,7 +215,7 @@ func (m *Manager) Approve(ctx context.Context, name string) (int, error) {
 
 // Connect starts a server from an interactive command.
 func (m *Manager) Connect(ctx context.Context, name, command string, args []string) (int, error) {
-	cfg := ServerConfig{Name: name, Command: command, Args: args, Env: os.Environ()}
+	cfg := ServerConfig{Name: name, Command: command, Args: args}
 	return m.startServer(ctx, cfg)
 }
 
@@ -260,8 +263,8 @@ func (m *Manager) ServerInstructions() string {
 	return strings.Join(parts, "\n")
 }
 
-// ListPending returns sorted names that are awaiting first approval. Servers
-// whose last start failed are shown separately by Status and remain retryable.
+// ListPending returns sorted names that are awaiting approval. Servers whose
+// last start failed are shown separately by Status and remain retryable.
 func (m *Manager) ListPending() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -476,7 +479,7 @@ func parseMCPConfigFile(workdir string) []ServerConfig {
 		for k, v := range r.Env {
 			envVars = append(envVars, k+"="+v)
 		}
-		configs = append(configs, ServerConfig{Name: r.Name, Command: r.Command, Args: r.Args, Env: append(os.Environ(), envVars...)})
+		configs = append(configs, ServerConfig{Name: r.Name, Command: r.Command, Args: r.Args, Env: envVars})
 	}
 	return configs
 }
@@ -512,7 +515,7 @@ func parseMCPConfigEnv() []ServerConfig {
 			Name:    r.Name,
 			Command: r.Command,
 			Args:    r.Args,
-			Env:     append(os.Environ(), envVars...),
+			Env:     envVars,
 		})
 	}
 	return configs
@@ -549,7 +552,7 @@ func (a *ToolCatalogAdapter) RegisterMCPTools(serverName string, tools []ToolInf
 		defs = append(defs, tool.ToolDefinition{
 			Name:        fullName,
 			Description: fmt.Sprintf("[MCP:%s] %s", serverName, t.Description),
-			RiskLevel:   tool.RiskDanger, // MCP tools default to dangerous; override via config
+			RiskLevel:   tool.RiskDanger, // MCP tools default to dangerous
 			Effects:     effects,
 			Schema:      schema,
 			Timeout:     30 * time.Second,

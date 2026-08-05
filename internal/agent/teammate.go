@@ -55,6 +55,8 @@ type TeammateManager struct {
 	diffPreview  tool.DiffPreview
 	approval     tool.ApprovalChecker
 	eventSink    event.Sink
+	network      tool.NetworkChecker
+	sanitizer    tool.OutputSanitizer
 
 	spawnMu   sync.Mutex
 	lastSpawn time.Time
@@ -70,6 +72,13 @@ func (tm *TeammateManager) SetDiffPreview(preview tool.DiffPreview) { tm.diffPre
 // SetApproval wires the session HITL adapter so teammate tools are gated
 // the same way as lead tools (plan gate still controls CanWrite).
 func (tm *TeammateManager) SetApproval(a tool.ApprovalChecker) { tm.approval = a }
+
+// SetExecutorSecurity applies the session's shared network preflight and
+// output redaction policy to each teammate work phase.
+func (tm *TeammateManager) SetExecutorSecurity(network tool.NetworkChecker, sanitizer tool.OutputSanitizer) {
+	tm.network = network
+	tm.sanitizer = sanitizer
+}
 
 func (tm *TeammateManager) SetEventSink(sink event.Sink) { tm.eventSink = sink }
 
@@ -144,7 +153,23 @@ func (tm *TeammateManager) getSessionCtx() context.Context {
 	return tm.sessCtx
 }
 
-func (tm *TeammateManager) Wait() { tm.wg.Wait() }
+// Wait waits for all teammate goroutines to exit or until ctx is canceled.
+func (tm *TeammateManager) Wait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	go func() {
+		tm.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // Spawn starts a persistent autonomous teammate with worktree isolation.
 // If worktree creation fails, fail-closed: no teammate starts and error is returned.
@@ -235,7 +260,7 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 		CanMemory:   true,
 		DiffPreview: tm.diffPreview,
 	}
-	executor := tool.NewExecutor(tm.catalog, tm.approval, nil)
+	executor := tm.newExecutor()
 
 	traceID := "team-" + name
 	if tm.eventSink != nil {
@@ -256,7 +281,7 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 			*msgs = append(*msgs, llm.UserMessage(string(data)))
 		}
 
-		toolDefs := tool.NewExecutor(tm.catalog, tm.approval, nil).ToolDefs()
+		toolDefs := executor.ToolDefs()
 		modelStart := time.Now()
 		sr, err := tm.gateway.Stream(ctx, "teammate", llm.CallParams{
 			Model:     tm.modelID,
@@ -331,6 +356,10 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 		}
 	}
 	return "idle"
+}
+
+func (tm *TeammateManager) newExecutor() *tool.Executor {
+	return tool.NewExecutor(tm.catalog, tm.approval, tm.network).WithSanitizer(tm.sanitizer)
 }
 
 // idlePhase polls inbox and task board. Returns true if work found.
@@ -459,18 +488,12 @@ func (tm *TeammateManager) ShutdownByName(name string) string {
 		return fmt.Sprintf("Error: no teammate named '%s'", name)
 	}
 	team.PostShutdownRequest(tm.protocols, tm.bus, name)
-	if tm.worktrees != nil {
-		_ = tm.worktrees.Release(name)
-	}
 	return fmt.Sprintf("Shutdown request sent to '%s'", name)
 }
 
 func (tm *TeammateManager) ShutdownAll() {
 	for _, name := range tm.MemberNames() {
 		_ = team.PostShutdownRequest(tm.protocols, tm.bus, name)
-		if tm.worktrees != nil {
-			_ = tm.worktrees.Release(name)
-		}
 	}
 }
 

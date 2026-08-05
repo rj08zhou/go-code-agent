@@ -61,7 +61,9 @@ func (b *SystemPromptBuilder) BuildWith(v SystemPromptVars) string {
 		"skill_context": v.SkillContext,
 	})
 	if len(b.embedded) > 0 {
-		result += "\n\n## Project Documentation\n" + string(b.embedded)
+		// From workdir AGENT.md / CLAUDE.md / AGENTS.md — project-local
+		// instructions for this coding agent (runtime), not IDE rules.
+		result += "\n\n## Project Instructions\n" + string(b.embedded)
 	}
 	return result
 }

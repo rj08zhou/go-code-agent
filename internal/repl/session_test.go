@@ -1,4 +1,4 @@
-package main
+package repl
 
 import (
 	"context"
@@ -17,6 +17,25 @@ import (
 	"go-code-agent/internal/session"
 )
 
+func TestFormatSessionListPreservesActiveMarkerAndFields(t *testing.T) {
+	got := formatSessionList("active", []session.State{
+		{ID: "old", Status: session.StatusArchived, Title: "Previous", CreatedAt: 100, UpdatedAt: 100},
+		{ID: "active", Status: session.StatusActive, Title: "Current", CreatedAt: 200, UpdatedAt: 300},
+	})
+	for _, want := range []string{"* active", "Current", "old", "archived", "Previous", formatSessionTime(300), formatSessionTime(100)} {
+		if !strings.Contains(got, want) {
+			t.Errorf("formatted session list %q does not contain %q", got, want)
+		}
+	}
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], "active") || !strings.Contains(lines[1], "old") {
+		t.Fatalf("expected newer session before older one: %q", got)
+	}
+	if got := formatSessionList("", nil); got != "No sessions." {
+		t.Fatalf("empty session list = %q", got)
+	}
+}
+
 func TestSessionSwitchCommandDefersActivationUntilBuild(t *testing.T) {
 	dataDir := t.TempDir()
 	repo := session.NewRepository(dataDir)
@@ -30,7 +49,6 @@ func TestSessionSwitchCommandDefersActivationUntilBuild(t *testing.T) {
 	if err := os.WriteFile(
 		filepath.Join(dataDir, "sessions.json"),
 		[]byte(`{"active_id":"","sessions":[]}`),
-
 		0o600,
 	); err != nil {
 		t.Fatal(err)
@@ -39,7 +57,7 @@ func TestSessionSwitchCommandDefersActivationUntilBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := &repl{built: &application.BuiltRunner{
+	r := &Loop{built: &application.BuiltRunner{
 		Session: application.SessionFacade{ID: first.ID, Repo: repo},
 	}}
 	messages := []llm.Message{}
@@ -77,7 +95,7 @@ func TestReplPromptCtrlCContinuesAndCtrlDExits(t *testing.T) {
 		t.Fatal(err)
 	}
 	reads := 0
-	r := newRepl(&application.BuiltRunner{
+	r := New(&application.BuiltRunner{
 		Session: application.SessionFacade{HistStore: histStore},
 	}, context.Background(), func() (string, error) {
 		reads++
@@ -87,7 +105,7 @@ func TestReplPromptCtrlCContinuesAndCtrlDExits(t *testing.T) {
 		return "", io.EOF
 	})
 
-	r.run()
+	r.Run()
 	if reads != 2 {
 		t.Fatalf("read calls = %d, want Ctrl-C to continue to the next prompt", reads)
 	}

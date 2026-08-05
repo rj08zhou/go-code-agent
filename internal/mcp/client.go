@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -57,6 +59,55 @@ type ServerConfig struct {
 	Env     []string
 }
 
+var mcpBaseEnvKeys = []string{
+	"HOME",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+	"LC_MESSAGES",
+	"PATH",
+	"TERM",
+	"TMPDIR",
+}
+
+// mcpProcessEnv builds the child environment without inheriting the complete
+// host environment. Env entries in ServerConfig are explicit per-server
+// configuration and may override the safe baseline.
+func mcpProcessEnv(explicit []string) []string {
+	values := make(map[string]string, len(mcpBaseEnvKeys)+len(explicit))
+	baseKeys := make(map[string]struct{}, len(mcpBaseEnvKeys))
+	for _, key := range mcpBaseEnvKeys {
+		baseKeys[key] = struct{}{}
+	}
+	for _, entry := range os.Environ() {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if _, ok := baseKeys[key]; ok || strings.HasPrefix(key, "LC_") {
+			values[key] = value
+		}
+	}
+	for _, entry := range explicit {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" || strings.ContainsRune(key, '\x00') || strings.ContainsRune(value, '\x00') {
+			continue
+		}
+		values[key] = value
+	}
+
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, key+"="+values[key])
+	}
+	return env
+}
+
 // ToolInfo describes an MCP tool.
 type ToolInfo struct {
 	Name        string         `json:"name"`
@@ -82,7 +133,7 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 
 	c.cmd = exec.CommandContext(ctx, c.config.Command, c.config.Args...)
-	c.cmd.Env = c.config.Env
+	c.cmd.Env = mcpProcessEnv(c.config.Env)
 
 	var err error
 	c.stdin, err = c.cmd.StdinPipe()
