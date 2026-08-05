@@ -55,15 +55,17 @@ type RunnerParams struct {
 
 // wireBundle is the intermediate product of staged wiring.
 type wireBundle struct {
-	catalog   *tool.ToolCatalog
-	executor  *tool.Executor
-	subagent  *agent.SubagentRunner
-	teamMgr   *agent.TeammateManager
-	sysPrompt string
-	runner    *agent.Runner
-	histStore *history.Store
-	judge     *agent.Judge
-	hitlAdpt  *hitlaudit.HITLApprovalAdapter
+	catalog      *tool.ToolCatalog
+	executor     *tool.Executor
+	subagent     *agent.SubagentRunner
+	teamMgr      *agent.TeammateManager
+	sysPrompt    string
+	runner       *agent.Runner
+	histStore    *history.Store
+	judge        *agent.Judge
+	hitlAdpt     *hitlaudit.HITLApprovalAdapter
+	network      tool.NetworkChecker
+	outputSafety tool.OutputSanitizer
 }
 
 // BuildRunner wires a single session run via staged helpers.
@@ -79,8 +81,8 @@ func (rt *SessionRuntime) BuildRunner(params RunnerParams, sessionDir string) (*
 		return nil, fmt.Errorf("initialize history: %w", err)
 	}
 	wb := &wireBundle{catalog: rt.catalog, histStore: histStore}
-	wb.executor, wb.hitlAdpt = wireSecurity(rt, params)
-	wb.subagent, wb.teamMgr = wireTeam(rt, params, sessionDir, wb.hitlAdpt)
+	wb.executor, wb.hitlAdpt, wb.network, wb.outputSafety = wireSecurity(rt, params)
+	wb.subagent, wb.teamMgr = wireTeam(rt, params, sessionDir, wb.hitlAdpt, wb.network, wb.outputSafety)
 	wireTools(rt, params, wb)
 	wb.sysPrompt = wireSystemPrompt(rt, params)
 	wb.runner, wb.judge = wireAgent(rt, params, wb, st.ID, sessionDir)
@@ -176,15 +178,17 @@ func safeEndpointHost(rawURL, defaultHost string) string {
 	return host
 }
 
-func wireSecurity(rt *SessionRuntime, params RunnerParams) (*tool.Executor, *hitlaudit.HITLApprovalAdapter) {
+func wireSecurity(rt *SessionRuntime, params RunnerParams) (*tool.Executor, *hitlaudit.HITLApprovalAdapter, tool.NetworkChecker, tool.OutputSanitizer) {
 	hitlApproval := hitlaudit.NewHITLApprovalAdapter(params.HITLMgr, params.Interactive)
 	hitlApproval.SetApproval(params.Approval)
 	hitlApproval.SetCatalog(rt.catalog)
 	hitlApproval.SetPermissions(params.Permissions)
-	exec := tool.NewExecutor(rt.catalog, hitlApproval, security.NewSSRFNetworkChecker()).
-		WithSanitizer(security.NewSecretsSanitizer()).
+	network := security.NewSSRFNetworkChecker()
+	outputSafety := security.NewSecretsSanitizer()
+	exec := tool.NewExecutor(rt.catalog, hitlApproval, network).
+		WithSanitizer(outputSafety).
 		WithDecisionLogger(params.DecisionLog)
-	return exec, hitlApproval
+	return exec, hitlApproval, network, outputSafety
 }
 
 func wireTeam(
@@ -192,11 +196,14 @@ func wireTeam(
 	params RunnerParams,
 	sessionDir string,
 	hitlApproval *hitlaudit.HITLApprovalAdapter,
+	network tool.NetworkChecker,
+	outputSafety tool.OutputSanitizer,
 ) (*agent.SubagentRunner, *agent.TeammateManager) {
 	cfg := params.Config
 	subagentRunner := agent.NewSubagentRunner(rt.gateway, rt.catalog, cfg, params.PromptLoader)
 	subagentRunner.SetCompression(agent.NewCompression(rt.gateway, nil, sessionDir, cfg.ModelID, params.PromptLoader))
 	subagentRunner.SetApproval(hitlApproval)
+	subagentRunner.SetExecutorSecurity(network, outputSafety)
 
 	teamMgr := agent.NewTeammateManager(
 		filepath.Join(sessionDir, "team"), rt.gateway,
@@ -206,6 +213,7 @@ func wireTeam(
 	teamMgr.SetSessionCtx(rt.Ctx)
 	teamMgr.SetDiffPreview(params.DiffPreview)
 	teamMgr.SetApproval(hitlApproval)
+	teamMgr.SetExecutorSecurity(network, outputSafety)
 	teamMgr.SetReasoningConfig(cfg)
 	return subagentRunner, teamMgr
 }
