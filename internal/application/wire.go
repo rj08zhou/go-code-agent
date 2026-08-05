@@ -39,6 +39,7 @@ type RunnerParams struct {
 	Bus          *team.MessageBus
 	WebService   tool.WebService
 	Console      *event.ConsoleSink
+	Interactive  security.InteractiveIO
 	HITLMgr      *hitlaudit.HITLManager
 	Approval     *security.ApprovalState
 	MCPMgr       *mcp.Manager
@@ -173,7 +174,7 @@ func safeEndpointHost(rawURL, defaultHost string) string {
 }
 
 func wireSecurity(rt *SessionRuntime, params RunnerParams) (*tool.Executor, *hitlaudit.HITLApprovalAdapter) {
-	hitlApproval := hitlaudit.NewHITLApprovalAdapter(params.HITLMgr, params.Console)
+	hitlApproval := hitlaudit.NewHITLApprovalAdapter(params.HITLMgr, params.Interactive)
 	hitlApproval.SetApproval(params.Approval)
 	hitlApproval.SetCatalog(rt.catalog)
 	hitlApproval.SetPermissions(params.Permissions)
@@ -382,6 +383,7 @@ func newSessionParams(
 		TodoSvc:     &task.TodoManager{},
 		DiffPreview: diffPreview,
 		Console:     app.consoleSink,
+		Interactive: app.interactive(),
 		DecisionLog: decisionLog,
 		MemoryStore: app.memStore,
 		SkillLoader: skill.NewLoader(filepath.Join(workdir, "skills")),

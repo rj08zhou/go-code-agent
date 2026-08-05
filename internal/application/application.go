@@ -35,11 +35,12 @@ type Application struct {
 	dataDir string
 
 	// Project-level services (process lifetime)
-	gateway     *model.Gateway
-	registry    *provider.Registry
-	sessionRepo *session.Repository
-	memStore    *memory.Store
-	consoleSink *event.ConsoleSink
+	gateway       *model.Gateway
+	registry      *provider.Registry
+	sessionRepo   *session.Repository
+	memStore      *memory.Store
+	consoleSink   *event.ConsoleSink
+	interactiveIO security.InteractiveIO
 
 	// Active runtime
 	runtime         *SessionRuntime
@@ -49,8 +50,42 @@ type Application struct {
 	backfillWG sync.WaitGroup
 }
 
+// Option configures optional process-level dependencies at construction time.
+type Option func(*bootConfig)
+
+// bootConfig accumulates construction options before Application fields are
+// finalized. ConsoleSink is owned by Application; the CLI only supplies a
+// line reader and TTY flag.
+type bootConfig struct {
+	consoleSink *event.ConsoleSink
+	readLine    func(string) (string, error)
+	isTTY       bool
+	hasReader   bool
+}
+
+// WithConsoleSink replaces the default process console event sink. Rarely
+// needed by the CLI; useful for tests or custom hosts.
+func WithConsoleSink(sink *event.ConsoleSink) Option {
+	return func(c *bootConfig) {
+		if sink != nil {
+			c.consoleSink = sink
+		}
+	}
+}
+
+// WithInteractiveReader attaches the host line reader used by HITL and diff
+// review. Application builds InteractiveIO from its own ConsoleSink so event
+// output and approval prompts share one writer.
+func WithInteractiveReader(readLine func(string) (string, error), isTTY bool) Option {
+	return func(c *bootConfig) {
+		c.readLine = readLine
+		c.isTTY = isTTY
+		c.hasReader = true
+	}
+}
+
 // New constructs the Application with all project-level services.
-func New(cfgDir, workdir string) (*Application, error) {
+func New(cfgDir, workdir string, opts ...Option) (*Application, error) {
 	cfg := config.Load()
 
 	reg := provider.NewRegistry()
@@ -69,12 +104,12 @@ func New(cfgDir, workdir string) (*Application, error) {
 		fmt.Fprintf(os.Stderr, "[throttle] %s capacity=%d\n", role, throttle.Capacity(role))
 	}
 
-	return NewWithGateway(cfgDir, workdir, cfg, gw, reg)
+	return NewWithGateway(cfgDir, workdir, cfg, gw, reg, opts...)
 }
 
 // NewWithGateway constructs an Application from a pre-built gateway/registry.
 // Production code uses New(); tests inject a fake provider without API keys.
-func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gateway, reg *provider.Registry) (*Application, error) {
+func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gateway, reg *provider.Registry, opts ...Option) (*Application, error) {
 	if cfg == nil {
 		cfg = &config.Config{ModelID: "default"}
 	}
@@ -85,21 +120,37 @@ func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gatewa
 		reg = provider.NewRegistry()
 	}
 
-	dataDir := resolveDataDir(cfgDir, workdir)
+	dataDir := ResolveDataDir(cfgDir, workdir)
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
+	var boot bootConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&boot)
+		}
+	}
+	consoleSink := boot.consoleSink
+	if consoleSink == nil {
+		consoleSink = event.NewConsoleSink()
+	}
+	var interactiveIO security.InteractiveIO
+	if boot.hasReader {
+		interactiveIO = security.NewInteractiveIO(consoleSink, boot.readLine, boot.isTTY)
+	}
+
 	return &Application{
-		cfg:         cfg,
-		cfgDir:      cfgDir,
-		workdir:     workdir,
-		dataDir:     dataDir,
-		gateway:     gw,
-		registry:    reg,
-		sessionRepo: session.NewRepository(dataDir),
-		memStore:    memory.NewStore(dataDir),
-		consoleSink: event.NewConsoleSink(),
+		cfg:           cfg,
+		cfgDir:        cfgDir,
+		workdir:       workdir,
+		dataDir:       dataDir,
+		gateway:       gw,
+		registry:      reg,
+		sessionRepo:   session.NewRepository(dataDir),
+		memStore:      memory.NewStore(dataDir),
+		consoleSink:   consoleSink,
+		interactiveIO: interactiveIO,
 	}, nil
 }
 
@@ -118,6 +169,16 @@ func (a *Application) DataDir() string { return a.dataDir }
 // Config returns the process-wide configuration.
 func (a *Application) Config() *config.Config { return a.cfg }
 
+func (a *Application) interactive() security.InteractiveIO {
+	if a != nil && a.interactiveIO != nil {
+		return a.interactiveIO
+	}
+	if a != nil && a.consoleSink != nil {
+		return security.NewInteractiveIO(a.consoleSink, nil, false)
+	}
+	return security.DefaultInteractiveIO()
+}
+
 // CloseSession stops the active session runtime and releases its ownership.
 func (a *Application) CloseSession(ctx context.Context) error {
 	rt := a.runtime
@@ -134,10 +195,12 @@ func (a *Application) Shutdown(ctx context.Context) error {
 	return a.CloseSession(ctx)
 }
 
-// resolveDataDir computes a stable, isolated state directory from the
+// ResolveDataDir computes a stable, isolated state directory from the
 // canonical absolute workspace path. The basename keeps it recognizable while
-// the hash prevents same-named workspaces from sharing state.
-func resolveDataDir(cfgDir, workdir string) string {
+// the hash prevents same-named workspaces from sharing state. Exported so the
+// CLI can open the terminal against the same path before constructing
+// Application.
+func ResolveDataDir(cfgDir, workdir string) string {
 	canonical, err := filepath.Abs(workdir)
 	if err != nil {
 		canonical = workdir
@@ -424,7 +487,7 @@ func (app *Application) configureSessionSecurity(opts BuildOptions) sessionSecur
 		cfg = &config.Config{ModelID: "default"}
 	}
 
-	hitlMgr := hitlaudit.NewHITLManager(promptLoader, app.consoleSink)
+	hitlMgr := hitlaudit.NewHITLManager(promptLoader, app.interactive())
 	approval := security.NewApprovalState()
 	// Default approval mode is safe-auto. --human alone escalates to manual.
 	// --human-mode is retained as the advanced compatibility override.

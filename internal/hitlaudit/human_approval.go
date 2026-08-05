@@ -13,14 +13,6 @@ import (
 	"go-code-agent/internal/utils"
 )
 
-func isStdinTTY() bool {
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		return false
-	}
-	return (fi.Mode() & os.ModeCharDevice) != 0
-}
-
 type HITLDecision int
 
 const (
@@ -75,17 +67,17 @@ type HITLManager struct {
 	nonTTYFallback         HITLDecision
 	toolsRequiringReview   map[string]bool
 	criticalPathSubstrings []string
-	console                security.InteractiveConsole
+	console                security.InteractiveIO
 	mu                     sync.RWMutex
 	promptLoader           *prompt.Loader
 }
 
-func NewHITLManager(pl *prompt.Loader, consoles ...security.InteractiveConsole) *HITLManager {
+func NewHITLManager(pl *prompt.Loader, consoles ...security.InteractiveIO) *HITLManager {
 	fallback := HITLReject
 	if os.Getenv("HITL_NON_TTY_FALLBACK") == "approve" {
 		fallback = HITLApprove
 	}
-	console := security.DefaultInteractiveConsole()
+	console := security.DefaultInteractiveIO()
 	if len(consoles) > 0 && consoles[0] != nil {
 		console = consoles[0]
 	}
@@ -115,6 +107,13 @@ func (h *HITLManager) NeedsReview(toolName, arguments string) (bool, string, str
 	if !h.IsEnabled() {
 		return false, "", ""
 	}
+	return h.classifyReview(toolName, arguments)
+}
+
+// classifyReview evaluates intrinsic review requirements without re-reading
+// the enabled flag, so callers that already froze a policy snapshot stay
+// consistent for the rest of DecideTool.
+func (h *HITLManager) classifyReview(toolName, arguments string) (bool, string, string) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -203,7 +202,7 @@ func (h *HITLManager) printReviewHeader(req HITLRequest) {
 }
 
 func (h *HITLManager) promptInteractive(req HITLRequest) HITLResponse {
-	if !isStdinTTY() {
+	if !h.console.IsTTY() {
 		if h.nonTTYFallback == HITLApprove {
 			h.console.WriteInteractive(fmt.Sprintf("[hitl] no tty, auto-approving %s (fallback=approve)\n", req.ToolName))
 			return HITLResponse{Decision: HITLApprove}
@@ -233,13 +232,13 @@ func (h *HITLManager) promptInteractive(req HITLRequest) HITLResponse {
 	return readInteractiveDecision(h.console)
 }
 
-func readInteractiveDecision(consoles ...security.InteractiveConsole) HITLResponse {
-	console := security.DefaultInteractiveConsole()
+func readInteractiveDecision(consoles ...security.InteractiveIO) HITLResponse {
+	console := security.DefaultInteractiveIO()
 	if len(consoles) > 0 && consoles[0] != nil {
 		console = consoles[0]
 	}
 	for {
-		raw, err := security.ReadLine("Your choice [y/n/m]: ")
+		raw, err := console.ReadLine("Your choice [y/n/m]: ")
 		if err != nil {
 			console.WriteInteractive("[hitl] input closed; rejected\n")
 			return HITLResponse{Decision: HITLReject}
@@ -256,7 +255,7 @@ func readInteractiveDecision(consoles ...security.InteractiveConsole) HITLRespon
 			console.WriteInteractive("[hitl] rejected\n")
 			return HITLResponse{Decision: HITLReject}
 		case "m", "modify":
-			fb, err := security.ReadLine("Feedback for the agent: ")
+			fb, err := console.ReadLine("Feedback for the agent: ")
 			if err != nil {
 				console.WriteInteractive("[hitl] feedback input closed; rejected\n")
 				return HITLResponse{Decision: HITLReject}
