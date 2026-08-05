@@ -12,8 +12,7 @@ import (
 type Level int
 
 const (
-	LevelDebug Level = iota
-	LevelInfo
+	LevelInfo Level = iota
 	LevelWarn
 	LevelError
 )
@@ -40,7 +39,6 @@ func (l *Logger) log(level Level, tag, msg string) {
 	l.w.WriteString(fmt.Sprintf("%s [%s] %s\n", ts, tag, msg))
 }
 
-func (l *Logger) Debug(msg string) { l.log(LevelDebug, "DEBUG", msg) }
 func (l *Logger) Info(msg string)  { l.log(LevelInfo, "INFO", msg) }
 func (l *Logger) Warn(msg string)  { l.log(LevelWarn, "WARN", msg) }
 func (l *Logger) Error(msg string) { l.log(LevelError, "ERROR", msg) }
@@ -57,22 +55,3 @@ func Default() *Logger { return defaultLogger.Load() }
 
 // SetDefault replaces the default logger.
 func SetDefault(l *Logger) { defaultLogger.Store(l) }
-
-// MultiHandler writes to multiple outputs.
-type MultiHandler struct {
-	mu      sync.Mutex
-	writers []*os.File
-}
-
-func NewMultiHandler(writers ...*os.File) *MultiHandler {
-	return &MultiHandler{writers: writers}
-}
-
-func (m *MultiHandler) Write(p []byte) (int, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, w := range m.writers {
-		w.Write(p)
-	}
-	return len(p), nil
-}

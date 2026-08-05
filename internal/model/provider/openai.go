@@ -456,27 +456,3 @@ func mapOpenAIResponse(resp *openai.ChatCompletion, providerInstanceID, modelID 
 	)
 	return c
 }
-
-// ParseArgs unmarshals raw JSON args into a struct, returning an error message on failure.
-func ParseArgs(raw json.RawMessage, v any) string {
-	if len(raw) == 0 {
-		raw = []byte("{}")
-	}
-	if err := json.Unmarshal(raw, v); err != nil {
-		return fmt.Sprintf("invalid arguments: %v", err)
-	}
-	return ""
-}
-
-func OpenAIRetriable(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	for _, h := range []string{"rate limit", "too many requests", "429", "500", "502", "503", "504", "timeout"} {
-		if strings.Contains(msg, h) {
-			return true
-		}
-	}
-	return false
-}

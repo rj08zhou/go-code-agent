@@ -140,8 +140,3 @@ func (m *MultiSink) Failures() int64 {
 func (m *MultiSink) Add(s Sink) {
 	m.sinks = append(m.sinks, s)
 }
-
-// NopSink discards all events.
-type NopSink struct{}
-
-func (NopSink) Emit(Event) {}

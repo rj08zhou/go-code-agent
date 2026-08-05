@@ -334,26 +334,3 @@ func indent(text, prefix string) string {
 	}
 	return strings.Join(lines, "\n")
 }
-
-func FormatRejectMessage(toolName, reason string, pl *prompt.Loader) string {
-	if pl == nil {
-		pl = prompt.NewLoader()
-	}
-	return prompt.Render(pl.MustLoad("human_reject"), map[string]string{
-		"tool":   toolName,
-		"reason": reason,
-	})
-}
-
-func FormatModifyMessage(toolName, feedback string, pl *prompt.Loader) string {
-	if feedback == "" {
-		feedback = "(no additional feedback)"
-	}
-	if pl == nil {
-		pl = prompt.NewLoader()
-	}
-	return prompt.Render(pl.MustLoad("human_modify"), map[string]string{
-		"tool":     toolName,
-		"feedback": feedback,
-	})
-}

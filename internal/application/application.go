@@ -159,9 +159,6 @@ func (a *Application) Gateway() *model.Gateway { return a.gateway }
 // SessionRepo returns the session repository.
 func (a *Application) SessionRepo() *session.Repository { return a.sessionRepo }
 
-// Workdir returns the project root.
-func (a *Application) Workdir() string { return a.workdir }
-
 // DataDir returns the per-workspace state root.
 func (a *Application) DataDir() string { return a.dataDir }
 

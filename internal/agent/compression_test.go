@@ -394,12 +394,3 @@ func TestNeedsCompaction(t *testing.T) {
 		t.Fatal("should compact when estimate exceeds budget")
 	}
 }
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}
