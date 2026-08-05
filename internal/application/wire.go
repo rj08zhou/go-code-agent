@@ -229,7 +229,7 @@ func wireTools(rt *SessionRuntime, params RunnerParams, wb *wireBundle) {
 
 func wireSystemPrompt(rt *SessionRuntime, params RunnerParams) string {
 	return agent.NewSystemPromptBuilder(
-		params.PromptLoader, params.SkillLoader, nil,
+		params.PromptLoader, params.SkillLoader, agent.LoadProjectDocumentation(rt.workdir),
 	).Build(rt.workdir)
 }
 
