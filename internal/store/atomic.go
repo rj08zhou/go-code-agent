@@ -11,17 +11,51 @@ func AtomicWrite(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+
 	mode := os.FileMode(0o644)
 	if info, err := os.Stat(path); err == nil {
 		mode = info.Mode().Perm()
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	return atomicReplace(path, data, mode)
+}
+
+// EnsurePrivateDir creates dir (and parents) owner-only and tightens the
+// permissions of a pre-existing dir. Chmod is applied explicitly because
+// MkdirAll modes are narrowed by umask but never widened, while legacy
+// directories may have been created 0755.
+func EnsurePrivateDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
+}
+
+// AtomicWritePrivate is AtomicWrite for agent-private state (session metadata,
+// histories, memories): parent dirs 0700, file 0600, tightening pre-existing
+// permissive modes. Never use it for files in the user's workspace.
+func AtomicWritePrivate(path string, data []byte) error {
+	if err := EnsurePrivateDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	return atomicReplace(path, data, 0o600)
+}
+
+// atomicReplace writes one fully prepared target using the caller-selected
+// mode. Directory creation and target-mode selection deliberately remain with
+// the public wrappers because workspace and private state have different rules.
+//
+// The temporary file uses a random name created with O_EXCL so concurrent
+// writers do not share one predictable path.tmp, and a pre-planted symlink at
+// path.tmp cannot be opened and truncated.
+func atomicReplace(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	if err := f.Chmod(mode); err != nil {
 		f.Close()
 		os.Remove(tmp)
@@ -45,65 +79,20 @@ func AtomicWrite(path string, data []byte) error {
 		os.Remove(tmp)
 		return err
 	}
-	// fsync parent directory to ensure the rename is durable
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
-		dir.Sync()
-		dir.Close()
-	}
+	syncParentDir(dir)
 	return nil
 }
 
-// EnsurePrivateDir creates dir (and parents) owner-only and tightens the
-// permissions of a pre-existing dir. Chmod is applied explicitly because
-// MkdirAll modes are narrowed by umask but never widened, while legacy
-// directories may have been created 0755.
-func EnsurePrivateDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	return os.Chmod(dir, 0o700)
-}
-
-// AtomicWritePrivate is AtomicWrite for agent-private state (session metadata,
-// histories, memories): parent dirs 0700, file 0600, tightening pre-existing
-// permissive modes. Never use it for files in the user's workspace.
-func AtomicWritePrivate(path string, data []byte) error {
-	if err := EnsurePrivateDir(filepath.Dir(path)); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+// syncParentDir makes a completed rename durable when the underlying
+// filesystem supports directory syncing. Preserve the existing best-effort
+// behavior: failure to open or sync the directory does not fail the write.
+func syncParentDir(dirPath string) {
+	dir, err := os.Open(dirPath)
 	if err != nil {
-		return err
+		return
 	}
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
-		dir.Sync()
-		dir.Close()
-	}
-	return nil
+	defer dir.Close()
+	_ = dir.Sync()
 }
 
 // OpenPrivateAppend opens an append-only agent-private file with owner-only

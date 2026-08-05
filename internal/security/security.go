@@ -52,18 +52,42 @@ func SecurePath(root, rel string, allowWrite bool) (string, error) {
 		return "", fmt.Errorf("path escapes workdir (use a path relative to %s, or an absolute path inside it): %s", cleanRoot, rel)
 	}
 	// Resolve symlinks in the resolved path, then re-check against the
-	// symlink-resolved root to handle macOS /var→/private/var
+	// symlink-resolved root to handle macOS /var→/private/var.
+	// When the target does not yet exist (allowWrite=true), EvalSymlinks
+	// fails on the leaf; resolve the nearest existing ancestor instead so
+	// symlinked parents cannot be used to escape the sandbox, even when
+	// intermediate directories will also be created.
+	resolvedRoot, rootErr := filepath.EvalSymlinks(cleanRoot)
+	if rootErr != nil {
+		return "", fmt.Errorf("resolve workdir symlinks: %w", rootErr)
+	}
 	resolved, err := filepath.EvalSymlinks(clean)
 	if err != nil {
 		if !allowWrite {
 			return "", fmt.Errorf("cannot resolve path %q under workdir %s: %w", rel, cleanRoot, err)
 		}
-	} else {
-		resolvedRoot, rootErr := filepath.EvalSymlinks(cleanRoot)
-		if rootErr == nil {
-			if !strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) && resolved != resolvedRoot {
-				return "", fmt.Errorf("symlink escapes workdir: %s", rel)
+		// Walk upward until an existing directory is found. Resolving only
+		// filepath.Dir(clean) is insufficient for paths such as
+		// "link/missing-dir/new.txt": the immediate parent does not exist,
+		// but "link" may resolve outside the workdir.
+		ancestor := filepath.Dir(clean)
+		for {
+			resolvedAncestor, ancestorErr := filepath.EvalSymlinks(ancestor)
+			if ancestorErr == nil {
+				if !pathWithinRoot(resolvedAncestor, resolvedRoot) {
+					return "", fmt.Errorf("symlink escapes workdir via parent: %s", rel)
+				}
+				break
 			}
+			parent := filepath.Dir(ancestor)
+			if parent == ancestor {
+				return "", fmt.Errorf("cannot resolve parent path %q for write: %w", rel, ancestorErr)
+			}
+			ancestor = parent
+		}
+	} else {
+		if !pathWithinRoot(resolved, resolvedRoot) {
+			return "", fmt.Errorf("symlink escapes workdir: %s", rel)
 		}
 	}
 	if !allowWrite {
@@ -72,6 +96,10 @@ func SecurePath(root, rel string, allowWrite bool) (string, error) {
 		}
 	}
 	return clean, nil
+}
+
+func pathWithinRoot(path, root string) bool {
+	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
 }
 
 // IsReadOnlyBash reports whether a command is read-only/inspection-only

@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/config"
+	"go-code-agent/internal/event"
 	"go-code-agent/internal/hitlaudit"
-	"go-code-agent/internal/llm"
+	"go-code-agent/internal/memory"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/model/provider"
 	"go-code-agent/internal/prompt"
@@ -32,19 +34,57 @@ type Application struct {
 	dataDir string
 
 	// Project-level services (process lifetime)
-	gateway     *model.Gateway
-	registry    *provider.Registry
-	sessionRepo *session.Repository
-
-	// Embedded documentation
-	Embedded []byte
+	gateway       *model.Gateway
+	registry      *provider.Registry
+	sessionRepo   *session.Repository
+	memStore      *memory.Store
+	consoleSink   *event.ConsoleSink
+	interactiveIO security.InteractiveIO
 
 	// Active runtime
-	runtime *SessionRuntime
+	runtime         *SessionRuntime
+	runtimeCloseErr error
+
+	// Background session→memory distillation (non-blocking on exit/switch).
+	backfillWG sync.WaitGroup
+}
+
+// Option configures optional process-level dependencies at construction time.
+type Option func(*bootConfig)
+
+// bootConfig accumulates construction options before Application fields are
+// finalized. ConsoleSink is owned by Application; the CLI only supplies a
+// line reader and TTY flag.
+type bootConfig struct {
+	consoleSink *event.ConsoleSink
+	readLine    func(string) (string, error)
+	isTTY       bool
+	hasReader   bool
+}
+
+// WithConsoleSink replaces the default process console event sink. Rarely
+// needed by the CLI; useful for tests or custom hosts.
+func WithConsoleSink(sink *event.ConsoleSink) Option {
+	return func(c *bootConfig) {
+		if sink != nil {
+			c.consoleSink = sink
+		}
+	}
+}
+
+// WithInteractiveReader attaches the host line reader used by HITL and diff
+// review. Application builds InteractiveIO from its own ConsoleSink so event
+// output and approval prompts share one writer.
+func WithInteractiveReader(readLine func(string) (string, error), isTTY bool) Option {
+	return func(c *bootConfig) {
+		c.readLine = readLine
+		c.isTTY = isTTY
+		c.hasReader = true
+	}
 }
 
 // New constructs the Application with all project-level services.
-func New(cfgDir, workdir string) (*Application, error) {
+func New(cfgDir, workdir string, opts ...Option) (*Application, error) {
 	cfg := config.Load()
 
 	reg := provider.NewRegistry()
@@ -63,12 +103,12 @@ func New(cfgDir, workdir string) (*Application, error) {
 		fmt.Fprintf(os.Stderr, "[throttle] %s capacity=%d\n", role, throttle.Capacity(role))
 	}
 
-	return NewWithGateway(cfgDir, workdir, cfg, gw, reg)
+	return NewWithGateway(cfgDir, workdir, cfg, gw, reg, opts...)
 }
 
 // NewWithGateway constructs an Application from a pre-built gateway/registry.
 // Production code uses New(); tests inject a fake provider without API keys.
-func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gateway, reg *provider.Registry) (*Application, error) {
+func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gateway, reg *provider.Registry, opts ...Option) (*Application, error) {
 	if cfg == nil {
 		cfg = &config.Config{ModelID: "default"}
 	}
@@ -79,38 +119,45 @@ func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gatewa
 		reg = provider.NewRegistry()
 	}
 
-	dataDir := resolveDataDir(cfgDir, workdir)
+	dataDir := ResolveDataDir(cfgDir, workdir)
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
+	var boot bootConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&boot)
+		}
+	}
+	consoleSink := boot.consoleSink
+	if consoleSink == nil {
+		consoleSink = event.NewConsoleSink()
+	}
+	var interactiveIO security.InteractiveIO
+	if boot.hasReader {
+		interactiveIO = security.NewInteractiveIO(consoleSink, boot.readLine, boot.isTTY)
+	}
+
 	return &Application{
-		cfg:         cfg,
-		cfgDir:      cfgDir,
-		workdir:     workdir,
-		dataDir:     dataDir,
-		gateway:     gw,
-		registry:    reg,
-		sessionRepo: session.NewRepository(dataDir),
+		cfg:           cfg,
+		cfgDir:        cfgDir,
+		workdir:       workdir,
+		dataDir:       dataDir,
+		gateway:       gw,
+		registry:      reg,
+		sessionRepo:   session.NewRepository(dataDir),
+		memStore:      memory.NewStore(dataDir),
+		consoleSink:   consoleSink,
+		interactiveIO: interactiveIO,
 	}, nil
 }
 
 // Gateway returns the model gateway.
 func (a *Application) Gateway() *model.Gateway { return a.gateway }
 
-// Catalog returns the active session's tool catalog, or nil if no session.
-func (a *Application) Catalog() *tool.ToolCatalog {
-	if a.runtime == nil {
-		return nil
-	}
-	return a.runtime.catalog
-}
-
 // SessionRepo returns the session repository.
 func (a *Application) SessionRepo() *session.Repository { return a.sessionRepo }
-
-// Workdir returns the project root.
-func (a *Application) Workdir() string { return a.workdir }
 
 // DataDir returns the per-workspace state root.
 func (a *Application) DataDir() string { return a.dataDir }
@@ -118,24 +165,38 @@ func (a *Application) DataDir() string { return a.dataDir }
 // Config returns the process-wide configuration.
 func (a *Application) Config() *config.Config { return a.cfg }
 
-// Runtime returns the active session runtime or nil.
-func (a *Application) Runtime() *SessionRuntime { return a.runtime }
+func (a *Application) interactive() security.InteractiveIO {
+	if a != nil && a.interactiveIO != nil {
+		return a.interactiveIO
+	}
+	if a != nil && a.consoleSink != nil {
+		return security.NewInteractiveIO(a.consoleSink, nil, false)
+	}
+	return security.DefaultInteractiveIO()
+}
 
-// SetRuntime sets the active session runtime.
-func (a *Application) SetRuntime(rt *SessionRuntime) { a.runtime = rt }
+// CloseSession stops the active session runtime and releases its ownership.
+func (a *Application) CloseSession(ctx context.Context) error {
+	rt := a.runtime
+	if rt == nil {
+		return a.runtimeCloseErr
+	}
+	a.runtime = nil
+	a.runtimeCloseErr = rt.Close(ctx)
+	return a.runtimeCloseErr
+}
 
 // Shutdown gracefully stops all services.
 func (a *Application) Shutdown(ctx context.Context) error {
-	if a.runtime == nil {
-		return nil
-	}
-	return a.runtime.Close(ctx)
+	return a.CloseSession(ctx)
 }
 
-// resolveDataDir computes a stable, isolated state directory from the
+// ResolveDataDir computes a stable, isolated state directory from the
 // canonical absolute workspace path. The basename keeps it recognizable while
-// the hash prevents same-named workspaces from sharing state.
-func resolveDataDir(cfgDir, workdir string) string {
+// the hash prevents same-named workspaces from sharing state. Exported so the
+// CLI can open the terminal against the same path before constructing
+// Application.
+func ResolveDataDir(cfgDir, workdir string) string {
 	canonical, err := filepath.Abs(workdir)
 	if err != nil {
 		canonical = workdir
@@ -159,7 +220,7 @@ func resolveDataDir(cfgDir, workdir string) string {
 // Hooks run in reverse registration order.
 type ShutdownHook struct {
 	Name string
-	Fn   func() error
+	Fn   func(context.Context) error
 }
 
 // SessionRuntime supervises a single session's running resources.
@@ -181,8 +242,11 @@ type SessionRuntime struct {
 
 // NewSessionRuntime creates a runtime for the given session state.
 // It receives only the shared services it uses — no Application pointer.
-func NewSessionRuntime(gw *model.Gateway, workdir string, catalog *tool.ToolCatalog, repo *session.Repository, st *session.State) *SessionRuntime {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewSessionRuntime(parent context.Context, gw *model.Gateway, workdir string, catalog *tool.ToolCatalog, repo *session.Repository, st *session.State) *SessionRuntime {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
 	return &SessionRuntime{
 		gateway:      gw,
 		workdir:      workdir,
@@ -195,7 +259,7 @@ func NewSessionRuntime(gw *model.Gateway, workdir string, catalog *tool.ToolCata
 }
 
 // AddHook registers a cleanup hook. Hooks run in reverse registration order on Close.
-func (rt *SessionRuntime) AddHook(name string, fn func() error) {
+func (rt *SessionRuntime) AddHook(name string, fn func(context.Context) error) {
 	rt.hooks = append(rt.hooks, ShutdownHook{Name: name, Fn: fn})
 }
 
@@ -206,6 +270,9 @@ func (rt *SessionRuntime) Close(ctx context.Context) error {
 	if rt.closed {
 		return rt.closeErr
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	rt.closed = true
 	if rt.Cancel != nil {
 		rt.Cancel()
@@ -214,8 +281,21 @@ func (rt *SessionRuntime) Close(ctx context.Context) error {
 	var errs []string
 	for i := len(rt.hooks) - 1; i >= 0; i-- {
 		h := rt.hooks[i]
-		if err := h.Fn(); err != nil {
+		done := make(chan error, 1)
+		go func() {
+			done <- h.Fn(ctx)
+		}()
+		var err error
+		select {
+		case err = <-done:
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", h.Name, err))
+		}
+		if ctx.Err() != nil {
+			break
 		}
 	}
 	if len(errs) > 0 {
@@ -232,21 +312,123 @@ type BuildOptions struct {
 	HumanMode  string // interactive / auto-approve / auto-reject
 }
 
-// Build creates the session, wires all services, assembles the runner,
-// and returns a fully-configured BuiltRunner together with the SessionRuntime.
-// The caller (main / repl) owns the REPL loop and shutdown.
-func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime, error) {
-	if opts.NewSession && opts.SessionID != "" {
-		return nil, nil, errors.New("--session and --new-session cannot be used together")
+type openedSession struct {
+	state              *session.State
+	dir                string
+	requiresActivation bool
+}
+
+type sessionSecurity struct {
+	hitlMgr      *hitlaudit.HITLManager
+	approval     *security.ApprovalState
+	permissions  *security.Permissions
+	diffPreview  *security.DiffPreview
+	promptLoader *prompt.Loader
+	cfg          *config.Config
+}
+
+// Build creates the session under ctx, wires all services, and returns a
+// fully-configured BuiltRunner. Application owns the resulting SessionRuntime.
+// Canceling ctx cancels the session lifetime; a user turn must use its own
+// child context so interrupting one turn does not tear down the session.
+// The caller owns the REPL loop and requests teardown through CloseSession.
+func (app *Application) Build(ctx context.Context, opts BuildOptions) (*BuiltRunner, error) {
+	ctx, err := validateBuildContext(ctx, opts)
+	if err != nil {
+		return nil, err
 	}
-	for _, w := range app.Config().Validate() {
-		fmt.Fprintf(os.Stderr, "[warn] %s\n", w)
+	if app.runtime != nil {
+		return nil, errors.New("active session runtime must be closed before building another session")
+	}
+	app.reportConfigWarnings()
+
+	opened, err := app.openSession(opts)
+	if err != nil {
+		return nil, err
 	}
 
+	// Each session gets its own ToolCatalog so MCP/builtin registration
+	// cannot leak across session switches.
+	catalog := tool.NewToolCatalog()
+	rt := NewSessionRuntime(ctx, app.gateway, app.workdir, catalog, app.sessionRepo, opened.state)
+	usageTracker, usageErr := agent.NewUsageTracker(opened.dir)
+	if usageErr != nil {
+		fmt.Fprintf(os.Stderr, "[warn] usage tracker: %v\n", usageErr)
+	}
+	rt.AddHook("usage", func(context.Context) error {
+		if usageTracker == nil {
+			return nil
+		}
+		return usageTracker.Close()
+	})
+
+	securitySetup := app.configureSessionSecurity(opts)
+	decisionLog, _ := agent.NewDecisionLog(opened.dir)
+	msgBus := team.NewBus(filepath.Join(opened.dir, "team", "inbox"))
+	params := newSessionParams(
+		app,
+		opened.dir,
+		app.workdir,
+		securitySetup.hitlMgr,
+		securitySetup.approval,
+		securitySetup.permissions,
+		securitySetup.diffPreview,
+		decisionLog,
+		msgBus,
+		securitySetup.promptLoader,
+		securitySetup.cfg,
+	)
+	params.Usage = usageTracker
+
+	built, err := rt.BuildRunner(params, opened.dir)
+	if err != nil {
+		return nil, closeRuntimeAfterBuildFailure(rt, fmt.Errorf("build runner: %w", err))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, closeRuntimeAfterBuildFailure(rt, err)
+	}
+
+	built.Session.Usage = usageTracker
+	built.Security.ReloadPermissions = func() error {
+		// In-place reload: bash handler closes over this same pointer.
+		return securitySetup.permissions.Load(app.dataDir)
+	}
+
+	if err := app.activateSessionRuntime(opened, rt); err != nil {
+		return nil, closeRuntimeAfterBuildFailure(rt, err)
+	}
+
+	// Distill inactive unsaved sessions in the background so exit/switch
+	// paths stay non-blocking (legacy SessionManager.BackfillMemory).
+	app.StartMemoryBackfill(opened.state.ID)
+
+	return built, nil
+}
+
+func validateBuildContext(ctx context.Context, opts BuildOptions) (context.Context, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if opts.NewSession && opts.SessionID != "" {
+		return nil, errors.New("--session and --new-session cannot be used together")
+	}
+	return ctx, nil
+}
+
+func (app *Application) reportConfigWarnings() {
+	for _, warning := range app.Config().Validate() {
+		fmt.Fprintf(os.Stderr, "[warn] %s\n", warning)
+	}
+}
+
+func (app *Application) openSession(opts BuildOptions) (openedSession, error) {
 	repo := app.SessionRepo()
 	idx, err := repo.LoadIndex()
 	if err != nil {
-		return nil, nil, fmt.Errorf("load sessions: %w", err)
+		return openedSession{}, fmt.Errorf("load sessions: %w", err)
 	}
 
 	var st *session.State
@@ -256,7 +438,7 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime,
 	case opts.SessionID != "":
 		st, err = repo.LoadSessionMeta(opts.SessionID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("resume session %q: %w", opts.SessionID, err)
+			return openedSession{}, fmt.Errorf("resume session %q: %w", opts.SessionID, err)
 		}
 	case idx.ActiveID != "":
 		st, err = repo.LoadSessionMeta(idx.ActiveID)
@@ -273,118 +455,76 @@ func (app *Application) Build(opts BuildOptions) (*BuiltRunner, *SessionRuntime,
 			Status: session.StatusActive,
 		}
 		if err := repo.CreateSession(st); err != nil {
-			return nil, nil, fmt.Errorf("create session %q: %w", st.ID, err)
+			return openedSession{}, fmt.Errorf("create session %q: %w", st.ID, err)
 		}
 		idx.Sessions = append(idx.Sessions, *st)
 		if err := repo.SaveIndex(idx); err != nil {
-			return nil, nil, fmt.Errorf("save sessions index: %w", err)
+			return openedSession{}, fmt.Errorf("save sessions index: %w", err)
 		}
 	}
 	if err := repo.EnsureSessionDir(st.ID); err != nil {
-		return nil, nil, fmt.Errorf("ensure session directory: %w", err)
+		return openedSession{}, fmt.Errorf("ensure session directory: %w", err)
 	}
 	sessionDir, err := repo.SessionDir(st.ID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve session directory: %w", err)
+		return openedSession{}, fmt.Errorf("resolve session directory: %w", err)
 	}
+	return openedSession{
+		state:              st,
+		dir:                sessionDir,
+		requiresActivation: idx.ActiveID != st.ID,
+	}, nil
+}
 
-	// Each session gets its own ToolCatalog so MCP/builtin registration
-	// cannot leak across session switches.
-	catalog := tool.NewToolCatalog()
-	rt := NewSessionRuntime(app.gateway, app.workdir, catalog, repo, st)
-	var usageTracker *agent.UsageTracker
-	rt.AddHook("usage", func() error {
-		if usageTracker == nil {
-			return nil
-		}
-		return usageTracker.Close()
-	})
-
-	workdir := app.workdir
+func (app *Application) configureSessionSecurity(opts BuildOptions) sessionSecurity {
 	promptLoader := prompt.NewLoader()
 	cfg := app.cfg
 	if cfg == nil {
 		cfg = &config.Config{ModelID: "default"}
 	}
 
-	hitlMgr := hitlaudit.NewHITLManager(promptLoader)
+	hitlMgr := hitlaudit.NewHITLManager(promptLoader, app.interactive())
 	approval := security.NewApprovalState()
 	// Default approval mode is safe-auto. --human alone escalates to manual.
 	// --human-mode is retained as the advanced compatibility override.
-	hitlMgr.SetEnabled(true)
-	hitlMgr.SetMode(hitlaudit.HITLModeSafeOnly)
-	approval.ApplyPreset("safe-auto")
+	hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeSafeOnly)
 	if opts.Human && opts.HumanMode == "" {
-		hitlMgr.SetMode(hitlaudit.HITLModeInteractive)
-		approval.ApplyPreset("manual")
+		hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeInteractive)
 	}
 	if opts.HumanMode != "" {
-		if mode, modeErr := hitlaudit.ParseMode(opts.HumanMode); modeErr == nil {
-			hitlMgr.SetMode(mode)
-			syncApprovalWithHITLMode(approval, mode)
+		if mode, err := hitlaudit.ParseMode(opts.HumanMode); err == nil {
+			hitlaudit.ApplyMode(hitlMgr, approval, mode)
 		} else {
-			fmt.Fprintf(os.Stderr, "[warn] %v\n", modeErr)
+			fmt.Fprintf(os.Stderr, "[warn] %v\n", err)
 		}
 	}
-	// Permissions + DiffPreview
-	perms := security.NewPermissions()
-	_ = perms.Load(app.dataDir)
 
-	diffPreview := security.NewDiffPreview(workdir)
-	decisionLog, _ := agent.NewDecisionLog(sessionDir)
-	msgBus := team.NewBus(filepath.Join(sessionDir, "team", "inbox"))
-	params := newSessionParams(app, sessionDir, workdir, hitlMgr, approval, perms, diffPreview, decisionLog, msgBus, promptLoader, cfg)
-
-	built, err := rt.BuildRunner(params, sessionDir)
-	if err != nil {
-		buildErr := fmt.Errorf("build runner: %w", err)
-		if closeErr := rt.Close(context.Background()); closeErr != nil {
-			return nil, nil, fmt.Errorf("%w; cleanup runtime: %v", buildErr, closeErr)
-		}
-		return nil, nil, buildErr
+	permissions := security.NewPermissions()
+	_ = permissions.Load(app.dataDir)
+	return sessionSecurity{
+		hitlMgr:      hitlMgr,
+		approval:     approval,
+		permissions:  permissions,
+		diffPreview:  security.NewDiffPreview(app.workdir),
+		promptLoader: promptLoader,
+		cfg:          cfg,
 	}
-
-	usageTracker, usageErr := agent.NewUsageTracker(sessionDir)
-	if usageErr != nil {
-		fmt.Fprintf(os.Stderr, "[warn] usage tracker: %v\n", usageErr)
-	}
-	built.Session.Usage = usageTracker
-	built.Security.ReloadPermissions = func() error {
-		// In-place reload: bash handler closes over this same pointer.
-		return perms.Load(app.dataDir)
-	}
-
-	if idx.ActiveID != st.ID {
-		if err := repo.SwitchActive(st.ID); err != nil {
-			activateErr := fmt.Errorf("activate session %q: %w", st.ID, err)
-			if closeErr := rt.Close(context.Background()); closeErr != nil {
-				return nil, nil, fmt.Errorf("%w; cleanup runtime: %v", activateErr, closeErr)
-			}
-			return nil, nil, activateErr
-		}
-	}
-	if usageTracker != nil {
-		app.gateway.SetUsageRecorder(func(role, providerName, modelID, traceID string, usage llm.Usage, duration float64) {
-			usageTracker.Record(providerName, role, modelID, traceID, usage, duration)
-		})
-	}
-	app.SetRuntime(rt)
-
-	return built, rt, nil
 }
 
-// syncApprovalWithHITLMode keeps ApprovalState (diff-preview skip) aligned
-// with the advanced --human-mode compatibility override.
-func syncApprovalWithHITLMode(approval *security.ApprovalState, mode hitlaudit.HITLMode) {
-	if approval == nil {
-		return
+func closeRuntimeAfterBuildFailure(rt *SessionRuntime, buildErr error) error {
+	if closeErr := rt.Close(context.Background()); closeErr != nil {
+		return fmt.Errorf("%w; cleanup runtime: %v", buildErr, closeErr)
 	}
-	switch mode {
-	case hitlaudit.HITLModeAutoApprove:
-		approval.ApplyPreset("all-auto")
-	case hitlaudit.HITLModeSafeOnly:
-		approval.ApplyPreset("safe-auto")
-	default:
-		approval.ApplyPreset("manual")
+	return buildErr
+}
+
+func (app *Application) activateSessionRuntime(opened openedSession, rt *SessionRuntime) error {
+	if opened.requiresActivation {
+		if err := app.sessionRepo.SwitchActive(opened.state.ID); err != nil {
+			return fmt.Errorf("activate session %q: %w", opened.state.ID, err)
+		}
 	}
+	app.runtime = rt
+	app.runtimeCloseErr = nil
+	return nil
 }

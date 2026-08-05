@@ -108,6 +108,12 @@ type sessionsIndex struct {
 
 // LoadIndex reads the sessions index from disk.
 func (r *Repository) LoadIndex() (*sessionsIndex, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.loadIndexLocked()
+}
+
+func (r *Repository) loadIndexLocked() (*sessionsIndex, error) {
 	data, err := os.ReadFile(r.indexPath())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -154,6 +160,12 @@ func (r *Repository) LoadIndex() (*sessionsIndex, error) {
 
 // SaveIndex persists the sessions index.
 func (r *Repository) SaveIndex(idx *sessionsIndex) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.saveIndexLocked(idx)
+}
+
+func (r *Repository) saveIndexLocked(idx *sessionsIndex) error {
 	if idx == nil {
 		return errors.New("sessions index is nil")
 	}
@@ -258,11 +270,18 @@ func (r *Repository) DataDir() string {
 }
 
 // SwitchActive validates and sets the active session to id.
+// The meta check and index update run under one lock so a concurrent
+// rename/archive/backfill cannot observe a half-applied activation.
 func (r *Repository) SwitchActive(id string) error {
 	if err := ValidateSessionID(id); err != nil {
 		return err
 	}
-	idx, err := r.LoadIndex()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, err := r.LoadSessionMeta(id); err != nil {
+		return fmt.Errorf("cannot activate session %q: %w", id, err)
+	}
+	idx, err := r.loadIndexLocked()
 	if err != nil {
 		return err
 	}
@@ -276,81 +295,132 @@ func (r *Repository) SwitchActive(id string) error {
 	if !found {
 		return fmt.Errorf("session %q: %w", id, ErrSessionNotFound)
 	}
-	if _, err := r.LoadSessionMeta(id); err != nil {
-		return fmt.Errorf("cannot activate session %q: %w", id, err)
-	}
 	idx.ActiveID = id
-	if err := r.SaveIndex(idx); err != nil {
+	if err := r.saveIndexLocked(idx); err != nil {
 		return fmt.Errorf("switch session %q: %w", id, err)
 	}
 	return nil
 }
 
-// RenameSession sets the title of the active session.
-func (r *Repository) RenameSession(sessionID, title string) string {
+// RenameSession sets a session's title.
+// Meta and index are updated under one lock to keep the dual write atomic
+// with concurrent MarkMemorySaved / ArchiveSession callers.
+func (r *Repository) RenameSession(sessionID, title string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	st, err := r.LoadSessionMeta(sessionID)
 	if err != nil {
-		return fmt.Sprintf("Session not found: %v", err)
+		return fmt.Errorf("load session %q: %w", sessionID, err)
 	}
 	st.Title = title
 	if err := r.SaveSessionMeta(st); err != nil {
-		return fmt.Sprintf("Failed to rename: %v", err)
+		return fmt.Errorf("save session %q metadata: %w", sessionID, err)
 	}
-	idx, err := r.LoadIndex()
+	idx, err := r.loadIndexLocked()
 	if err != nil {
-		return fmt.Sprintf("Failed to load sessions: %v", err)
+		return fmt.Errorf("load sessions index: %w", err)
 	}
 	for i := range idx.Sessions {
 		if idx.Sessions[i].ID == sessionID {
 			idx.Sessions[i].Title = title
-			if err := r.SaveIndex(idx); err != nil {
-				return fmt.Sprintf("Failed to update session index: %v", err)
+			idx.Sessions[i].UpdatedAt = st.UpdatedAt
+			if err := r.saveIndexLocked(idx); err != nil {
+				return fmt.Errorf("update session index: %w", err)
 			}
 			break
 		}
 	}
-	return ""
+	return nil
 }
 
 // ArchiveSession marks a session as archived.
-func (r *Repository) ArchiveSession(id string) string {
+// Meta and index are updated under one lock; clearing ActiveID is part of the
+// same critical section.
+func (r *Repository) ArchiveSession(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	st, err := r.LoadSessionMeta(id)
 	if err != nil {
-		return fmt.Sprintf("Session not found: %v", err)
+		return fmt.Errorf("load session %q: %w", id, err)
 	}
 	st.Status = StatusArchived
 	if err := r.SaveSessionMeta(st); err != nil {
-		return fmt.Sprintf("Failed to archive: %v", err)
+		return fmt.Errorf("save session %q metadata: %w", id, err)
 	}
-	idx, err := r.LoadIndex()
+	idx, err := r.loadIndexLocked()
 	if err != nil {
-		return fmt.Sprintf("Failed to load sessions: %v", err)
+		return fmt.Errorf("load sessions index: %w", err)
+	}
+	for i := range idx.Sessions {
+		if idx.Sessions[i].ID == id {
+			idx.Sessions[i].Status = StatusArchived
+			idx.Sessions[i].UpdatedAt = st.UpdatedAt
+			break
+		}
 	}
 	if idx.ActiveID == id {
 		idx.ActiveID = ""
-		if err := r.SaveIndex(idx); err != nil {
-			return fmt.Sprintf("Failed to update session index: %v", err)
-		}
 	}
-	return ""
+	if err := r.saveIndexLocked(idx); err != nil {
+		return fmt.Errorf("update session index: %w", err)
+	}
+	return nil
 }
 
-// ListSessions returns a formatted list of all sessions.
-func (r *Repository) ListSessions() string {
+// MarkMemorySaved records that a session has already been distilled into
+// long-term memory so later startups skip it.
+// Meta and index updates share one lock with Rename/Archive so concurrent
+// backfill cannot drop a title/status change or vice versa.
+func (r *Repository) MarkMemorySaved(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st, err := r.LoadSessionMeta(id)
+	if err != nil {
+		return fmt.Errorf("load session %q: %w", id, err)
+	}
+	if st.MemorySaved {
+		return nil
+	}
+	st.MemorySaved = true
+	if err := r.SaveSessionMeta(st); err != nil {
+		return fmt.Errorf("save session %q metadata: %w", id, err)
+	}
+	idx, err := r.loadIndexLocked()
+	if err != nil {
+		return fmt.Errorf("load sessions index: %w", err)
+	}
+	for i := range idx.Sessions {
+		if idx.Sessions[i].ID == id {
+			idx.Sessions[i].MemorySaved = true
+			if err := r.saveIndexLocked(idx); err != nil {
+				return fmt.Errorf("update session index: %w", err)
+			}
+			break
+		}
+	}
+	return nil
+}
+
+// ListBackfillCandidates returns non-archived, unsaved sessions excluding
+// activeID. Metadata is loaded from disk so MemorySaved/Status stay accurate.
+func (r *Repository) ListBackfillCandidates(activeID string) ([]State, error) {
 	idx, err := r.LoadIndex()
 	if err != nil {
-		return fmt.Sprintf("Failed to list sessions: %v", err)
+		return nil, err
 	}
-	if len(idx.Sessions) == 0 {
-		return "No sessions."
-	}
-	var sb strings.Builder
-	for _, st := range idx.Sessions {
-		marker := " "
-		if st.ID == idx.ActiveID {
-			marker = "*"
+	var out []State
+	for _, entry := range idx.Sessions {
+		if entry.ID == "" || entry.ID == activeID {
+			continue
 		}
-		fmt.Fprintf(&sb, " %s %s  %-16s %s\n", marker, st.ID, st.Status, st.Title)
+		st, err := r.LoadSessionMeta(entry.ID)
+		if err != nil {
+			continue
+		}
+		if st.Status == StatusArchived || st.MemorySaved {
+			continue
+		}
+		out = append(out, *st)
 	}
-	return sb.String()
+	return out, nil
 }

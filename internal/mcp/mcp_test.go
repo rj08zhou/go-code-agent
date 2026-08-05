@@ -228,11 +228,44 @@ func TestManagerLoadAndStartReturnsAndRecordsFailure(t *testing.T) {
 	t.Setenv("MCP_SERVERS", string(config))
 	mgr := NewManager(t.TempDir())
 
-	if err := mgr.LoadAndStart(context.Background()); err == nil {
-		t.Fatal("LoadAndStart returned nil error for a missing executable")
+	if err := mgr.LoadAndStart(context.Background()); err != nil {
+		t.Fatalf("LoadAndStart returned an error before approval: %v", err)
+	}
+	if mgr.Count() != 0 || mgr.FailedCount() != 0 {
+		t.Fatalf("counts before approval: active=%d failed=%d", mgr.Count(), mgr.FailedCount())
+	}
+	if _, err := mgr.Approve(context.Background(), "auto-broken"); err == nil {
+		t.Fatal("Approve returned nil error for a missing executable")
 	}
 	if mgr.Count() != 0 || mgr.FailedCount() != 1 {
-		t.Fatalf("counts after auto-start failure: active=%d failed=%d", mgr.Count(), mgr.FailedCount())
+		t.Fatalf("counts after approved failure: active=%d failed=%d", mgr.Count(), mgr.FailedCount())
+	}
+}
+
+func TestMCPProcessEnvironmentRequiresExplicitSecrets(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "host-secret")
+	t.Setenv("MCP_HELPER_MODE", "env-check")
+	mgr, _ := newHelperManager(t, "env-check")
+	command, args := helperCommand()
+
+	mgr.mu.Lock()
+	mgr.pendingServers["env-check"] = ServerConfig{
+		Name:    "env-check",
+		Command: command,
+		Args:    args,
+		Env:     append(helperEnv(), "MCP_EXPLICIT=approved"),
+	}
+	mgr.mu.Unlock()
+
+	if _, err := mgr.Approve(context.Background(), "env-check"); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	instructions := mgr.ServerInstructions()
+	if strings.Contains(instructions, "host-secret") {
+		t.Fatalf("host secret leaked into MCP process: %q", instructions)
+	}
+	if !strings.Contains(instructions, "explicit=approved") {
+		t.Fatalf("explicit MCP environment was not passed: %q", instructions)
 	}
 }
 
@@ -262,7 +295,7 @@ func TestManagerConnectHonorsContextCancellation(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	if _, err := mgr.Connect(ctx, "cancelled", command, args); err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+	if _, err := helperConnect(mgr, ctx, "cancelled", command, args); err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
 		t.Fatalf("Connect error = %v, want deadline exceeded", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
@@ -277,7 +310,7 @@ func TestManagerConnectInitializationFailureRollsBack(t *testing.T) {
 	mgr, catalog := newHelperManager(t, "initialize-error")
 	command, args := helperCommand()
 
-	if _, err := mgr.Connect(context.Background(), "init-fails", command, args); err == nil {
+	if _, err := helperConnect(mgr, context.Background(), "init-fails", command, args); err == nil {
 		t.Fatal("Connect returned nil error when initialize failed")
 	}
 	if got := mgr.Count(); got != 0 {
@@ -295,7 +328,7 @@ func TestManagerConnectDiscoveryFailureRollsBack(t *testing.T) {
 	mgr, catalog := newHelperManager(t, "discover-error")
 	command, args := helperCommand()
 
-	if _, err := mgr.Connect(context.Background(), "discover-fails", command, args); err == nil {
+	if _, err := helperConnect(mgr, context.Background(), "discover-fails", command, args); err == nil {
 		t.Fatal("Connect returned nil error when tools/list failed")
 	}
 	if got := mgr.Count(); got != 0 {
@@ -317,7 +350,7 @@ func TestManagerApproveFailureRemainsRetryable(t *testing.T) {
 	name := "approval-retry"
 	mgr.mu.Lock()
 	mgr.pendingServers[name] = ServerConfig{
-		Name: name, Command: filepath.Join(t.TempDir(), "missing-mcp-server"), Env: os.Environ(),
+		Name: name, Command: filepath.Join(t.TempDir(), "missing-mcp-server"),
 	}
 	mgr.mu.Unlock()
 
@@ -334,7 +367,7 @@ func TestManagerApproveFailureRemainsRetryable(t *testing.T) {
 	cfg := mgr.pendingServers[name]
 	cfg.Command = command
 	cfg.Args = args
-	cfg.Env = os.Environ()
+	cfg.Env = helperEnv()
 	mgr.pendingServers[name] = cfg
 	mgr.mu.Unlock()
 
@@ -363,7 +396,7 @@ func TestManagerConcurrentConnectPublishesOnlyOneServer(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := mgr.Connect(context.Background(), "single", command, args)
+			_, err := helperConnect(mgr, context.Background(), "single", command, args)
 			errs <- err
 		}()
 	}
@@ -391,7 +424,7 @@ func TestManagerDisconnectUnregistersTools(t *testing.T) {
 	mgr, catalog := newHelperManager(t, "success")
 	command, args := helperCommand()
 
-	toolCount, err := mgr.Connect(context.Background(), "healthy", command, args)
+	toolCount, err := helperConnect(mgr, context.Background(), "healthy", command, args)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -427,6 +460,19 @@ func newHelperManager(t *testing.T, mode string) (*Manager, *tool.ToolCatalog) {
 
 func helperCommand() (string, []string) {
 	return os.Args[0], []string{"-test.run=^TestMCPHelperProcess$"}
+}
+
+func helperEnv() []string {
+	return []string{
+		"GO_WANT_MCP_HELPER=1",
+		"MCP_HELPER_MODE=" + os.Getenv("MCP_HELPER_MODE"),
+	}
+}
+
+func helperConnect(mgr *Manager, ctx context.Context, name, command string, args []string) (int, error) {
+	return mgr.startServer(ctx, ServerConfig{
+		Name: name, Command: command, Args: args, Env: helperEnv(),
+	})
 }
 
 // --- Manager CallTool with no server ---
@@ -580,13 +626,17 @@ func TestMCPHelperProcess(t *testing.T) {
 				})
 				return
 			}
+			instructions := "test helper instructions"
+			if mode == "env-check" {
+				instructions = fmt.Sprintf("openai=%s explicit=%s", os.Getenv("OPENAI_API_KEY"), os.Getenv("MCP_EXPLICIT"))
+			}
 			_ = encoder.Encode(map[string]any{
 				"jsonrpc": "2.0", "id": req.ID,
 				"result": map[string]any{
 					"protocolVersion": "2024-11-05",
 					"capabilities":    map[string]any{},
 					"serverInfo":      map[string]any{"name": "test-helper", "version": "1.0.0"},
-					"instructions":    "test helper instructions",
+					"instructions":    instructions,
 				},
 			})
 		case "notifications/initialized":

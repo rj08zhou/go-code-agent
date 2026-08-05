@@ -297,21 +297,6 @@ func NewExploreProfile() Profile {
 	}
 }
 
-func NewTeammateProfile(name string) Profile {
-	return Profile{
-		Role:       "teammate",
-		Name:       name,
-		MaxRounds:  config.TeammateWorkMaxRounds,
-		MaxTokens:  config.DefaultMaxOutputTokens,
-		CanRead:    true,
-		CanWrite:   true,
-		CanExecute: true,
-		CanNetwork: false,
-		CanTeam:    true,
-		CanMemory:  false,
-	}
-}
-
 // --- Helpers ---
 
 func lastUserMessage(msgs []llm.Message) string {

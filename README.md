@@ -231,7 +231,7 @@ Session Switch / New / Archive
 | `ANTHROPIC_BASE_URL` | SDK default | Gateway/proxy override for Anthropic |
 | `OPENAI_API_KEY` | — | Required for OpenAI / compatible models |
 | `OPENAI_BASE_URL` | SDK default | Proxy/local model endpoint |
-| `REASONING_ENABLED` | off | Opt into provider-native reasoning for agent calls; raw reasoning is never displayed or persisted |
+| `REASONING_ENABLED` | off | Opt into provider-native reasoning for agent calls; thinking streams to the terminal in dim magenta (`[thinking]`), opaque state is never persisted in history |
 | `REASONING_EFFORT` | `medium` | OpenAI-compatible effort hint: `minimal` \| `low` \| `medium` \| `high` |
 | `LLM_MAX_QPS` | `4.0` | Process-wide LLM requests/sec |
 | `LLM_MAX_BURST` | `8` | Token-bucket burst |
@@ -368,7 +368,6 @@ go-code-agent/
 | `/inbox` | Read lead inbox |
 | `/judge` | Toggle LLM-as-Judge |
 | `/approval [manual\|safe-auto\|all-auto\|reject\|notify-only]` | Show or set the effective approval mode (`all-auto` requires `confirm`) |
-| `/approve ...` / `/hitl ...` | Compatibility aliases for legacy commands |
 | `/permissions [reload]` | Show / reload permissions.json |
 | `/security` | Security status |
 | `/security test-bash <cmd>` | Dry-run bash policy |
@@ -478,7 +477,7 @@ Two cooperating pieces:
 | `security.ApprovalState` | Internal auto-approval flags and diff-preview posture |
 | `hitlaudit.HITLManager` | Implements the effective `manual`, `safe-auto`, `all-auto`, `reject`, and `notify-only` modes |
 
-`HITLApprovalAdapter` adapts both into `tool.ApprovalChecker` for the executor (including chunked diff confirmation).
+`HITLApprovalAdapter` adapts both into `tool.ApprovalChecker` for the executor (including chunked diff confirmation). Tool definition risk metadata is enforced here as well: dangerous and interactive tools require review, and unclassified MCP tools cannot run without an approval policy. `permissions.json` block/confirm rules apply to MCP names and arguments before HITL.
 
 ### 4. Secrets Sanitizer
 
@@ -491,6 +490,7 @@ Tool outputs are sanitized before returning to the model / logs.
 - Decision audit log (`decisions.jsonl`)
 - Session event log (`session.log`)
 - Permissions rules file (`permissions.json` under dataDir)
+- Executor network preflight reusing the SSRF host policy; Web transports retain dial-time IP checks
 
 ---
 
@@ -589,13 +589,18 @@ Read-oriented isolation with prompt/token budgets, soft deadline wrap-up, and re
 
 ### Configuration
 
-Workspace `.mcp.json` and/or `MCP_SERVERS` style configuration (see manager for current schema). Untrusted servers may require `/mcp approve`.
+Workspace `.mcp.json` and/or `MCP_SERVERS` style configuration (see manager for current schema). All configured servers remain pending until explicitly approved with `/mcp approve <name>`.
 
 ### How It Works
 
-1. Manager starts stdio MCP servers
-2. Tools merge into the session `ToolCatalog` **after** builtins (additive register; order kept stable)
-3. Runtime connect/disconnect via REPL
+1. Manager loads configured stdio MCP servers into a pending queue; configuration alone never starts a subprocess
+2. `/mcp approve <name>` starts the selected server and merges its tools into the session `ToolCatalog` **after** builtins
+3. `/mcp connect` remains an explicit immediate-connect command; runtime disconnect is available via the REPL
+
+MCP subprocesses receive a minimal baseline environment (`PATH`, `HOME`, locale,
+terminal, and temporary-directory variables). Only variables explicitly declared
+in the server's `env` configuration are added on top; host credentials such as
+`OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are not inherited automatically.
 
 ### Circuit Breaker / Safety
 

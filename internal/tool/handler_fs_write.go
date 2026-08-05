@@ -3,10 +3,10 @@ package tool
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/store"
@@ -142,27 +142,12 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			if err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
-			content := string(data)
-			oldText := a.OldText
-			if !strings.Contains(content, oldText) {
-				// Try whitespace-tolerant fuzzy match as fallback
-				for _, line := range strings.Split(content, "\n") {
-					normed := security.WhitespaceNormalize(line)
-					searchNormed := security.WhitespaceNormalize(oldText)
-					if normed == searchNormed {
-						oldText = line
-						break
-					}
-				}
-				if !strings.Contains(content, oldText) {
+			newContent, err := replaceFileContent(string(data), a.OldText, a.NewText, a.ReplaceAll)
+			if err != nil {
+				if errors.Is(err, errMutationTextNotFound) {
 					return Failed("Text not found in file (tried exact and whitespace-tolerant match)")
 				}
-			}
-			var newContent string
-			if a.ReplaceAll {
-				newContent = strings.ReplaceAll(content, oldText, a.NewText)
-			} else {
-				newContent = strings.Replace(content, oldText, a.NewText, 1)
+				return Failed(fmt.Sprintf("edit: %v", err))
 			}
 			if err := store.AtomicWrite(fp, []byte(newContent)); err != nil {
 				return Failed(fmt.Sprintf("write: %v", err))
@@ -245,19 +230,7 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			if err != nil {
 				return Failed(fmt.Sprintf("read: %v", err))
 			}
-			lines := strings.Split(string(data), "\n")
-			idx := a.InsertAt - 1 // 1-based to 0-based
-			if idx < 0 {
-				idx = 0
-			}
-			if idx > len(lines) {
-				idx = len(lines)
-			}
-			newLines := append([]string{}, lines[:idx]...)
-			insertLines := strings.Split(a.Content, "\n")
-			newLines = append(newLines, insertLines...)
-			newLines = append(newLines, lines[idx:]...)
-			newContent := strings.Join(newLines, "\n")
+			newContent := insertFileContent(string(data), a.InsertAt, a.Content)
 			if err := os.WriteFile(fp, []byte(newContent), 0o644); err != nil {
 				return Failed(fmt.Sprintf("write: %v", err))
 			}

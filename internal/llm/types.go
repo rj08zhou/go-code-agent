@@ -187,11 +187,6 @@ func (s *StreamResult) ToAssistantMessage() Message {
 	}
 }
 
-func EstimateTokens(msgs []Message) int {
-	data, _ := json.Marshal(msgs)
-	return len(data) / 4
-}
-
 func EstimateRequestTokens(msgs []Message, tools []ToolDef) int {
 	dataMsgs, _ := json.Marshal(msgs)
 	if len(tools) == 0 {

@@ -13,14 +13,6 @@ import (
 	"go-code-agent/internal/utils"
 )
 
-func isStdinTTY() bool {
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		return false
-	}
-	return (fi.Mode() & os.ModeCharDevice) != 0
-}
-
 type HITLDecision int
 
 const (
@@ -75,19 +67,25 @@ type HITLManager struct {
 	nonTTYFallback         HITLDecision
 	toolsRequiringReview   map[string]bool
 	criticalPathSubstrings []string
+	console                security.InteractiveIO
 	mu                     sync.RWMutex
 	promptLoader           *prompt.Loader
 }
 
-func NewHITLManager(pl *prompt.Loader) *HITLManager {
+func NewHITLManager(pl *prompt.Loader, consoles ...security.InteractiveIO) *HITLManager {
 	fallback := HITLReject
 	if os.Getenv("HITL_NON_TTY_FALLBACK") == "approve" {
 		fallback = HITLApprove
+	}
+	console := security.DefaultInteractiveIO()
+	if len(consoles) > 0 && consoles[0] != nil {
+		console = consoles[0]
 	}
 	return &HITLManager{
 		enabled:        false,
 		mode:           HITLModeInteractive,
 		nonTTYFallback: fallback,
+		console:        console,
 		promptLoader:   pl,
 		toolsRequiringReview: map[string]bool{
 			"delete_file": true, "bash": true, "execute_command": true, "background_run": true,
@@ -109,6 +107,13 @@ func (h *HITLManager) NeedsReview(toolName, arguments string) (bool, string, str
 	if !h.IsEnabled() {
 		return false, "", ""
 	}
+	return h.classifyReview(toolName, arguments)
+}
+
+// classifyReview evaluates intrinsic review requirements without re-reading
+// the enabled flag, so callers that already froze a policy snapshot stay
+// consistent for the rest of DecideTool.
+func (h *HITLManager) classifyReview(toolName, arguments string) (bool, string, string) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -160,7 +165,7 @@ func (h *HITLManager) RequestApproval(req HITLRequest) HITLResponse {
 	switch mode {
 	case HITLModeAutoApprove:
 		h.printReviewHeader(req)
-		fmt.Println("[hitl] auto-approved")
+		h.console.WriteInteractive("[hitl] auto-approved\n")
 		return HITLResponse{Decision: HITLApprove}
 	case HITLModeSafeOnly:
 		// Auto-approve safe requests; the interactive panel fully renders risky ones.
@@ -168,15 +173,15 @@ func (h *HITLManager) RequestApproval(req HITLRequest) HITLResponse {
 			return h.promptInteractive(req)
 		}
 		h.printReviewHeader(req)
-		fmt.Println("[hitl] auto-approved (safe)")
+		h.console.WriteInteractive("[hitl] auto-approved (safe)\n")
 		return HITLResponse{Decision: HITLApprove}
 	case HITLModeAutoReject:
 		h.printReviewHeader(req)
-		fmt.Printf("[hitl] auto-rejected (%s)\n", req.RiskLevel)
+		h.console.WriteInteractive(fmt.Sprintf("[hitl] auto-rejected (%s)\n", req.RiskLevel))
 		return HITLResponse{Decision: HITLReject}
 	case HITLModeNotifyOnly:
 		h.printReviewHeader(req)
-		fmt.Println("[hitl] proceeding (notify-only)")
+		h.console.WriteInteractive("[hitl] proceeding (notify-only)\n")
 		return HITLResponse{Decision: HITLApprove}
 	default:
 		return h.promptInteractive(req)
@@ -184,73 +189,82 @@ func (h *HITLManager) RequestApproval(req HITLRequest) HITLResponse {
 }
 
 func (h *HITLManager) printReviewHeader(req HITLRequest) {
-	fmt.Println()
-	fmt.Printf("[hitl] reviewing %s", req.ToolName)
+	h.console.WriteInteractive("\n")
+	h.console.WriteInteractive(fmt.Sprintf("[hitl] reviewing %s", req.ToolName))
 	if req.RiskLevel != "" {
-		fmt.Printf(" [%s]", req.RiskLevel)
+		h.console.WriteInteractive(fmt.Sprintf(" [%s]", req.RiskLevel))
 	}
-	fmt.Println()
+	h.console.WriteInteractive("\n")
 	if req.Reason != "" {
 		// Reason already contains the diff preview appended by DecideTool.
-		fmt.Println(req.Reason)
+		h.console.WriteInteractive(req.Reason + "\n")
 	}
 }
 
 func (h *HITLManager) promptInteractive(req HITLRequest) HITLResponse {
-	if !isStdinTTY() {
+	if !h.console.IsTTY() {
 		if h.nonTTYFallback == HITLApprove {
-			fmt.Printf("[hitl] no tty, auto-approving %s (fallback=approve)\n", req.ToolName)
+			h.console.WriteInteractive(fmt.Sprintf("[hitl] no tty, auto-approving %s (fallback=approve)\n", req.ToolName))
 			return HITLResponse{Decision: HITLApprove}
 		}
-		fmt.Printf("[hitl] no tty, auto-rejecting %s (set HITL_NON_TTY_FALLBACK=approve to change)\n", req.ToolName)
+		h.console.WriteInteractive(fmt.Sprintf("[hitl] no tty, auto-rejecting %s (set HITL_NON_TTY_FALLBACK=approve to change)\n", req.ToolName))
 		return HITLResponse{Decision: HITLReject}
 	}
 	divider := strings.Repeat("=", 60)
-	fmt.Println()
-	fmt.Println(utils.Bold + divider)
-	fmt.Println("HUMAN APPROVAL REQUIRED")
-	fmt.Println(divider + utils.Reset)
-	fmt.Printf("  Tool       : %s%s%s\n", utils.BoldYellow, req.ToolName, utils.Reset)
-	fmt.Printf("  Risk level : %s\n", req.RiskLevel)
+	h.console.WriteInteractive("\n")
+	h.console.WriteInteractive(utils.Bold + divider + "\n")
+	h.console.WriteInteractive("HUMAN APPROVAL REQUIRED\n")
+	h.console.WriteInteractive(divider + utils.Reset + "\n")
+	h.console.WriteInteractive(fmt.Sprintf("  Tool       : %s%s%s\n", utils.BoldYellow, req.ToolName, utils.Reset))
+	h.console.WriteInteractive(fmt.Sprintf("  Risk level : %s\n", req.RiskLevel))
 	if req.Reason != "" {
-		fmt.Printf("  Reason     : %s\n", req.Reason)
+		h.console.WriteInteractive(fmt.Sprintf("  Reason     : %s\n", req.Reason))
 	}
-	fmt.Println(strings.Repeat("-", 60))
+	h.console.WriteInteractive(strings.Repeat("-", 60) + "\n")
 	label, details := approvalDetails(req)
-	fmt.Printf("  %-11s:\n", label)
-	fmt.Println(indent(details, "    "))
-	fmt.Println(divider)
-	fmt.Println("  [y] approve  — run the tool as-is")
-	fmt.Println("  [n] reject   — veto, agent will pick another approach")
-	fmt.Println("  [m] modify   — veto and provide guidance to the agent")
+	h.console.WriteInteractive(fmt.Sprintf("  %-11s:\n", label))
+	h.console.WriteInteractive(indent(details, "    ") + "\n")
+	h.console.WriteInteractive(divider + "\n")
+	h.console.WriteInteractive("  [y] approve  — run the tool as-is\n")
+	h.console.WriteInteractive("  [n] reject   — veto, agent will pick another approach\n")
+	h.console.WriteInteractive("  [m] modify   — veto and provide guidance to the agent\n")
 
-	return readInteractiveDecision()
+	return readInteractiveDecision(h.console)
 }
 
-func readInteractiveDecision() HITLResponse {
+func readInteractiveDecision(consoles ...security.InteractiveIO) HITLResponse {
+	console := security.DefaultInteractiveIO()
+	if len(consoles) > 0 && consoles[0] != nil {
+		console = consoles[0]
+	}
 	for {
-		raw, err := security.ReadLine("Your choice [y/n/m]: ")
+		raw, err := console.ReadLine("Your choice [y/n/m]: ")
 		if err != nil {
-			fmt.Println("[hitl] input closed; rejected")
+			console.WriteInteractive("[hitl] input closed; rejected\n")
 			return HITLResponse{Decision: HITLReject}
 		}
 		choice := strings.ToLower(strings.TrimSpace(raw))
 		switch choice {
+		case "":
+			// Blank Enter / empty paste lines should not look like a decision.
+			continue
 		case "y", "yes", "approve":
-			fmt.Println("[hitl] approved")
+			console.WriteInteractive("[hitl] approved\n")
 			return HITLResponse{Decision: HITLApprove}
 		case "n", "no", "reject":
-			fmt.Println("[hitl] rejected")
+			console.WriteInteractive("[hitl] rejected\n")
 			return HITLResponse{Decision: HITLReject}
 		case "m", "modify":
-			fb, err := security.ReadLine("Feedback for the agent: ")
+			fb, err := console.ReadLine("Feedback for the agent: ")
 			if err != nil {
-				fmt.Println("[hitl] feedback input closed; rejected")
+				console.WriteInteractive("[hitl] feedback input closed; rejected\n")
 				return HITLResponse{Decision: HITLReject}
 			}
 			fb = strings.TrimSpace(fb)
-			fmt.Println("[hitl] modified with feedback")
+			console.WriteInteractive("[hitl] modified with feedback\n")
 			return HITLResponse{Decision: HITLModify, Feedback: fb}
+		default:
+			console.WriteInteractive("[hitl] enter y (approve), n (reject), or m (modify)\n")
 		}
 	}
 }
@@ -319,27 +333,4 @@ func indent(text, prefix string) string {
 		lines[i] = prefix + l
 	}
 	return strings.Join(lines, "\n")
-}
-
-func FormatRejectMessage(toolName, reason string, pl *prompt.Loader) string {
-	if pl == nil {
-		pl = prompt.NewLoader()
-	}
-	return prompt.Render(pl.MustLoad("human_reject"), map[string]string{
-		"tool":   toolName,
-		"reason": reason,
-	})
-}
-
-func FormatModifyMessage(toolName, feedback string, pl *prompt.Loader) string {
-	if feedback == "" {
-		feedback = "(no additional feedback)"
-	}
-	if pl == nil {
-		pl = prompt.NewLoader()
-	}
-	return prompt.Render(pl.MustLoad("human_modify"), map[string]string{
-		"tool":     toolName,
-		"feedback": feedback,
-	})
 }

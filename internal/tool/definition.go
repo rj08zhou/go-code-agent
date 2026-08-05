@@ -110,7 +110,7 @@ const (
 	EffectMemoryMutation
 	EffectTeamMutation
 	// EffectUnclassified marks dynamically discovered tools whose behavior
-	// cannot be classified confidently enough for pre-plan execution.
+	// cannot be classified confidently enough for automatic execution.
 	EffectUnclassified
 	// EffectDelegation marks tools that create or authorize other agents
 	// capable of side effects (e.g. spawning a teammate, approving its plan).

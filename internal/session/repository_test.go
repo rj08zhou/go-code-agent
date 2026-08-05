@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -144,7 +145,39 @@ func TestSwitchActiveRejectsUnknownSession(t *testing.T) {
 	}
 }
 
-func TestListSessionsHandlesShortAndGeneratedIDs(t *testing.T) {
+func TestRenameSessionUpdatesIndexTimestamp(t *testing.T) {
+	repo := NewRepository(t.TempDir())
+	st := &State{ID: "s1", Title: "One", Status: StatusActive}
+	if err := repo.CreateSession(st); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := repo.LoadSessionMeta(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveIndex(&sessionsIndex{ActiveID: st.ID, Sessions: []State{*meta}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.RenameSession(st.ID, "Renamed"); err != nil {
+		t.Fatal(err)
+	}
+	meta, err = repo.LoadSessionMeta(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := repo.LoadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Sessions) != 1 || idx.Sessions[0].Title != "Renamed" {
+		t.Fatalf("index session = %#v", idx.Sessions)
+	}
+	if idx.Sessions[0].UpdatedAt != meta.UpdatedAt {
+		t.Fatalf("index UpdatedAt = %d, want meta %d", idx.Sessions[0].UpdatedAt, meta.UpdatedAt)
+	}
+}
+
+func TestLoadIndexReturnsShortAndGeneratedSessionIDs(t *testing.T) {
 	repo := NewRepository(t.TempDir())
 	generated := NewSessionID()
 	idx := &sessionsIndex{
@@ -158,10 +191,125 @@ func TestListSessionsHandlesShortAndGeneratedIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := repo.ListSessions()
-	for _, want := range []string{"a", generated, "Short", "Generated"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("ListSessions output %q does not contain %q", got, want)
+	got, err := repo.LoadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ActiveID != "a" {
+		t.Fatalf("ActiveID = %q, want %q", got.ActiveID, "a")
+	}
+	if len(got.Sessions) != 2 {
+		t.Fatalf("session count = %d, want 2", len(got.Sessions))
+	}
+	if got.Sessions[0].ID != "a" || got.Sessions[0].Title != "Short" {
+		t.Fatalf("first session = %#v", got.Sessions[0])
+	}
+	if got.Sessions[1].ID != generated || got.Sessions[1].Title != "Generated" {
+		t.Fatalf("second session = %#v", got.Sessions[1])
+	}
+}
+
+func TestListBackfillCandidatesSkipsActiveArchivedAndSaved(t *testing.T) {
+	repo := NewRepository(t.TempDir())
+	active := &State{ID: "active", Title: "Active", Status: StatusActive}
+	saved := &State{ID: "saved", Title: "Saved", Status: StatusActive, MemorySaved: true}
+	archived := &State{ID: "archived", Title: "Archived", Status: StatusArchived}
+	pending := &State{ID: "pending", Title: "Pending", Status: StatusActive}
+	for _, st := range []*State{active, saved, archived, pending} {
+		if err := repo.CreateSession(st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.SaveIndex(&sessionsIndex{
+		ActiveID: active.ID,
+		Sessions: []State{*active, *saved, *archived, *pending},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.ListBackfillCandidates(active.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != pending.ID {
+		t.Fatalf("candidates = %#v, want only pending", got)
+	}
+}
+
+func TestMarkMemorySavedUpdatesMetaAndIndex(t *testing.T) {
+	repo := NewRepository(t.TempDir())
+	st := &State{ID: "s1", Title: "One", Status: StatusActive}
+	if err := repo.CreateSession(st); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveIndex(&sessionsIndex{ActiveID: st.ID, Sessions: []State{*st}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkMemorySaved(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := repo.LoadSessionMeta(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !meta.MemorySaved {
+		t.Fatal("meta MemorySaved not set")
+	}
+	idx, err := repo.LoadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Sessions) != 1 || !idx.Sessions[0].MemorySaved {
+		t.Fatalf("index MemorySaved not set: %#v", idx.Sessions)
+	}
+}
+
+func TestConcurrentRenameAndMarkMemorySavedKeepBothFields(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		repo := NewRepository(t.TempDir())
+		st := &State{ID: "s1", Title: "One", Status: StatusActive}
+		if err := repo.CreateSession(st); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.SaveIndex(&sessionsIndex{ActiveID: st.ID, Sessions: []State{*st}}); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		errCh := make(chan error, 2)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			errCh <- repo.RenameSession(st.ID, "Renamed")
+		}()
+		go func() {
+			defer wg.Done()
+			errCh <- repo.MarkMemorySaved(st.ID)
+		}()
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		meta, err := repo.LoadSessionMeta(st.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if meta.Title != "Renamed" || !meta.MemorySaved {
+			t.Fatalf("iter %d meta = %#v, want title=Renamed MemorySaved=true", i, meta)
+		}
+		idx, err := repo.LoadIndex()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(idx.Sessions) != 1 {
+			t.Fatalf("iter %d index sessions = %#v", i, idx.Sessions)
+		}
+		if idx.Sessions[0].Title != "Renamed" || !idx.Sessions[0].MemorySaved {
+			t.Fatalf("iter %d index session = %#v, want title=Renamed MemorySaved=true", i, idx.Sessions[0])
 		}
 	}
 }

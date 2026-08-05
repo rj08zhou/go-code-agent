@@ -26,6 +26,7 @@ type Supervisor struct {
 	workdir string
 	mu      sync.Mutex
 	jobs    map[string]*Job
+	wg      sync.WaitGroup
 }
 
 func New(workdir string) *Supervisor {
@@ -54,9 +55,11 @@ func (s *Supervisor) Run(sessionID, command string, timeout int) string {
 
 	s.mu.Lock()
 	s.jobs[jobID] = job
+	s.wg.Add(1)
 	s.mu.Unlock()
 
 	go func() {
+		defer s.wg.Done()
 		defer cancel()
 		defer close(job.done)
 		output, err := job.cmd.CombinedOutput()
@@ -128,10 +131,28 @@ func (s *Supervisor) Drain() []map[string]string {
 
 func (s *Supervisor) StopAll() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, j := range s.jobs {
 		if j.cancel != nil {
 			j.cancel()
 		}
+	}
+	s.mu.Unlock()
+}
+
+// Wait waits for all background jobs to exit or until ctx is canceled.
+func (s *Supervisor) Wait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

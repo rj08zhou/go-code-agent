@@ -21,8 +21,8 @@ import (
 // --- HITLApprovalAdapter ---
 
 func TestInteractiveDecisionPreservesNaturalLanguageFeedback(t *testing.T) {
-	calls := setReviewAnswers(t, "m", "please use tabs")
-	response := readInteractiveDecision()
+	term, calls := scriptedIO(t, true, "m", "please use tabs")
+	response := readInteractiveDecision(term)
 	if response.Decision != HITLModify {
 		t.Fatalf("decision = %v, want modify", response.Decision)
 	}
@@ -35,18 +35,29 @@ func TestInteractiveDecisionPreservesNaturalLanguageFeedback(t *testing.T) {
 }
 
 func TestInteractiveDecisionRejectsWhenFeedbackInputCloses(t *testing.T) {
-	setReviewAnswers(t, "m")
-	response := readInteractiveDecision()
+	term, _ := scriptedIO(t, true, "m")
+	response := readInteractiveDecision(term)
 	if response.Decision != HITLReject {
 		t.Fatalf("decision = %v, want fail-closed rejection", response.Decision)
 	}
 }
 
 func TestInteractiveDecisionTrimsChoiceWhitespace(t *testing.T) {
-	setReviewAnswers(t, "  y   ")
-	response := readInteractiveDecision()
+	term, _ := scriptedIO(t, true, "  y   ")
+	response := readInteractiveDecision(term)
 	if response.Decision != HITLApprove {
 		t.Fatalf("decision = %v, want approval", response.Decision)
+	}
+}
+
+func TestInteractiveDecisionIgnoresBlankAndInvalidChoices(t *testing.T) {
+	term, calls := scriptedIO(t, true, "", "please apply this", "y")
+	response := readInteractiveDecision(term)
+	if response.Decision != HITLApprove {
+		t.Fatalf("decision = %v, want approval after ignored invalid input", response.Decision)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("input calls = %d, want blank + invalid + approve", got)
 	}
 }
 
@@ -99,10 +110,71 @@ func TestHITLApprovalAdapter_AllowsSafeTool(t *testing.T) {
 	}
 }
 
-func TestHITLApprovalAdapter_NeedsReviewForDanger(t *testing.T) {
-	mgr := NewHITLManager(nil)
+func TestHITLApprovalAdapter_UsesDefinitionRiskForMCP(t *testing.T) {
+	t.Setenv("HITL_NON_TTY_FALLBACK", "")
+	mgr, adapter := newNonTTYAdapter(t)
 	mgr.SetEnabled(true)
-	adapter := NewHITLApprovalAdapter(mgr)
+	mgr.SetMode(HITLModeSafeOnly)
+
+	catalog := tool.NewToolCatalog()
+	catalog.RegisterAll([]tool.ToolDefinition{{
+		Name:      "mcp__demo__delete_user",
+		RiskLevel: tool.RiskDanger,
+		Effects:   tool.Effects(tool.EffectNetworkAccess),
+		Handler: func(scope *tool.ToolScope, args json.RawMessage) tool.Result {
+			return tool.Succeeded("deleted")
+		},
+	}})
+	adapter.SetCatalog(catalog)
+
+	allowed, reason := adapter.AllowTool("mcp__demo__delete_user", json.RawMessage(`{"id":"42"}`))
+	if allowed {
+		t.Fatalf("dangerous MCP tool bypassed HITL: %q", reason)
+	}
+}
+
+func TestHITLApprovalAdapter_EnforcesMCPPermissionRules(t *testing.T) {
+	dir := t.TempDir()
+	permissionsPath := filepath.Join(dir, "permissions.json")
+	if err := os.WriteFile(permissionsPath, []byte(`[
+		{"tool":"mcp__demo__write","level":"block"},
+		{"tool":"mcp__demo__read","level":"confirm"}
+	]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	permissions := security.NewPermissions()
+	if err := permissions.Load(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	blockedMgr := NewHITLManager(nil)
+	blockedAdapter := NewHITLApprovalAdapter(blockedMgr)
+	blockedAdapter.SetPermissions(permissions)
+	if allowed, reason := blockedAdapter.AllowTool("mcp__demo__write", json.RawMessage(`{}`)); allowed {
+		t.Fatalf("blocked MCP tool was allowed: %q", reason)
+	}
+
+	confirmMgr := NewHITLManager(nil)
+	confirmMgr.SetEnabled(true)
+	confirmMgr.SetMode(HITLModeAutoReject)
+	confirmAdapter := NewHITLApprovalAdapter(confirmMgr)
+	confirmAdapter.SetPermissions(permissions)
+	catalog := tool.NewToolCatalog()
+	catalog.RegisterAll([]tool.ToolDefinition{{
+		Name:      "mcp__demo__read",
+		RiskLevel: tool.RiskAuto,
+		Effects:   tool.Effects(tool.EffectNetworkAccess),
+		Handler:   func(scope *tool.ToolScope, args json.RawMessage) tool.Result { return tool.Succeeded("read") },
+	}})
+	confirmAdapter.SetCatalog(catalog)
+	if allowed, reason := confirmAdapter.AllowTool("mcp__demo__read", json.RawMessage(`{}`)); allowed {
+		t.Fatalf("confirm MCP tool was auto-allowed: %q", reason)
+	}
+}
+
+func TestHITLApprovalAdapter_NeedsReviewForDanger(t *testing.T) {
+	mgr, adapter := newNonTTYAdapter(t)
+	mgr.SetEnabled(true)
 
 	allowed, _ := adapter.AllowTool("bash", json.RawMessage(`{"command":"rm -rf /"}`))
 	if allowed {
@@ -122,16 +194,14 @@ func TestHITLApprovalAdapter_AllowsWhenDisabled(t *testing.T) {
 }
 
 func TestHITLApprovalAdapter_NonTTYApproveFallback(t *testing.T) {
-	os.Setenv("HITL_NON_TTY_FALLBACK", "approve")
-	defer os.Unsetenv("HITL_NON_TTY_FALLBACK")
-
-	mgr := NewHITLManager(nil)
+	t.Setenv("HITL_NON_TTY_FALLBACK", "approve")
+	mgr, adapter := newNonTTYAdapter(t)
 	mgr.SetEnabled(true)
-	adapter := NewHITLApprovalAdapter(mgr)
 
-	// With nonTTYFallback=approve, the approve path is hit instead of reject
 	allowed, _ := adapter.AllowTool("bash", json.RawMessage(`{"command":"rm -rf /"}`))
-	t.Logf("bash with approve fallback: allowed=%v", allowed)
+	if !allowed {
+		t.Fatal("expected non-TTY approve fallback to allow dangerous bash")
+	}
 }
 
 func TestNonInteractiveModesDoNotOpenDiffReview(t *testing.T) {
@@ -169,8 +239,8 @@ func TestNonInteractiveModesDoNotOpenDiffReview(t *testing.T) {
 
 func TestFileReviewUsesWholeOperationForCreateAndDelete(t *testing.T) {
 	t.Run("create", func(t *testing.T) {
-		calls := setReviewAnswers(t, "a")
-		adapter := newInteractiveApprovalAdapter()
+		term, calls := scriptedIO(t, true, "a")
+		adapter := newInteractiveApprovalAdapter(term)
 		content := "first\nsecond\n"
 		result := adapter.DecideTool(
 			"write_file",
@@ -192,8 +262,8 @@ func TestFileReviewUsesWholeOperationForCreateAndDelete(t *testing.T) {
 	})
 
 	t.Run("delete", func(t *testing.T) {
-		calls := setReviewAnswers(t, "d")
-		adapter := newInteractiveApprovalAdapter()
+		term, calls := scriptedIO(t, true, "d")
+		adapter := newInteractiveApprovalAdapter(term)
 		result := adapter.DecideTool(
 			"delete_file",
 			json.RawMessage(`{"path":"old.txt"}`),
@@ -228,8 +298,8 @@ func TestFileReviewUsesWholeOperationForCreateAndDelete(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			calls := setReviewAnswers(t, tc.answer)
-			result := newInteractiveApprovalAdapter().DecideTool(
+			term, calls := scriptedIO(t, true, tc.answer)
+			result := newInteractiveApprovalAdapter(term).DecideTool(
 				tc.toolName,
 				json.RawMessage(`{"path":"empty.txt","content":""}`),
 				tool.ApprovalPreview{Mutation: &tc.request},
@@ -256,8 +326,8 @@ func TestExistingFileReviewSupportsPartialAndAllApproval(t *testing.T) {
 	diff := existingFileDiff(t, original, proposed)
 
 	t.Run("partial", func(t *testing.T) {
-		calls := setReviewAnswers(t, "a", "r")
-		adapter := newInteractiveApprovalAdapter()
+		term, calls := scriptedIO(t, true, "a", "r")
+		adapter := newInteractiveApprovalAdapter(term)
 		result := adapter.DecideTool(
 			"edit_file",
 			json.RawMessage(`{"path":"file.txt","old_text":"old","new_text":"new","replace_all":true}`),
@@ -282,8 +352,8 @@ func TestExistingFileReviewSupportsPartialAndAllApproval(t *testing.T) {
 	})
 
 	t.Run("all", func(t *testing.T) {
-		calls := setReviewAnswers(t, "l")
-		adapter := newInteractiveApprovalAdapter()
+		term, calls := scriptedIO(t, true, "l")
+		adapter := newInteractiveApprovalAdapter(term)
 		result := adapter.DecideTool(
 			"insert_file",
 			json.RawMessage(`{"path":"file.txt","insert_at":1,"content":"unused"}`),
@@ -308,10 +378,9 @@ func TestExistingFileReviewSupportsPartialAndAllApproval(t *testing.T) {
 }
 
 func TestConcurrentFileReviewsAreSerializedAndKeepOwnContent(t *testing.T) {
-	adapter := newInteractiveApprovalAdapter()
 	var active atomic.Int32
 	var maximum atomic.Int32
-	security.SetReadLine(func(string) (string, error) {
+	term := security.NewInteractiveIO(nil, func(string) (string, error) {
 		current := active.Add(1)
 		for {
 			previous := maximum.Load()
@@ -322,8 +391,8 @@ func TestConcurrentFileReviewsAreSerializedAndKeepOwnContent(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		active.Add(-1)
 		return "a", nil
-	})
-	t.Cleanup(resetReviewInput)
+	}, true)
+	adapter := newInteractiveApprovalAdapter(term)
 
 	const workers = 6
 	start := make(chan struct{})
@@ -362,29 +431,41 @@ func TestConcurrentFileReviewsAreSerializedAndKeepOwnContent(t *testing.T) {
 	}
 }
 
-func newInteractiveApprovalAdapter() *HITLApprovalAdapter {
-	manager := NewHITLManager(nil)
+func newInteractiveApprovalAdapter(ios ...security.InteractiveIO) *HITLApprovalAdapter {
+	console := nonTTYIO()
+	if len(ios) > 0 && ios[0] != nil {
+		console = ios[0]
+	}
+	manager := NewHITLManager(nil, console)
 	manager.SetEnabled(true)
 	manager.SetMode(HITLModeInteractive)
-	return NewHITLApprovalAdapter(manager)
+	return NewHITLApprovalAdapter(manager, console)
 }
 
-func setReviewAnswers(t *testing.T, answers ...string) *atomic.Int32 {
+func newNonTTYAdapter(t *testing.T) (*HITLManager, *HITLApprovalAdapter) {
+	t.Helper()
+	term := nonTTYIO()
+	mgr := NewHITLManager(nil, term)
+	return mgr, NewHITLApprovalAdapter(mgr, term)
+}
+
+func nonTTYIO() security.InteractiveIO {
+	return security.NewInteractiveIO(nil, func(string) (string, error) {
+		return "", io.EOF
+	}, false)
+}
+
+func scriptedIO(t *testing.T, tty bool, answers ...string) (security.InteractiveIO, *atomic.Int32) {
 	t.Helper()
 	var calls atomic.Int32
-	security.SetReadLine(func(string) (string, error) {
+	term := security.NewInteractiveIO(nil, func(string) (string, error) {
 		index := int(calls.Add(1)) - 1
 		if index >= len(answers) {
 			return "", io.EOF
 		}
 		return answers[index], nil
-	})
-	t.Cleanup(resetReviewInput)
-	return &calls
-}
-
-func resetReviewInput() {
-	security.SetReadLine(func(string) (string, error) { return "", io.EOF })
+	}, tty)
+	return term, &calls
 }
 
 func existingFileDiff(t *testing.T, original, proposed string) string {
@@ -465,9 +546,8 @@ func TestHITLManager_Toggle(t *testing.T) {
 // --- Executor integration ---
 
 func TestExecutorIntegration_HITLRejectsDanger(t *testing.T) {
-	mgr := NewHITLManager(nil)
+	mgr, adapter := newNonTTYAdapter(t)
 	mgr.SetEnabled(true)
-	adapter := NewHITLApprovalAdapter(mgr)
 
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{{

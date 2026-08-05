@@ -3,27 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
-	"strings"
 )
-
-// parseTeamMemberNames extracts member names from the TeammateManager list output.
-// The list format is: "Team: <name>\n  Alice (role): working\n  Bob (role): idle"
-func parseTeamMemberNames(listOutput string) []string {
-	lines := strings.Split(strings.TrimSpace(listOutput), "\n")
-	var names []string
-	for _, line := range lines {
-		// Skip header line starting with "Team:"
-		if strings.HasPrefix(strings.TrimSpace(line), "Team:") {
-			continue
-		}
-		// Extract name: "  Alice (role): working" → "Alice"
-		trimmed := strings.TrimSpace(line)
-		if idx := strings.Index(trimmed, " ("); idx > 0 {
-			names = append(names, trimmed[:idx])
-		}
-	}
-	return names
-}
 
 func teamTools(d builtinDeps) []ToolDefinition {
 	var defs []ToolDefinition
@@ -147,8 +127,7 @@ func teamTools(d builtinDeps) []ToolDefinition {
 			if d.bus == nil || d.teamSvc == nil {
 				return Failed("broadcast unavailable")
 			}
-			// Parse member names from list output
-			recipients := parseTeamMemberNames(d.teamSvc.ListAll())
+			recipients := d.teamSvc.MemberNames()
 			if len(recipients) == 0 {
 				return Succeeded("No teammates to broadcast to.")
 			}

@@ -1,0 +1,77 @@
+package repl
+
+import (
+	"fmt"
+	"strings"
+
+	"go-code-agent/internal/application"
+	"go-code-agent/internal/hitlaudit"
+)
+
+// approvalModeToHITL maps the canonical /approval UX spelling to the
+// HITLMode it applies. Keep in sync with effectiveApprovalMode's reverse
+// mapping below.
+var approvalModeToHITL = map[string]hitlaudit.HITLMode{
+	"manual":      hitlaudit.HITLModeInteractive,
+	"safe-auto":   hitlaudit.HITLModeSafeOnly,
+	"all-auto":    hitlaudit.HITLModeAutoApprove,
+	"reject":      hitlaudit.HITLModeAutoReject,
+	"notify-only": hitlaudit.HITLModeNotifyOnly,
+}
+
+func effectiveApprovalMode(b *application.BuiltRunner) string {
+	if b == nil || b.Security.HITL == nil {
+		return "unavailable"
+	}
+	if !b.Security.HITL.IsEnabled() {
+		return "all-auto (HITL off)"
+	}
+	switch b.Security.HITL.Mode() {
+	case hitlaudit.HITLModeInteractive:
+		return "manual"
+	case hitlaudit.HITLModeSafeOnly:
+		return "safe-auto"
+	case hitlaudit.HITLModeAutoApprove:
+		return "all-auto"
+	case hitlaudit.HITLModeAutoReject:
+		return "reject"
+	case hitlaudit.HITLModeNotifyOnly:
+		return "notify-only"
+	default:
+		return "unknown"
+	}
+}
+
+func (r *Loop) handleApproval(parts []string) string {
+	if r.built.Security.HITL == nil || r.built.Security.Approval == nil {
+		return "Approval controls are unavailable."
+	}
+	if len(parts) == 1 {
+		mode := effectiveApprovalMode(r.built)
+		preview := "skipped"
+		if (mode == "manual" || mode == "safe-auto") && r.built.Security.Approval.ShouldPreviewDiff() {
+			preview = "enabled"
+		}
+		return fmt.Sprintf("Approval mode: %s\nDiff preview: %s", mode, preview)
+	}
+
+	mode := strings.ToLower(parts[1])
+	if mode == "all-auto" {
+		if len(parts) != 3 || strings.ToLower(parts[2]) != "confirm" {
+			return "WARNING: all-auto disables approval prompts and skips diff previews.\nHard Bash deny rules and permissions.json remain enforced.\nConfirm with: /approval all-auto confirm"
+		}
+	} else if len(parts) != 2 {
+		return "Usage: /approval manual|safe-auto|all-auto|reject|notify-only"
+	}
+
+	hitlMode, ok := approvalModeToHITL[mode]
+	if !ok {
+		return "Usage: /approval manual|safe-auto|all-auto|reject|notify-only"
+	}
+	hitlaudit.ApplyMode(r.built.Security.HITL, r.built.Security.Approval, hitlMode)
+
+	if mode == "all-auto" {
+		return "Approval mode: all-auto — prompts disabled and diff previews skipped; hard deny rules still apply."
+	}
+	return fmt.Sprintf("Approval mode: %s", mode)
+}

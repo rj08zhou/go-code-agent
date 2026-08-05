@@ -2,6 +2,7 @@ package event
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -111,6 +112,59 @@ func TestSessionLogSinkReportsDroppedEvents(t *testing.T) {
 	}
 }
 
+func TestSessionLogSinkKeepsTaskStateOutputComplete(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "session.log")
+	sink, err := NewSessionLogSink(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	output := strings.Repeat("task-state\n", 700)
+	sink.Emit(Event{Type: ToolFinished, ToolName: "TodoWrite", Output: output})
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record struct {
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(data), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Output != output {
+		t.Fatalf("session log truncated TodoWrite output: got %d chars, want %d", len(record.Output), len(output))
+	}
+	if strings.Contains(record.Output, "truncated for session.log") {
+		t.Fatalf("task state output should not use the generic session log truncation")
+	}
+}
+
+func TestSessionLogSinkStillCapsRegularToolOutput(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "session.log")
+	sink, err := NewSessionLogSink(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	output := strings.Repeat("regular-output\n", 700)
+	sink.Emit(Event{Type: ToolFinished, ToolName: "read_file", Output: output})
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "truncated for session.log") {
+		t.Fatal("regular tool output should retain the generic session log cap")
+	}
+	if len(data) >= len(output) {
+		t.Fatalf("regular tool output was not capped: got %d bytes for %d-byte output", len(data), len(output))
+	}
+}
+
 func TestConsoleSinkPreviewsReadFileOutput(t *testing.T) {
 	outputLines := make([]string, 12)
 	for i := range outputLines {
@@ -201,6 +255,94 @@ func TestConsoleSinkShowsShortSuccessfulToolOutput(t *testing.T) {
 	})
 	if !strings.Contains(got, "Wrote 120 bytes to internal/example.go") {
 		t.Fatalf("short successful output was hidden: %q", got)
+	}
+}
+
+func TestConsoleSinkPreviewsTodoWriteOutput(t *testing.T) {
+	items := []string{
+		"[>] 核实改动是否在文件里",
+		"[ ] 检查是否存在绕过改动的其他路径",
+		"[ ] 检查构建产物与启动方式",
+		"[ ] 给出结论与修复",
+		"",
+		"(0/4 completed)",
+	}
+	got := captureConsoleStderr(t, func() {
+		NewConsoleSink().Emit(Event{
+			Type:     ToolFinished,
+			ToolName: "TodoWrite",
+			Status:   "succeeded",
+			Output:   strings.Join(items, "\n"),
+		})
+	})
+
+	for _, want := range []string{
+		"[TodoWrite]", "succeeded", "items=6",
+		"[>] 核实改动是否在文件里",
+		"[ ] 给出结论与修复",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("console TodoWrite preview missing %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "output=") {
+		t.Fatalf("TodoWrite must not show byte-count fallback: %q", got)
+	}
+}
+
+func TestConsoleSinkPreviewsTaskDagOutput(t *testing.T) {
+	got := captureConsoleStderr(t, func() {
+		NewConsoleSink().Emit(Event{
+			Type:     ToolFinished,
+			ToolName: "task_dag",
+			Status:   "succeeded",
+			Output:   "1→2→3\n2→4\n3→4",
+		})
+	})
+
+	for _, want := range []string{"[task_dag]", "succeeded", "nodes=3", "1→2→3"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("console task_dag preview missing %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "output=") {
+		t.Fatalf("task_dag must not show byte-count fallback: %q", got)
+	}
+}
+
+func TestConsoleSinkShowsFullTodoWriteOutput(t *testing.T) {
+	lines := []string{
+		"[>] task 1",
+		"[ ] task 2",
+		"[ ] task 3",
+		"[ ] task 4",
+		"[ ] task 5",
+		"[ ] task 6",
+		"[ ] task 7",
+		"[ ] task 8",
+		"[ ] task 9",
+		"[ ] task 10 with a deliberately long description that must not be shortened in the terminal",
+		"(0/10 completed)",
+	}
+	got := captureConsoleStderr(t, func() {
+		NewConsoleSink().Emit(Event{
+			Type:     ToolFinished,
+			ToolName: "TodoWrite",
+			Status:   "succeeded",
+			Output:   strings.Join(lines, "\n"),
+		})
+	})
+
+	for _, want := range []string{
+		"[ ] task 10 with a deliberately long description that must not be shortened in the terminal",
+		"(0/10 completed)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("full TodoWrite output missing %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "more lines") {
+		t.Fatalf("full TodoWrite output was still abbreviated: %q", got)
 	}
 }
 

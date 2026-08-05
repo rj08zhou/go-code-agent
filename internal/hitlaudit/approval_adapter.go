@@ -1,10 +1,7 @@
 package hitlaudit
 
 import (
-	"bytes"
 	"encoding/json"
-	"fmt"
-	"sync"
 
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/tool"
@@ -12,25 +9,43 @@ import (
 
 // HITLApprovalAdapter adapts HITLManager to the tool.ApprovalChecker interface,
 // enabling the executor to call HITL for human-in-the-loop approval.
+//
+// Policy resolution is pure (see policy.go); terminal interaction is delegated
+// to ApprovalReviewer.
 type HITLApprovalAdapter struct {
-	mgr           *HITLManager
-	approval      *security.ApprovalState
-	interactionMu sync.Mutex
+	mgr         *HITLManager
+	approval    *security.ApprovalState
+	catalog     *tool.ToolCatalog
+	permissions *security.Permissions
+	reviewer    ApprovalReviewer
 }
 
-func NewHITLApprovalAdapter(mgr *HITLManager) *HITLApprovalAdapter {
-	return &HITLApprovalAdapter{mgr: mgr}
+type reviewRequirement struct {
+	needsReview bool
+	riskLevel   string
+	reason      string
+}
+
+func NewHITLApprovalAdapter(mgr *HITLManager, consoles ...security.InteractiveIO) *HITLApprovalAdapter {
+	console := security.DefaultInteractiveIO()
+	if len(consoles) > 0 && consoles[0] != nil {
+		console = consoles[0]
+	}
+	return &HITLApprovalAdapter{
+		mgr:      mgr,
+		reviewer: newTerminalApprovalReviewer(mgr, console),
+	}
 }
 
 // SetApproval binds the session ApprovalState used by effective approval modes.
 func (a *HITLApprovalAdapter) SetApproval(s *security.ApprovalState) { a.approval = s }
 
-func (a *HITLApprovalAdapter) shouldPreviewDiff() bool {
-	if a.approval == nil {
-		return true
-	}
-	return a.approval.ShouldPreviewDiff()
-}
+// SetCatalog binds the live catalog so definition risk metadata participates
+// in the same approval decision as legacy tool-specific rules.
+func (a *HITLApprovalAdapter) SetCatalog(c *tool.ToolCatalog) { a.catalog = c }
+
+// SetPermissions binds session-scoped user permission rules.
+func (a *HITLApprovalAdapter) SetPermissions(p *security.Permissions) { a.permissions = p }
 
 func (a *HITLApprovalAdapter) AllowTool(toolName string, args json.RawMessage) (bool, string) {
 	result := a.DecideTool(toolName, args, tool.ApprovalPreview{})
@@ -48,90 +63,39 @@ func (a *HITLApprovalAdapter) AllowToolWithPreview(toolName string, args json.Ra
 	return result.Decision == tool.ApprovalAllowed, result.Reason
 }
 
-func isFileMutation(toolName string) bool {
-	switch toolName {
-	case "write_file", "edit_file", "insert_file", "delete_file":
-		return true
-	}
-	return false
+// DecideTool separates policy resolution from the interactive review step. The
+// ordering deliberately matches the previous pipeline: permissions, intrinsic
+// review requirements, mutation review, then general HITL approval.
+func (a *HITLApprovalAdapter) DecideTool(toolName string, args json.RawMessage, preview tool.ApprovalPreview) tool.ApprovalResult {
+	snap := a.policySnapshot()
+	permissionLevel, earlyReject := a.resolvePermissionPlan(toolName, args, snap.enabled)
+	review := a.resolveReviewRequirementFor(toolName, args, permissionLevel, snap)
+	plan := decideApprovalPlan(toolName, args, preview, snap, permissionLevel, earlyReject, review)
+	return a.reviewer.Apply(plan)
 }
 
-func (a *HITLApprovalAdapter) DecideTool(toolName string, args json.RawMessage, preview tool.ApprovalPreview) tool.ApprovalResult {
-	needsReview, riskLevel, reason := a.mgr.NeedsReview(toolName, string(args))
+func (a *HITLApprovalAdapter) resolvePermissionPlan(toolName string, args json.RawMessage, hitlEnabled bool) (string, *approvalPlan) {
+	if a.permissions == nil {
+		return "", nil
+	}
+	level := a.permissions.Match(toolName, string(args))
+	return permissionRejectPlan(level, hitlEnabled, toolName)
+}
 
-	// Only prompting modes perform interactive file review. Reject and
-	// notify-only preserve their non-interactive semantics.
-	mode := a.mgr.Mode()
-	mutationPreview := false
-	if preview.Mutation != nil && isFileMutation(toolName) {
-		request := preview.Mutation
-		mutationPreview = !request.Existed || request.Delete ||
-			!bytes.Equal(request.OriginalContent, request.Content)
+func (a *HITLApprovalAdapter) resolveReviewRequirementFor(
+	toolName string,
+	args json.RawMessage,
+	permissionLevel string,
+	snap approvalPolicySnapshot,
+) reviewRequirement {
+	needsReview, riskLevel, reason := false, "", ""
+	if snap.enabled {
+		needsReview, riskLevel, reason = a.mgr.classifyReview(toolName, string(args))
 	}
-	promptingMode := mode == HITLModeInteractive || mode == HITLModeSafeOnly
-	if mutationPreview && a.mgr.IsEnabled() && promptingMode && a.shouldPreviewDiff() {
-		request := *preview.Mutation
-		var accepted string
-		var ok bool
-
-		a.interactionMu.Lock()
-		switch {
-		case request.Delete:
-			ok = security.PreviewDeleteAndConfirm(request.Path, preview.Text)
-		case !request.Existed:
-			accepted, ok = security.PreviewCreateAndConfirm(request.Path, string(request.Content), preview.Text)
-		default:
-			accepted, ok = security.PreviewAndConfirm(
-				request.Path,
-				string(request.OriginalContent),
-				string(request.Content),
-				preview.Text,
-			)
-		}
-		a.interactionMu.Unlock()
-
-		if !ok {
-			return tool.ApprovalResult{Decision: tool.ApprovalRejected, Reason: "changes rejected by operator"}
-		}
-		result := tool.ApprovalResult{Decision: tool.ApprovalAllowed}
-		if !request.Delete {
-			result.ReplacementContent = &accepted
-		}
-		return result
+	var definition tool.ToolDefinition
+	hasDefinition := false
+	if a.catalog != nil {
+		definition, hasDefinition = a.catalog.Load().Definitions[toolName]
 	}
-	if mutationPreview && a.mgr.IsEnabled() &&
-		(mode == HITLModeAutoReject || mode == HITLModeNotifyOnly) && !needsReview {
-		needsReview = true
-		riskLevel = "medium"
-		reason = "file mutation requires review"
-	}
-	if !needsReview {
-		return tool.ApprovalResult{Decision: tool.ApprovalAllowed}
-	}
-	if preview.Text != "" {
-		reason += "\n\nProposed mutation:\n" + preview.Text
-	}
-
-	a.interactionMu.Lock()
-	resp := a.mgr.RequestApproval(HITLRequest{
-		ToolName:  toolName,
-		Arguments: string(args),
-		RiskLevel: riskLevel,
-		Reason:    reason,
-	})
-	a.interactionMu.Unlock()
-
-	switch resp.Decision {
-	case HITLApprove:
-		return tool.ApprovalResult{Decision: tool.ApprovalAllowed}
-	case HITLReject:
-		return tool.ApprovalResult{
-			Decision: tool.ApprovalRejected,
-			Reason:   fmt.Sprintf("HITL rejected %s: %s", toolName, reason),
-		}
-	case HITLModify:
-		return tool.ApprovalResult{Decision: tool.ApprovalModified, Feedback: resp.Feedback}
-	default:
-		return tool.ApprovalResult{Decision: tool.ApprovalRejected, Reason: "unknown HITL decision"}
-	}
+	return resolveReviewRequirement(needsReview, riskLevel, reason, permissionLevel, snap, definition, hasDefinition)
 }
