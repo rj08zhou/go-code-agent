@@ -45,12 +45,17 @@ func AtomicWritePrivate(path string, data []byte) error {
 // atomicReplace writes one fully prepared target using the caller-selected
 // mode. Directory creation and target-mode selection deliberately remain with
 // the public wrappers because workspace and private state have different rules.
+//
+// The temporary file uses a random name created with O_EXCL so concurrent
+// writers do not share one predictable path.tmp, and a pre-planted symlink at
+// path.tmp cannot be opened and truncated.
 func atomicReplace(path string, data []byte, mode os.FileMode) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	if err := f.Chmod(mode); err != nil {
 		f.Close()
 		os.Remove(tmp)
@@ -74,7 +79,7 @@ func atomicReplace(path string, data []byte, mode os.FileMode) error {
 		os.Remove(tmp)
 		return err
 	}
-	syncParentDir(filepath.Dir(path))
+	syncParentDir(dir)
 	return nil
 }
 
