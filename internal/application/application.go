@@ -14,7 +14,6 @@ import (
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
 	"go-code-agent/internal/hitlaudit"
-	"go-code-agent/internal/llm"
 	"go-code-agent/internal/memory"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/model/provider"
@@ -355,7 +354,10 @@ func (app *Application) Build(ctx context.Context, opts BuildOptions) (*BuiltRun
 	// cannot leak across session switches.
 	catalog := tool.NewToolCatalog()
 	rt := NewSessionRuntime(ctx, app.gateway, app.workdir, catalog, app.sessionRepo, opened.state)
-	var usageTracker *agent.UsageTracker
+	usageTracker, usageErr := agent.NewUsageTracker(opened.dir)
+	if usageErr != nil {
+		fmt.Fprintf(os.Stderr, "[warn] usage tracker: %v\n", usageErr)
+	}
 	rt.AddHook("usage", func(context.Context) error {
 		if usageTracker == nil {
 			return nil
@@ -379,6 +381,7 @@ func (app *Application) Build(ctx context.Context, opts BuildOptions) (*BuiltRun
 		securitySetup.promptLoader,
 		securitySetup.cfg,
 	)
+	params.Usage = usageTracker
 
 	built, err := rt.BuildRunner(params, opened.dir)
 	if err != nil {
@@ -388,17 +391,13 @@ func (app *Application) Build(ctx context.Context, opts BuildOptions) (*BuiltRun
 		return nil, closeRuntimeAfterBuildFailure(rt, err)
 	}
 
-	usageTracker, usageErr := agent.NewUsageTracker(opened.dir)
-	if usageErr != nil {
-		fmt.Fprintf(os.Stderr, "[warn] usage tracker: %v\n", usageErr)
-	}
 	built.Session.Usage = usageTracker
 	built.Security.ReloadPermissions = func() error {
 		// In-place reload: bash handler closes over this same pointer.
 		return securitySetup.permissions.Load(app.dataDir)
 	}
 
-	if err := app.activateSessionRuntime(opened, rt, usageTracker); err != nil {
+	if err := app.activateSessionRuntime(opened, rt); err != nil {
 		return nil, closeRuntimeAfterBuildFailure(rt, err)
 	}
 
@@ -526,16 +525,11 @@ func closeRuntimeAfterBuildFailure(rt *SessionRuntime, buildErr error) error {
 	return buildErr
 }
 
-func (app *Application) activateSessionRuntime(opened openedSession, rt *SessionRuntime, usageTracker *agent.UsageTracker) error {
+func (app *Application) activateSessionRuntime(opened openedSession, rt *SessionRuntime) error {
 	if opened.requiresActivation {
 		if err := app.sessionRepo.SwitchActive(opened.state.ID); err != nil {
 			return fmt.Errorf("activate session %q: %w", opened.state.ID, err)
 		}
-	}
-	if usageTracker != nil {
-		app.gateway.SetUsageRecorder(func(role, providerName, modelID, traceID string, usage llm.Usage, duration float64) {
-			usageTracker.Record(providerName, role, modelID, traceID, usage, duration)
-		})
 	}
 	app.runtime = rt
 	app.runtimeCloseErr = nil

@@ -162,7 +162,9 @@ type RateLimited interface {
 	RetryAfter() int // seconds
 }
 
-// Gateway is the unified model access point, holding the active provider.
+// Gateway coordinates provider selection, retries, throttling, and fallback.
+// It is process-scoped and must not store session-owned observers; those travel
+// via CallObservers on the request context.
 type Gateway struct {
 	provider     Provider
 	judgeProv    Provider
@@ -172,13 +174,37 @@ type Gateway struct {
 	// fallbacks maps role → ordered fallback chain (tried after the primary).
 	fallbacks map[string][]Provider
 
-	usageFn   UsageRecorder
-	eventSink event.Sink
-	throttle  *RoleThrottle
-	retry     retryPolicy
+	throttle *RoleThrottle
+	retry    retryPolicy
 }
 
 type UsageRecorder func(source, provider, model, traceID string, u llm.Usage, dur float64)
+
+// CallObservers are request-scoped observers for model calls. They are carried
+// by context instead of stored on Gateway because Gateway lives for the whole
+// process while event logs and usage files belong to one session.
+type CallObservers struct {
+	Usage  UsageRecorder
+	Events event.Sink
+}
+
+type callObserversKey struct{}
+
+// WithCallObservers attaches request-scoped model observers to ctx.
+func WithCallObservers(ctx context.Context, observers CallObservers) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, callObserversKey{}, observers)
+}
+
+func callObserversFromContext(ctx context.Context) CallObservers {
+	if ctx == nil {
+		return CallObservers{}
+	}
+	observers, _ := ctx.Value(callObserversKey{}).(CallObservers)
+	return observers
+}
 
 // NewGateway creates a Gateway with the main provider and per-role throttling.
 func NewGateway(p Provider, throttle *RoleThrottle) *Gateway {
@@ -190,15 +216,9 @@ func NewGateway(p Provider, throttle *RoleThrottle) *Gateway {
 	}
 }
 
-func (g *Gateway) SetJudgeProvider(p Provider)       { g.judgeProv = p }
-func (g *Gateway) SetSubagentProvider(p Provider)    { g.subagentProv = p }
-func (g *Gateway) SetTeamProvider(p Provider)        { g.teamProv = p }
-func (g *Gateway) SetUsageRecorder(fn UsageRecorder) { g.usageFn = fn }
-
-// SetEventSink wires the event pipeline (console, session.log, audit) so
-// retry waits and provider fallbacks are visible to the user. Same pattern
-// as Runner.SetEventSink.
-func (g *Gateway) SetEventSink(s event.Sink) { g.eventSink = s }
+func (g *Gateway) SetJudgeProvider(p Provider)    { g.judgeProv = p }
+func (g *Gateway) SetSubagentProvider(p Provider) { g.subagentProv = p }
+func (g *Gateway) SetTeamProvider(p Provider)     { g.teamProv = p }
 
 // ProviderName returns the provider selected as the primary route for a role.
 func (g *Gateway) ProviderName(role string) string {
@@ -323,9 +343,10 @@ func (g *Gateway) Call(ctx context.Context, role string, params llm.CallParams) 
 	if err != nil {
 		return nil, err
 	}
+	observers := callObserversFromContext(ctx)
 
 	for {
-		resp, callErr := callWithRetry(ctx, provider, prepareParamsFor(provider, params, role), g.throttle, g.usageFn, g.eventSink, role, g.retry)
+		resp, callErr := callWithRetry(ctx, provider, prepareParamsFor(provider, params, role), g.throttle, observers.Usage, observers.Events, role, g.retry)
 		if callErr == nil {
 			return resp, nil
 		}
@@ -336,7 +357,7 @@ func (g *Gateway) Call(ctx context.Context, role string, params llm.CallParams) 
 		if !ok {
 			return nil, callErr
 		}
-		logProviderFallback(ctx, g.eventSink, role, provider, next, callErr)
+		logProviderFallback(ctx, observers.Events, role, provider, next, callErr)
 		provider, idx = next, nextIdx
 	}
 }
@@ -348,10 +369,11 @@ func (g *Gateway) Stream(ctx context.Context, role string, params llm.CallParams
 	if err != nil {
 		return nil, err
 	}
+	observers := callObserversFromContext(ctx)
 
 	ts := newTrackingSink(sink)
 	for {
-		sr, callErr := streamWithRetry(ctx, provider, prepareParamsFor(provider, params, role), ts, g.throttle, g.usageFn, g.eventSink, role, g.retry)
+		sr, callErr := streamWithRetry(ctx, provider, prepareParamsFor(provider, params, role), ts, g.throttle, observers.Usage, observers.Events, role, g.retry)
 		if callErr == nil {
 			ts.notifyDone()
 			return sr, nil
@@ -368,7 +390,7 @@ func (g *Gateway) Stream(ctx context.Context, role string, params llm.CallParams
 		if !ok {
 			return nil, callErr
 		}
-		logProviderFallback(ctx, g.eventSink, role, provider, next, callErr)
+		logProviderFallback(ctx, observers.Events, role, provider, next, callErr)
 		provider, idx = next, nextIdx
 		ts.reset()
 	}
