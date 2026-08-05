@@ -8,6 +8,17 @@ import (
 	"go-code-agent/internal/hitlaudit"
 )
 
+// approvalModeToHITL maps the canonical /approval UX spelling to the
+// HITLMode it applies. Keep in sync with effectiveApprovalMode's reverse
+// mapping below.
+var approvalModeToHITL = map[string]hitlaudit.HITLMode{
+	"manual":      hitlaudit.HITLModeInteractive,
+	"safe-auto":   hitlaudit.HITLModeSafeOnly,
+	"all-auto":    hitlaudit.HITLModeAutoApprove,
+	"reject":      hitlaudit.HITLModeAutoReject,
+	"notify-only": hitlaudit.HITLModeNotifyOnly,
+}
+
 func effectiveApprovalMode(b *application.BuiltRunner) string {
 	if b == nil || b.Security.HITL == nil {
 		return "unavailable"
@@ -83,26 +94,11 @@ func (r *Loop) handleApproval(parts []string) string {
 		return "Usage: /approval manual|safe-auto|all-auto|reject|notify-only"
 	}
 
-	r.built.Security.HITL.SetEnabled(true)
-	switch mode {
-	case "manual":
-		r.built.Security.HITL.SetMode(hitlaudit.HITLModeInteractive)
-		r.built.Security.Approval.ApplyPreset("manual")
-	case "safe-auto":
-		r.built.Security.HITL.SetMode(hitlaudit.HITLModeSafeOnly)
-		r.built.Security.Approval.ApplyPreset("safe-auto")
-	case "all-auto":
-		r.built.Security.HITL.SetMode(hitlaudit.HITLModeAutoApprove)
-		r.built.Security.Approval.ApplyPreset("all-auto")
-	case "reject":
-		r.built.Security.HITL.SetMode(hitlaudit.HITLModeAutoReject)
-		r.built.Security.Approval.ApplyPreset("manual")
-	case "notify-only":
-		r.built.Security.HITL.SetMode(hitlaudit.HITLModeNotifyOnly)
-		r.built.Security.Approval.ApplyPreset("manual")
-	default:
+	hitlMode, ok := approvalModeToHITL[mode]
+	if !ok {
 		return "Usage: /approval manual|safe-auto|all-auto|reject|notify-only"
 	}
+	hitlaudit.ApplyMode(r.built.Security.HITL, r.built.Security.Approval, hitlMode)
 
 	prefix := ""
 	if legacy {
