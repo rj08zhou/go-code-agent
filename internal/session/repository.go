@@ -270,11 +270,18 @@ func (r *Repository) DataDir() string {
 }
 
 // SwitchActive validates and sets the active session to id.
+// The meta check and index update run under one lock so a concurrent
+// rename/archive/backfill cannot observe a half-applied activation.
 func (r *Repository) SwitchActive(id string) error {
 	if err := ValidateSessionID(id); err != nil {
 		return err
 	}
-	idx, err := r.LoadIndex()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, err := r.LoadSessionMeta(id); err != nil {
+		return fmt.Errorf("cannot activate session %q: %w", id, err)
+	}
+	idx, err := r.loadIndexLocked()
 	if err != nil {
 		return err
 	}
@@ -288,18 +295,19 @@ func (r *Repository) SwitchActive(id string) error {
 	if !found {
 		return fmt.Errorf("session %q: %w", id, ErrSessionNotFound)
 	}
-	if _, err := r.LoadSessionMeta(id); err != nil {
-		return fmt.Errorf("cannot activate session %q: %w", id, err)
-	}
 	idx.ActiveID = id
-	if err := r.SaveIndex(idx); err != nil {
+	if err := r.saveIndexLocked(idx); err != nil {
 		return fmt.Errorf("switch session %q: %w", id, err)
 	}
 	return nil
 }
 
 // RenameSession sets a session's title.
+// Meta and index are updated under one lock to keep the dual write atomic
+// with concurrent MarkMemorySaved / ArchiveSession callers.
 func (r *Repository) RenameSession(sessionID, title string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	st, err := r.LoadSessionMeta(sessionID)
 	if err != nil {
 		return fmt.Errorf("load session %q: %w", sessionID, err)
@@ -308,7 +316,7 @@ func (r *Repository) RenameSession(sessionID, title string) error {
 	if err := r.SaveSessionMeta(st); err != nil {
 		return fmt.Errorf("save session %q metadata: %w", sessionID, err)
 	}
-	idx, err := r.LoadIndex()
+	idx, err := r.loadIndexLocked()
 	if err != nil {
 		return fmt.Errorf("load sessions index: %w", err)
 	}
@@ -316,7 +324,7 @@ func (r *Repository) RenameSession(sessionID, title string) error {
 		if idx.Sessions[i].ID == sessionID {
 			idx.Sessions[i].Title = title
 			idx.Sessions[i].UpdatedAt = st.UpdatedAt
-			if err := r.SaveIndex(idx); err != nil {
+			if err := r.saveIndexLocked(idx); err != nil {
 				return fmt.Errorf("update session index: %w", err)
 			}
 			break
@@ -326,7 +334,11 @@ func (r *Repository) RenameSession(sessionID, title string) error {
 }
 
 // ArchiveSession marks a session as archived.
+// Meta and index are updated under one lock; clearing ActiveID is part of the
+// same critical section.
 func (r *Repository) ArchiveSession(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	st, err := r.LoadSessionMeta(id)
 	if err != nil {
 		return fmt.Errorf("load session %q: %w", id, err)
@@ -335,7 +347,7 @@ func (r *Repository) ArchiveSession(id string) error {
 	if err := r.SaveSessionMeta(st); err != nil {
 		return fmt.Errorf("save session %q metadata: %w", id, err)
 	}
-	idx, err := r.LoadIndex()
+	idx, err := r.loadIndexLocked()
 	if err != nil {
 		return fmt.Errorf("load sessions index: %w", err)
 	}
@@ -349,7 +361,7 @@ func (r *Repository) ArchiveSession(id string) error {
 	if idx.ActiveID == id {
 		idx.ActiveID = ""
 	}
-	if err := r.SaveIndex(idx); err != nil {
+	if err := r.saveIndexLocked(idx); err != nil {
 		return fmt.Errorf("update session index: %w", err)
 	}
 	return nil
@@ -357,7 +369,11 @@ func (r *Repository) ArchiveSession(id string) error {
 
 // MarkMemorySaved records that a session has already been distilled into
 // long-term memory so later startups skip it.
+// Meta and index updates share one lock with Rename/Archive so concurrent
+// backfill cannot drop a title/status change or vice versa.
 func (r *Repository) MarkMemorySaved(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	st, err := r.LoadSessionMeta(id)
 	if err != nil {
 		return fmt.Errorf("load session %q: %w", id, err)
@@ -369,8 +385,6 @@ func (r *Repository) MarkMemorySaved(id string) error {
 	if err := r.SaveSessionMeta(st); err != nil {
 		return fmt.Errorf("save session %q metadata: %w", id, err)
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	idx, err := r.loadIndexLocked()
 	if err != nil {
 		return fmt.Errorf("load sessions index: %w", err)
