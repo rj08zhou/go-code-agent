@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -260,6 +261,56 @@ func TestMarkMemorySavedUpdatesMetaAndIndex(t *testing.T) {
 	}
 	if len(idx.Sessions) != 1 || !idx.Sessions[0].MemorySaved {
 		t.Fatalf("index MemorySaved not set: %#v", idx.Sessions)
+	}
+}
+
+func TestConcurrentRenameAndMarkMemorySavedKeepBothFields(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		repo := NewRepository(t.TempDir())
+		st := &State{ID: "s1", Title: "One", Status: StatusActive}
+		if err := repo.CreateSession(st); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.SaveIndex(&sessionsIndex{ActiveID: st.ID, Sessions: []State{*st}}); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		errCh := make(chan error, 2)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			errCh <- repo.RenameSession(st.ID, "Renamed")
+		}()
+		go func() {
+			defer wg.Done()
+			errCh <- repo.MarkMemorySaved(st.ID)
+		}()
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		meta, err := repo.LoadSessionMeta(st.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if meta.Title != "Renamed" || !meta.MemorySaved {
+			t.Fatalf("iter %d meta = %#v, want title=Renamed MemorySaved=true", i, meta)
+		}
+		idx, err := repo.LoadIndex()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(idx.Sessions) != 1 {
+			t.Fatalf("iter %d index sessions = %#v", i, idx.Sessions)
+		}
+		if idx.Sessions[0].Title != "Renamed" || !idx.Sessions[0].MemorySaved {
+			t.Fatalf("iter %d index session = %#v, want title=Renamed MemorySaved=true", i, idx.Sessions[0])
+		}
 	}
 }
 
