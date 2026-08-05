@@ -1,8 +1,7 @@
-// Package team manages teammate lifecycle and message routing.
+// Package team manages teammate coordination and messaging.
 package team
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,14 +11,6 @@ import (
 
 	"go-code-agent/internal/store"
 )
-
-// Actor represents a teammate's runtime state.
-type Actor struct {
-	ID     string
-	Name   string
-	Role   string
-	Status string // "idle", "working"
-}
 
 // MessageBus handles inter-agent messaging via JSONL inboxes.
 type MessageBus struct {
@@ -87,10 +78,8 @@ func (b *MessageBus) sendLocked(from, to, content, msgType string, meta map[stri
 		"type":    msgType,
 		"content": content,
 	}
-	if meta != nil {
-		for k, v := range meta {
-			msg[k] = v
-		}
+	for k, v := range meta {
+		msg[k] = v
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -127,7 +116,7 @@ func (b *MessageBus) ReadInbox(id string) []map[string]any {
 			msgs = append(msgs, m)
 		}
 	}
-	// Drain inbox
+	// Drain inbox.
 	_ = os.Truncate(path, 0)
 	return msgs
 }
@@ -140,68 +129,4 @@ func (b *MessageBus) Broadcast(from, content string, recipients []string) string
 		results = append(results, b.sendLocked(from, to, content, "broadcast", nil))
 	}
 	return strings.Join(results, "\n")
-}
-
-// Supervisor manages teammate lifecycle (Spawn, Stop, List).
-type Supervisor struct {
-	mu     sync.Mutex
-	actors map[string]*Actor
-}
-
-func NewSupervisor() *Supervisor {
-	return &Supervisor{actors: make(map[string]*Actor)}
-}
-
-func (s *Supervisor) Spawn(ctx context.Context, name, role, prompt string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Generate safe ID
-	id := "tm_" + strings.ReplaceAll(strings.ToLower(name), " ", "_")
-
-	if _, ok := s.actors[id]; ok {
-		return fmt.Sprintf("Teammate %s already exists", name)
-	}
-
-	s.actors[id] = &Actor{
-		ID:     id,
-		Name:   name,
-		Role:   role,
-		Status: "idle",
-	}
-	return fmt.Sprintf("Spawned teammate %s (%s): %s", name, id, role)
-}
-
-func (s *Supervisor) Stop(name string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := "tm_" + strings.ReplaceAll(strings.ToLower(name), " ", "_")
-	if _, ok := s.actors[id]; ok {
-		delete(s.actors, id)
-		return fmt.Sprintf("Stopped teammate %s", name)
-	}
-	return fmt.Sprintf("Teammate %s not found", name)
-}
-
-func (s *Supervisor) ListAll() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.actors) == 0 {
-		return "No teammates."
-	}
-	var lines []string
-	for _, a := range s.actors {
-		lines = append(lines, fmt.Sprintf("[%s] %s (%s) - %s", a.Status, a.Name, a.ID, a.Role))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (s *Supervisor) MemberNames() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	names := make([]string, 0, len(s.actors))
-	for _, a := range s.actors {
-		names = append(names, a.Name)
-	}
-	return names
 }

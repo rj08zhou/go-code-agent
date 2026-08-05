@@ -12,7 +12,7 @@ type recordingTeamService struct {
 	spawnName   string
 	spawnRole   string
 	spawnPrompt string
-	listOutput  string
+	members     []string
 }
 
 func (f *recordingTeamService) Spawn(ctx context.Context, name, role, prompt string) string {
@@ -20,10 +20,13 @@ func (f *recordingTeamService) Spawn(ctx context.Context, name, role, prompt str
 	return "spawned " + name
 }
 func (f *recordingTeamService) ListAll() string {
-	if f.listOutput != "" {
-		return f.listOutput
+	if len(f.members) == 0 {
+		return "No teammates."
 	}
-	return "Team: default\n  Alice (coder): working\n  Bob (researcher): idle"
+	return "Team: default"
+}
+func (f *recordingTeamService) MemberNames() []string {
+	return append([]string(nil), f.members...)
 }
 
 type recordingMessageBus struct {
@@ -42,23 +45,6 @@ func (f *recordingMessageBus) ReadInbox(id string) []map[string]any { return f.i
 func (f *recordingMessageBus) Broadcast(from, content string, recipients []string) string {
 	f.broadcastFrom, f.broadcastContent, f.broadcastRecipients = from, content, recipients
 	return "broadcast ok"
-}
-
-func TestParseTeamMemberNames(t *testing.T) {
-	tests := []struct {
-		in   string
-		want []string
-	}{
-		{"", nil},
-		{"Team: default\n  Alice (coder): working\n  Bob (researcher): idle", []string{"Alice", "Bob"}},
-		{"No teammates.", nil},
-	}
-	for _, tc := range tests {
-		got := parseTeamMemberNames(tc.in)
-		if !reflect.DeepEqual(got, tc.want) {
-			t.Fatalf("parseTeamMemberNames(%q) = %#v, want %#v", tc.in, got, tc.want)
-		}
-	}
 }
 
 func TestTeamTools(t *testing.T) {
@@ -131,7 +117,7 @@ func TestTeamTools(t *testing.T) {
 	})
 
 	t.Run("broadcast no teammates", func(t *testing.T) {
-		team := &recordingTeamService{listOutput: "Team: default\n"}
+		team := &recordingTeamService{}
 		bus := &recordingMessageBus{}
 		tool := mustTool(t, teamTools(builtinDeps{teamSvc: team, bus: bus}), "broadcast")
 		got := tool.Handler(scope, json.RawMessage(`{"content":"ping"}`))
@@ -140,8 +126,8 @@ func TestTeamTools(t *testing.T) {
 		}
 	})
 
-	t.Run("broadcast parses recipients", func(t *testing.T) {
-		team := &recordingTeamService{}
+	t.Run("broadcast uses MemberNames", func(t *testing.T) {
+		team := &recordingTeamService{members: []string{"Alice", "Bob"}}
 		bus := &recordingMessageBus{}
 		tool := mustTool(t, teamTools(builtinDeps{teamSvc: team, bus: bus}), "broadcast")
 		got := tool.Handler(scope, json.RawMessage(`{"content":"ping"}`))
