@@ -585,10 +585,10 @@ func TestGateway_RetryAndFallbackEmitModelRetryEvents(t *testing.T) {
 	rec := &collectEventSink{}
 	gw := NewGateway(primary, NewRoleThrottle(4))
 	gw.retry = fastRetryPolicy(3, time.Second)
-	gw.SetEventSink(rec)
 	gw.SetFallbacks("lead", fallback)
 
-	if _, err := gw.Call(context.Background(), "lead", llm.CallParams{Model: "test"}); err != nil {
+	ctx := WithCallObservers(context.Background(), CallObservers{Events: rec})
+	if _, err := gw.Call(ctx, "lead", llm.CallParams{Model: "test"}); err != nil {
 		t.Fatalf("Call: %v", err)
 	}
 
@@ -601,5 +601,73 @@ func TestGateway_RetryAndFallbackEmitModelRetryEvents(t *testing.T) {
 	}
 	if !strings.Contains(got[1], "provider fallback") || !strings.Contains(got[1], "primary → backup") {
 		t.Fatalf("fallback summary = %q", got[1])
+	}
+}
+
+func TestGateway_CallObserversAreRequestScoped(t *testing.T) {
+	calls := 0
+	primary := &capsProvider{
+		name: "primary",
+		caps: ProviderCapabilities{Streaming: true},
+		callFn: func(context.Context, llm.CallParams) (*llm.Completion, error) {
+			calls++
+			switch calls {
+			case 1:
+				return nil, NewProviderError("primary", 429, "rate_limit_error", errors.New("slow down"))
+			case 2:
+				return nil, NewProviderError("primary", 401, "invalid_api_key", errors.New("bad key"))
+			default:
+				return &llm.Completion{Content: "ok", FinishReason: "stop"}, nil
+			}
+		},
+	}
+	fallback := &capsProvider{name: "backup", caps: ProviderCapabilities{Streaming: true}}
+	gw := NewGateway(primary, NewRoleThrottle(4))
+	gw.retry = fastRetryPolicy(3, time.Second)
+	gw.SetFallbacks("lead", fallback)
+
+	firstEvents := &collectEventSink{}
+	secondEvents := &collectEventSink{}
+	firstUsage, secondUsage := 0, 0
+	firstCtx := WithCallObservers(context.Background(), CallObservers{
+		Events: firstEvents,
+		Usage: func(string, string, string, string, llm.Usage, float64) {
+			firstUsage++
+		},
+	})
+	secondCtx := WithCallObservers(context.Background(), CallObservers{
+		Events: secondEvents,
+		Usage: func(string, string, string, string, llm.Usage, float64) {
+			secondUsage++
+		},
+	})
+
+	if _, err := gw.Call(firstCtx, "lead", llm.CallParams{Model: "test"}); err != nil {
+		t.Fatalf("first Call: %v", err)
+	}
+	if firstUsage != 1 {
+		t.Fatalf("first usage callbacks = %d, want 1 (fallback success)", firstUsage)
+	}
+	gotFirst := firstEvents.summaries()
+	if len(gotFirst) != 2 {
+		t.Fatalf("first ModelRetry events = %d (%v), want 2", len(gotFirst), gotFirst)
+	}
+	if len(secondEvents.summaries()) != 0 || secondUsage != 0 {
+		t.Fatalf("second observers were polluted: events=%v usage=%d", secondEvents.summaries(), secondUsage)
+	}
+
+	calls = 0
+	if _, err := gw.Call(secondCtx, "lead", llm.CallParams{Model: "test"}); err != nil {
+		t.Fatalf("second Call: %v", err)
+	}
+	if secondUsage != 1 {
+		t.Fatalf("second usage callbacks = %d, want 1", secondUsage)
+	}
+	gotSecond := secondEvents.summaries()
+	if len(gotSecond) != 2 {
+		t.Fatalf("second ModelRetry events = %d (%v), want 2", len(gotSecond), gotSecond)
+	}
+	if len(firstEvents.summaries()) != 2 {
+		t.Fatalf("first observers changed after second call: %v", firstEvents.summaries())
 	}
 }
