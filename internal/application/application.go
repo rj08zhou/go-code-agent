@@ -490,17 +490,13 @@ func (app *Application) configureSessionSecurity(opts BuildOptions) sessionSecur
 	approval := security.NewApprovalState()
 	// Default approval mode is safe-auto. --human alone escalates to manual.
 	// --human-mode is retained as the advanced compatibility override.
-	hitlMgr.SetEnabled(true)
-	hitlMgr.SetMode(hitlaudit.HITLModeSafeOnly)
-	approval.ApplyPreset("safe-auto")
+	hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeSafeOnly)
 	if opts.Human && opts.HumanMode == "" {
-		hitlMgr.SetMode(hitlaudit.HITLModeInteractive)
-		approval.ApplyPreset("manual")
+		hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeInteractive)
 	}
 	if opts.HumanMode != "" {
 		if mode, err := hitlaudit.ParseMode(opts.HumanMode); err == nil {
-			hitlMgr.SetMode(mode)
-			syncApprovalWithHITLMode(approval, mode)
+			hitlaudit.ApplyMode(hitlMgr, approval, mode)
 		} else {
 			fmt.Fprintf(os.Stderr, "[warn] %v\n", err)
 		}
@@ -534,20 +530,4 @@ func (app *Application) activateSessionRuntime(opened openedSession, rt *Session
 	app.runtime = rt
 	app.runtimeCloseErr = nil
 	return nil
-}
-
-// syncApprovalWithHITLMode keeps ApprovalState (diff-preview skip) aligned
-// with the advanced --human-mode compatibility override.
-func syncApprovalWithHITLMode(approval *security.ApprovalState, mode hitlaudit.HITLMode) {
-	if approval == nil {
-		return
-	}
-	switch mode {
-	case hitlaudit.HITLModeAutoApprove:
-		approval.ApplyPreset("all-auto")
-	case hitlaudit.HITLModeSafeOnly:
-		approval.ApplyPreset("safe-auto")
-	default:
-		approval.ApplyPreset("manual")
-	}
 }
