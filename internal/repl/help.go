@@ -32,8 +32,6 @@ Commands:
     /approval all-auto confirm          Skip approval prompts and diff previews (unsafe)
     /approval reject                    Auto-reject review-required operations
     /approval notify-only               Report reviews without blocking execution
-    /approve ...                        Compatibility alias for legacy presets
-    /hitl ...                           Compatibility alias for legacy HITL modes
     /permissions                        Show loaded permission rules
     /permissions reload                 Reload permissions.json
     /security                           Show security controls
@@ -92,8 +90,6 @@ func NewCompleter() readline.AutoCompleter {
 			readline.PcItem("reject"),
 			readline.PcItem("notify-only"),
 		),
-		readline.PcItem("/approve"),
-		readline.PcItem("/hitl"),
 		readline.PcItem("/permissions", readline.PcItem("reload")),
 		readline.PcItem("/security", readline.PcItem("test-bash")),
 		readline.PcItem("/decisions"),

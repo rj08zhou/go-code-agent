@@ -19,7 +19,7 @@ func TestRenderHelpListsEveryREPLCommand(t *testing.T) {
 		"/team", "/team spawn <name> <role> <prompt>", "/team shutdown <name>", "/team message <name> <content>", "/team inbox",
 		"/session", "/session list", "/session switch <id>", "/session new", "/session rename <title>", "/session archive",
 		"/judge", "/approval", "/approval manual", "/approval safe-auto", "/approval all-auto confirm", "/approval reject", "/approval notify-only",
-		"/approve ...", "/hitl ...", "/inbox", "/search <query>", "/permissions", "/permissions reload", "/usage",
+		"/inbox", "/search <query>", "/permissions", "/permissions reload", "/usage",
 		"/security", "/security test-bash <command>", "/decisions", "/compact", "/exit, /quit",
 	}
 	for _, command := range commands {
@@ -87,23 +87,6 @@ func TestHandleApprovalCanonicalModes(t *testing.T) {
 		if !strings.Contains(status, "Diff preview: "+tc.preview) {
 			t.Errorf("status after %v = %q, want preview %s", tc.command, status, tc.preview)
 		}
-	}
-}
-
-func TestLegacyApprovalAliasesUseCanonicalSafety(t *testing.T) {
-	r := newApprovalTestLoop()
-	if got := r.handleApproval([]string{"/approve", "off"}); !strings.Contains(got, "use /approval manual") {
-		t.Fatalf("legacy manual alias = %q", got)
-	}
-	if mode := effectiveApprovalMode(r.built); mode != "manual" {
-		t.Fatalf("legacy /approve off mode = %q", mode)
-	}
-	got := r.handleApproval([]string{"/hitl", "off"})
-	if !strings.Contains(got, "/approval all-auto confirm") {
-		t.Fatalf("legacy HITL off bypassed confirmation: %q", got)
-	}
-	if mode := effectiveApprovalMode(r.built); mode != "manual" {
-		t.Fatalf("unconfirmed legacy HITL off changed mode to %q", mode)
 	}
 }
 

@@ -371,7 +371,6 @@ go-code-agent/
 | `/inbox` | 读取 lead inbox |
 | `/judge` | 开关 LLM-as-Judge |
 | `/approval [manual\|safe-auto\|all-auto\|reject\|notify-only]` | 查看或设置最终审批模式（`all-auto` 需附加 `confirm`） |
-| `/approve ...` / `/hitl ...` | 旧命令兼容别名 |
 | `/permissions [reload]` | 查看 / 重载 permissions.json |
 | `/security` | 安全状态 |
 | `/security test-bash <cmd>` | 干跑 bash 策略 |
@@ -478,7 +477,7 @@ MCP 服务器启动/批准后，以 `mcp__<server>__<tool>` 形式注册到会�
 
 | 组件 | 作用 |
 |------|------|
-| `security.ApprovalState` | 会话 `/approve` 姿态：`off` / `safe` / `danger`；控制自动放行与是否展示 diff preview |
+| `security.ApprovalState` | 会话 `/approval` 姿态：`manual` / `safe-auto` / `all-auto`；控制自动放行与是否展示 diff preview |
 | `hitlaudit.HITLManager` | 交互模式：`safe-only`、`interactive`、`auto-approve`、`auto-reject`、`notify-only` |
 
 `HITLApprovalAdapter` 将二者适配为 executor 使用的 `tool.ApprovalChecker`（含分块 diff 确认）。
