@@ -258,6 +258,9 @@ const (
 	DeduplicateThreshold = 0.7
 	MaxMemoryContentLen  = 2000
 	MaxEvergreenChars    = 8000
+	// MaxProjectDocChars caps AGENT.md / CLAUDE.md / AGENTS.md injection
+	// into the system prompt (rune count).
+	MaxProjectDocChars = 16000
 )
 
 const (
