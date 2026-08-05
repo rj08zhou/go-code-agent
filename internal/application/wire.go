@@ -269,39 +269,31 @@ func wireAgent(rt *SessionRuntime, params RunnerParams, wb *wireBundle, sessionI
 			return params.TodoSvc.HasOpenItems(), params.TodoSvc.Render()
 		})
 	}
+	renderTaskProgress := func() string {
+		var parts []string
+		if params.TodoSvc != nil {
+			parts = append(parts, params.TodoSvc.Render())
+		}
+		if params.TaskSvc != nil {
+			if progress := params.TaskSvc.ProgressSummary(); progress != "" {
+				parts = append(parts, progress)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
 	if params.TaskSvc != nil || params.TodoSvc != nil {
-		runner.SetTaskProgress(func() string {
-			var parts []string
-			if params.TodoSvc != nil {
-				parts = append(parts, params.TodoSvc.Render())
-			}
-			if params.TaskSvc != nil {
-				if progress := params.TaskSvc.ProgressSummary(); progress != "" {
-					parts = append(parts, progress)
-				}
-			}
-			return strings.Join(parts, "\n")
-		})
+		runner.SetTaskProgress(renderTaskProgress)
 	}
 	runner.SetDynamicContext(func() string {
 		evergreen := ""
 		if params.MemoryStore != nil {
 			evergreen = params.MemoryStore.GetEvergreen()
 		}
-		var taskParts []string
-		if params.TodoSvc != nil {
-			taskParts = append(taskParts, params.TodoSvc.Render())
-		}
-		if params.TaskSvc != nil {
-			if progress := params.TaskSvc.ProgressSummary(); progress != "" {
-				taskParts = append(taskParts, progress)
-			}
-		}
 		mcp := ""
 		if params.MCPMgr != nil {
 			mcp = strings.TrimSpace(params.MCPMgr.List() + "\n" + params.MCPMgr.ServerInstructions())
 		}
-		return agent.BuildSessionContext(evergreen, strings.Join(taskParts, "\n"), mcp)
+		return agent.BuildSessionContext(evergreen, renderTaskProgress(), mcp)
 	})
 
 	runner.SetCompression(agent.NewCompression(rt.gateway, wb.histStore, sessionDir, cfg.ModelID, params.PromptLoader))
