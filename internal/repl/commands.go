@@ -30,7 +30,7 @@ func (r *Loop) handleCommand(ctx context.Context, cmd string, messages *[]llm.Me
 		r.handleSearchCommand(ctx, parts)
 	case "/permissions", "/security", "/decisions":
 		r.handleSecurityCommands(cmd, parts)
-	case "/approval", "/approve", "/hitl":
+	case "/approval":
 		fmt.Println(r.handleApproval(parts))
 	case "/exit", "/quit":
 		fmt.Println("Goodbye!")

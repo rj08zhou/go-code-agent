@@ -368,7 +368,6 @@ go-code-agent/
 | `/inbox` | Read lead inbox |
 | `/judge` | Toggle LLM-as-Judge |
 | `/approval [manual\|safe-auto\|all-auto\|reject\|notify-only]` | Show or set the effective approval mode (`all-auto` requires `confirm`) |
-| `/approve ...` / `/hitl ...` | Compatibility aliases for legacy commands |
 | `/permissions [reload]` | Show / reload permissions.json |
 | `/security` | Security status |
 | `/security test-bash <cmd>` | Dry-run bash policy |
