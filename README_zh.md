@@ -362,7 +362,7 @@ go-code-agent/
 | `/session archive` | 归档当前会话 |
 | `/tasks` | 渲染短期 Todo |
 | `/dag` | 显示持久化任务 DAG |
-| `/task clear\|reset` | 清理已完成 / 清空全部任务 |
+| `/task new\|clear\|reset` | 封存当前 DAG 批次 / 清理已完成 / 清空全部任务 |
 | `/memory` | 记忆统计 |
 | `/mcp` | 列出 MCP 服务器 |
 | `/mcp pending` / `approve <name>` | 待批准 MCP |
@@ -409,7 +409,7 @@ go-code-agent/
 | 工具 | 说明 |
 |------|------|
 | `TodoWrite` | 短期清单 |
-| `task_create` / `task_list` / `task_update` / `task_get` | 持久化任务 |
+| `task_create` / `task_list` / `task_update` / `task_get` | 持久化任务，按请求归入 DAG 批次 |
 | `task_add_dep` / `task_remove_dep` / `task_ready` / `task_dag` / `claim_task` | DAG 调度 |
 
 ### 多 Agent 协作
@@ -587,7 +587,7 @@ PlanGate（规划闸）是另一层：无既定 plan 时拦写文件 / 非只读
 
 ### DAG 调度
 
-带依赖边的持久化任务（`task_*` 工具）。就绪任务可被认领；`/dag` 展示拓扑与进度。
+带依赖边的持久化任务（`task_*` 工具）。任务按请求归入 DAG 批次：同一请求的后续轮次继续扩展当前批次，批次做完后下一个任务自动开新批次。批次未完成时切换到无关需求，会封存旧批次（`new_plan` 参数或 `/task new`）而不是并入。就绪任务可被认领；`/dag` 按批次展示拓扑与进度。
 
 ### Auto-Lesson
 

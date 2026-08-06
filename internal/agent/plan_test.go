@@ -37,7 +37,7 @@ func TestPlanGateUsesDerivedPlanningState(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, action := gate.Eval(tc.round, tc.planEstablished, tc.task)
+			got, action := gate.Eval(tc.round, tc.planEstablished, tc.task, "")
 			if tc.wantPrompt != strings.Contains(got, "<planning-required>") {
 				t.Fatalf("Eval() = %q, wantPrompt = %v", got, tc.wantPrompt)
 			}
@@ -48,6 +48,43 @@ func TestPlanGateUsesDerivedPlanningState(t *testing.T) {
 				t.Fatalf("action = %q, want empty", action)
 			}
 		})
+	}
+}
+
+func TestPlanGateDAGCheckIsBatchScoped(t *testing.T) {
+	svc := taskpkg.NewService(t.TempDir())
+	svc.CreateForBatch("old", "leftover one", "", nil)
+	svc.CreateForBatch("old", "leftover two", "", nil)
+	gate := NewPlanGate(prompt.NewLoader(), svc)
+
+	nudged := func(batchID string) bool {
+		msg, _ := gate.Eval(1, true, "implement the feature", batchID)
+		return strings.Contains(msg, "NO dependencies")
+	}
+
+	if nudged("") {
+		t.Fatal("a run that created no tasks must not be judged on leftover batches")
+	}
+	if !nudged("old") {
+		t.Fatal("two edgeless tasks in the active batch should be nudged")
+	}
+
+	svc.CreateForBatch("current", "only one", "", nil)
+	if nudged("current") {
+		t.Fatal("a single task needs no dependency edge")
+	}
+	svc.CreateForBatch("current", "second one", "", nil)
+	if !nudged("current") {
+		t.Fatal("edgeless pair in the current batch should be nudged")
+	}
+	// The edge belongs to another batch, so it must not silence the nudge.
+	svc.AddEdge(1, 2)
+	if !nudged("current") {
+		t.Fatal("an edge in a different batch must not count")
+	}
+	svc.AddEdge(3, 4)
+	if nudged("current") {
+		t.Fatal("nudge should stop once the current batch has an edge")
 	}
 }
 

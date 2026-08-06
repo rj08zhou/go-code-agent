@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"go-code-agent/internal/security"
 	"go-code-agent/internal/store"
 )
 
@@ -67,7 +66,7 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			if a.Path == "" {
 				return Failed("path is required")
 			}
-			fp, err := security.SecurePath(scope.Workdir, a.Path, true)
+			fp, err := resolveFSPath(scope, a.Path, true)
 			if err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
@@ -114,7 +113,7 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			if e := parseJSON(args, &a); e != "" {
 				return Failed(e)
 			}
-			fp, err := security.SecurePath(scope.Workdir, a.Path, true)
+			fp, err := resolveFSPath(scope, a.Path, true)
 			if err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
@@ -165,7 +164,7 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			if e := parseJSON(args, &a); e != "" {
 				return Failed(e)
 			}
-			fp, err := security.SecurePath(scope.Workdir, a.Path, true)
+			fp, err := resolveFSPath(scope, a.Path, true)
 			if err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
@@ -202,7 +201,7 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			if e := parseJSON(args, &a); e != "" {
 				return Failed(e)
 			}
-			fp, err := security.SecurePath(scope.Workdir, a.Path, true)
+			fp, err := resolveFSPath(scope, a.Path, true)
 			if err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}

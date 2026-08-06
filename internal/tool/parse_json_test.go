@@ -87,9 +87,14 @@ func (f *fakeTaskService) Create(sub, desc string, deps []int) string {
 	}
 	return "task created"
 }
-func (f *fakeTaskService) Get(int) string                      { return "got" }
-func (f *fakeTaskService) Update(id int, status string) string { return "updated" }
-func (f *fakeTaskService) ListAll() string                     { return "[]" }
+func (f *fakeTaskService) CreateForBatch(batchID, sub, desc string, deps []int) string {
+	return f.Create(sub, desc, deps)
+}
+func (f *fakeTaskService) ResolveActiveBatch(prefix string) string { return prefix + "-active" }
+func (f *fakeTaskService) StartNewBatch(prefix string) string      { return prefix + "-new" }
+func (f *fakeTaskService) Get(int) string                          { return "got" }
+func (f *fakeTaskService) Update(id int, status string) string     { return "updated" }
+func (f *fakeTaskService) ListAll() string                         { return "[]" }
 func (f *fakeTaskService) AddEdge(from, to int) string {
 	f.edges = append(f.edges, "edge")
 	return "added"
@@ -99,7 +104,7 @@ func (f *fakeTaskService) ReadyTasks() string               { return "[]" }
 func (f *fakeTaskService) TopoView() string                 { return "" }
 func (f *fakeTaskService) ProgressSummary() string          { return "" }
 func (f *fakeTaskService) ClearCompleted() string           { return "" }
-func (f *fakeTaskService) Reset()                           {}
+func (f *fakeTaskService) Reset() string                    { return "" }
 func (f *fakeTaskService) Claim(int, string) (string, bool) { return "claimed", true }
 
 func TestTaskAddDep_StringArgs(t *testing.T) {

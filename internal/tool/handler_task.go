@@ -5,6 +5,23 @@ import (
 	"strings"
 )
 
+// resolveTaskBatch decides which DAG batch a new task joins, and remembers the
+// answer for the rest of the run.
+func resolveTaskBatch(scope *ToolScope, taskSvc TaskService, newPlan bool) string {
+	prefix := "batch"
+	var batch *TaskBatchRef
+	if scope != nil {
+		batch = scope.TaskBatch
+		if scope.Role != "" {
+			prefix = scope.Role
+		}
+	}
+	if newPlan {
+		return batch.Restart(func() string { return taskSvc.StartNewBatch(prefix) })
+	}
+	return batch.Resolve(func() string { return taskSvc.ResolveActiveBatch(prefix) })
+}
+
 func taskTools(d builtinDeps) []ToolDefinition {
 	var defs []ToolDefinition
 
@@ -80,13 +97,19 @@ When NOT to use: local rename / one-file fix → TodoWrite or just edit; read-on
 
 If you create multiple related tasks, set depends_on (or call task_add_dep) and review with task_dag before executing. Runtime stops you if multiple tasks have no edges.
 
-Example — auth middleware + wire into server + migrate handlers + integration tests (later steps depend on earlier): task_create with depends_on / task_add_dep, then task_dag, then execute in order. Incorrect: TodoWrite with unordered bullets and hope sequencing works.`,
+Example — auth middleware + wire into server + migrate handlers + integration tests (later steps depend on earlier): task_create with depends_on / task_add_dep, then task_dag, then execute in order. Incorrect: TodoWrite with unordered bullets and hope sequencing works.
+
+Tasks group into DAG batches, one per request. Follow-up turns on the same request keep extending that batch, and a new batch opens automatically once it is finished. depends_on may only reference tasks in the same batch. Set new_plan when the user switches to an unrelated request while the current batch still has unfinished tasks — that seals the old batch (its tasks stay visible) and starts a clean one.`,
 			Schema: MustMarshalJSON(map[string]any{
 				"type": "object", "required": []string{"subject"},
 				"properties": map[string]any{
 					"subject":     map[string]any{"type": "string", "description": "Short task title."},
 					"description": map[string]any{"type": "string"},
 					"depends_on":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
+					"new_plan": map[string]any{
+						"type":        "boolean",
+						"description": "Start a fresh DAG batch instead of extending the unfinished one. Use only when this request is unrelated to the tasks already on the board.",
+					},
 				},
 			}),
 			RiskLevel: RiskSafe,
@@ -96,18 +119,19 @@ Example — auth middleware + wire into server + migrate handlers + integration 
 					Subject     string `json:"subject"`
 					Description string `json:"description"`
 					DependsOn   []int  `json:"depends_on"`
+					NewPlan     bool   `json:"new_plan"`
 				}
 				if e := parseJSON(args, &a); e != "" {
 					return Failed(e)
 				}
-				if taskSvc != nil {
-					if strings.TrimSpace(a.Subject) == "" {
-						return Failed("subject is required")
-					}
-					return Succeeded(taskSvc.Create(a.Subject, a.Description, a.DependsOn))
+				if taskSvc == nil {
+					return Failed("task service unavailable")
 				}
-
-				return Failed("task service unavailable")
+				if strings.TrimSpace(a.Subject) == "" {
+					return Failed("subject is required")
+				}
+				batchID := resolveTaskBatch(scope, taskSvc, a.NewPlan)
+				return Succeeded(taskSvc.CreateForBatch(batchID, a.Subject, a.Description, a.DependsOn))
 			},
 		}
 	case "task_get":

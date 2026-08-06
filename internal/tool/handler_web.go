@@ -68,7 +68,7 @@ func webTools(d builtinDeps) []ToolDefinition {
 			)
 			ctx, cancel := context.WithTimeout(scopeParentContext(scope), config.WebFetchSubagentBudget)
 			defer cancel()
-			output := d.subagentSvc.Run(ctx, subPrompt, "web_fetch", scope.Workdir)
+			output := d.subagentSvc.Run(ctx, subPrompt, "web_fetch", scope.Workdir, scope.SourceWorkdir)
 			return Succeeded(output)
 		},
 	})
@@ -136,7 +136,7 @@ func webTools(d builtinDeps) []ToolDefinition {
 			if d.subagentSvc != nil {
 				ctx, cancel := context.WithTimeout(scopeParentContext(scope), config.SubagentTimeout)
 				defer cancel()
-				return Succeeded(d.subagentSvc.Run(ctx, a.Prompt, a.AgentType, scope.Workdir))
+				return Succeeded(d.subagentSvc.Run(ctx, a.Prompt, a.AgentType, scope.Workdir, scope.SourceWorkdir))
 			}
 			return Failed("subagent runner unavailable")
 		},

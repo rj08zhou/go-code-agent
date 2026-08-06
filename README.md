@@ -359,7 +359,7 @@ go-code-agent/
 | `/session archive` | Archive active session |
 | `/tasks` | Render short-term todos |
 | `/dag` | Show persistent task DAG |
-| `/task clear\|reset` | Clear completed / wipe all tasks |
+| `/task new\|clear\|reset` | Seal the current DAG batch / clear completed / wipe all tasks |
 | `/memory` | Memory stats |
 | `/mcp` | List MCP servers |
 | `/mcp pending` / `approve <name>` | Pending MCP approval |
@@ -406,7 +406,7 @@ go-code-agent/
 | Tool | Description |
 |------|-------------|
 | `TodoWrite` | Short-term checklist |
-| `task_create` / `task_list` / `task_update` / `task_get` | Persistent tasks |
+| `task_create` / `task_list` / `task_update` / `task_get` | Persistent tasks, grouped into one DAG batch per request |
 | `task_add_dep` / `task_remove_dep` / `task_ready` / `task_dag` / `claim_task` | DAG scheduling |
 
 ### Multi-Agent Collaboration
@@ -587,7 +587,7 @@ Fetched pages are framed as untrusted content, size-capped, and scrubbed of obvi
 
 ### DAG Scheduler
 
-Persistent tasks with dependency edges (`task_*` tools). Ready tasks can be claimed; `/dag` shows topology and progress.
+Persistent tasks with dependency edges (`task_*` tools). Tasks group into one DAG batch per request: follow-up turns extend the batch already in flight, and the next task after a batch finishes opens a new one. Unrelated work started while tasks are still open seals the old batch (`new_plan`, or `/task new`) instead of merging into it. Ready tasks can be claimed; `/dag` shows topology and progress per batch.
 
 ### Auto-Lesson
 

@@ -2,6 +2,7 @@
 package task
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"go-code-agent/internal/store"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -17,6 +19,15 @@ const (
 	StatusInProgress = "in_progress"
 	StatusCompleted  = "completed"
 	StatusDeleted    = "deleted"
+
+	// legacyBatchID owns tasks written before batches existed, plus anything
+	// created through the batch-less Create API.
+	legacyBatchID = "legacy"
+	// sealedKey marks a task whose batch no longer accepts new members.
+	sealedKey = "batch_sealed"
+	// maxReportedBatches caps how many batches ProgressSummary spells out, so
+	// a long-lived project cannot grow the per-turn prompt without bound.
+	maxReportedBatches = 3
 )
 
 var validStatuses = map[string]bool{
@@ -50,6 +61,21 @@ type Service struct {
 func NewService(dir string) *Service {
 	_ = store.EnsurePrivateDir(dir)
 	return &Service{dir: dir}
+}
+
+// NewBatchID returns an opaque identifier for one agent request's DAG.
+// It is intentionally independent from model trace IDs: traces describe
+// observability, while batches describe task ownership and lifecycle.
+func NewBatchID(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		prefix = "batch"
+	}
+	var random [4]byte
+	if _, err := rand.Read(random[:]); err == nil {
+		return fmt.Sprintf("%s-%x", prefix, random)
+	}
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }
 
 func (s *Service) edgesPath() string { return filepath.Join(s.dir, "dag_edges.json") }
@@ -196,16 +222,28 @@ func (s *Service) loadAll() []map[string]any {
 
 // --- CRUD ---
 
+// Create preserves the legacy single-board API. New runners should use
+// CreateForBatch so independent requests never merge their DAGs.
 func (s *Service) Create(subject, desc string, dependsOn []int) string {
+	return s.CreateForBatch(legacyBatchID, subject, desc, dependsOn)
+}
+
+// CreateForBatch adds a task to one persistent DAG batch. Dependencies must
+// reference tasks in that same batch; task IDs remain session-global.
+func (s *Service) CreateForBatch(batchID, subject, desc string, dependsOn []int) string {
 	subject = strings.TrimSpace(subject)
 	if subject == "" {
 		return "Error: subject is required"
+	}
+	batchID = strings.TrimSpace(batchID)
+	if batchID == "" {
+		batchID = legacyBatchID
 	}
 	s.mu.Lock()
 	id := s.nextID()
 	t := map[string]any{
 		"id": float64(id), "subject": subject, "description": desc,
-		"status": StatusPending, "owner": nil,
+		"status": StatusPending, "owner": nil, "batch_id": batchID,
 	}
 	if err := s.save(t); err != nil {
 		s.mu.Unlock()
@@ -227,6 +265,11 @@ func (s *Service) Create(subject, desc string, dependsOn []int) string {
 				warn = append(warn, fmt.Sprintf("dependency #%d not found, skipped", dep))
 				continue
 			}
+			dependency, err := s.load(dep)
+			if err != nil || taskBatchID(dependency) != batchID {
+				warn = append(warn, fmt.Sprintf("dependency #%d belongs to another batch, skipped", dep))
+				continue
+			}
 			edges = append(edges, dagEdge{From: dep, To: id})
 		}
 		if err := s.saveEdges(edges); err != nil {
@@ -235,11 +278,127 @@ func (s *Service) Create(subject, desc string, dependsOn []int) string {
 		}
 		s.mu.Unlock()
 		if len(warn) > 0 {
-			return fmt.Sprintf("Created task #%d: %s\n[WARN] %s", id, subject, strings.Join(warn, "; "))
+			return fmt.Sprintf("Created task #%d in %s: %s\n[WARN] %s", id, batchID, subject, strings.Join(warn, "; "))
 		}
 	}
 
-	return fmt.Sprintf("Created task #%d: %s", id, subject)
+	return fmt.Sprintf("Created task #%d in %s: %s", id, batchID, subject)
+}
+
+func taskBatchID(t map[string]any) string {
+	if batchID, _ := t["batch_id"].(string); batchID != "" {
+		return batchID
+	}
+	return legacyBatchID
+}
+
+func batchSealed(t map[string]any) bool {
+	sealed, _ := t[sealedKey].(bool)
+	return sealed
+}
+
+// ResolveActiveBatch answers "which batch does a new task belong to" for
+// callers that carry no explicit batch. A follow-up turn on the same request
+// keeps landing in the batch it started, and once that work is finished (or
+// sealed) the next task opens a fresh one.
+func (s *Service) ResolveActiveBatch(prefix string) string {
+	if batchID := s.activeBatch(); batchID != "" {
+		return batchID
+	}
+	return NewBatchID(prefix)
+}
+
+// StartNewBatch seals the active batch and returns a fresh ID, so an
+// unrelated request never appends to a plan that was abandoned half-done.
+func (s *Service) StartNewBatch(prefix string) string {
+	s.sealBatch(s.activeBatch())
+	return NewBatchID(prefix)
+}
+
+// SealActiveBatch stops the active batch from absorbing new tasks. Its tasks
+// stay on the board and keep appearing in listings and progress summaries.
+func (s *Service) SealActiveBatch() string {
+	batchID := s.activeBatch()
+	if batchID == "" {
+		return "No active DAG batch."
+	}
+	remaining := s.sealBatch(batchID)
+	return fmt.Sprintf("Sealed batch %s; %d unfinished task(s) kept on the board.",
+		displayBatchID(batchID), remaining)
+}
+
+// activeBatch is the unsealed batch owning the newest unfinished task.
+func (s *Service) activeBatch() string {
+	tasks := s.loadAll()
+	sealed := make(map[string]bool)
+	for _, t := range tasks {
+		if batchSealed(t) {
+			sealed[taskBatchID(t)] = true
+		}
+	}
+	// loadAll is ordered by ascending ID, so walking back finds the most
+	// recently created unfinished task first.
+	for i := len(tasks) - 1; i >= 0; i-- {
+		switch st, _ := tasks[i]["status"].(string); st {
+		case StatusDeleted, StatusCompleted:
+			continue
+		}
+		if batchID := taskBatchID(tasks[i]); !sealed[batchID] {
+			return batchID
+		}
+	}
+	return ""
+}
+
+// sealBatch marks every live task in batchID sealed and reports how many of
+// them are still unfinished.
+func (s *Service) sealBatch(batchID string) int {
+	if batchID == "" {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	remaining := 0
+	for _, t := range s.loadAll() {
+		st, _ := t["status"].(string)
+		if st == StatusDeleted || taskBatchID(t) != batchID {
+			continue
+		}
+		if !batchSealed(t) {
+			t[sealedKey] = true
+			if err := s.save(t); err != nil {
+				continue
+			}
+		}
+		if st != StatusCompleted {
+			remaining++
+		}
+	}
+	return remaining
+}
+
+// BatchCounts reports the live task count of batchID and the number of edges
+// with both endpoints inside it.
+func (s *Service) BatchCounts(batchID string) (tasks, edges int) {
+	if batchID == "" {
+		return 0, 0
+	}
+	inBatch := make(map[int]bool)
+	for _, t := range s.loadAll() {
+		if st, _ := t["status"].(string); st == StatusDeleted {
+			continue
+		}
+		if taskBatchID(t) != batchID {
+			continue
+		}
+		inBatch[int(t["id"].(float64))] = true
+	}
+	for _, e := range s.loadEdges() {
+		if inBatch[e.From] && inBatch[e.To] {
+			edges++
+		}
+	}
+	return len(inBatch), edges
 }
 
 func (s *Service) loadAllIDs() map[int]bool {
@@ -359,7 +518,7 @@ func (s *Service) ListAll() string {
 			}
 			depStr = fmt.Sprintf(" (depends on %s)", strings.Join(parts, ", "))
 		}
-		lines = append(lines, fmt.Sprintf("%s #%d: %s%s", mk, id, sub, depStr))
+		lines = append(lines, fmt.Sprintf("%s #%d [%s]: %s%s", mk, id, displayBatchID(taskBatchID(t)), sub, depStr))
 	}
 	if len(lines) == 0 {
 		return "No tasks."
@@ -428,14 +587,14 @@ func (s *Service) onComplete(completedID int) string {
 
 // --- DAG views ---
 
+// TaskCount is every task on record, deleted ones included. Callers deciding
+// what to show or gate on almost always want ActiveTaskCount or BatchCounts.
 func (s *Service) TaskCount() int {
 	s.ensureCache()
 	s.cacheMu.RLock()
 	defer s.cacheMu.RUnlock()
 	return len(s.cache)
 }
-
-func (s *Service) TaskCountSafe() int { return s.TaskCount() }
 
 func (s *Service) EdgeCount() int {
 	edges := s.loadEdges()
@@ -448,11 +607,16 @@ func (s *Service) TopoView() string {
 	tasks := s.loadAll()
 	edges := s.loadEdges()
 	markers := map[string]string{"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
-	var lines []string
+	byBatch := make(map[string][]string)
+	var batchOrder []string
 	for _, t := range tasks {
 		st, _ := t["status"].(string)
 		if st == StatusDeleted {
 			continue
+		}
+		batchID := taskBatchID(t)
+		if _, seen := byBatch[batchID]; !seen {
+			batchOrder = append(batchOrder, batchID)
 		}
 		id := int(t["id"].(float64))
 		sub, _ := t["subject"].(string)
@@ -470,12 +634,23 @@ func (s *Service) TopoView() string {
 		if len(deps) > 0 {
 			depStr = " <- " + strings.Join(deps, ", ")
 		}
-		lines = append(lines, fmt.Sprintf("%s #%d: %s%s", mk, id, sub, depStr))
+		byBatch[batchID] = append(byBatch[batchID], fmt.Sprintf("%s #%d: %s%s", mk, id, sub, depStr))
 	}
-	if len(lines) == 0 {
+	if len(batchOrder) == 0 {
 		return "No tasks."
 	}
-	return "DAG:\n" + strings.Join(lines, "\n")
+	var blocks []string
+	for _, batchID := range batchOrder {
+		blocks = append(blocks, "DAG "+displayBatchID(batchID)+":\n"+strings.Join(byBatch[batchID], "\n"))
+	}
+	return strings.Join(blocks, "\n\n")
+}
+
+func displayBatchID(batchID string) string {
+	if len(batchID) > 24 {
+		return batchID[:24] + "…"
+	}
+	return batchID
 }
 
 // ClearCompleted marks all completed status tasks as deleted.
@@ -499,14 +674,16 @@ func (s *Service) ClearCompleted() string {
 	return fmt.Sprintf("Cleared %d completed task(s).", count)
 }
 
-// Reset deletes all task files and the edges file.
-func (s *Service) Reset() {
+// Reset deletes all task files and the edges file. Returns a short summary.
+func (s *Service) Reset() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tasks := s.loadAll()
+	count := 0
 	for _, t := range tasks {
 		id := int(t["id"].(float64))
 		_ = os.Remove(s.taskPath(id))
+		count++
 	}
 	_ = os.Remove(s.edgesPath())
 	s.cacheMu.Lock()
@@ -517,6 +694,24 @@ func (s *Service) Reset() {
 	s.edges = nil
 	s.edgesLoaded = false
 	s.edgesMu.Unlock()
+	if count == 0 {
+		return "No tasks to clear."
+	}
+	return fmt.Sprintf("Cleared %d task(s) and DAG edges.", count)
+}
+
+// ActiveTaskCount is the number of non-deleted tasks on the board.
+func (s *Service) ActiveTaskCount() int {
+	s.ensureCache()
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	n := 0
+	for _, t := range s.cache {
+		if st, _ := t["status"].(string); st != StatusDeleted {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Service) ReadyTasks() string {
@@ -559,13 +754,16 @@ func (s *Service) AddEdge(from, to int) string {
 	// Validate both tasks exist.
 	tasks := s.loadAll()
 	foundFrom, foundTo := false, false
+	fromBatch, toBatch := "", ""
 	for _, t := range tasks {
 		id := int(t["id"].(float64))
 		if id == from {
 			foundFrom = true
+			fromBatch = taskBatchID(t)
 		}
 		if id == to {
 			foundTo = true
+			toBatch = taskBatchID(t)
 		}
 	}
 	if !foundFrom {
@@ -573,6 +771,9 @@ func (s *Service) AddEdge(from, to int) string {
 	}
 	if !foundTo {
 		return fmt.Sprintf("Error: task #%d does not exist", to)
+	}
+	if fromBatch != toBatch {
+		return fmt.Sprintf("Error: tasks #%d and #%d belong to different DAG batches", from, to)
 	}
 
 	edges := s.loadEdges()
@@ -621,53 +822,115 @@ func (s *Service) ProgressSummary() string {
 		return ""
 	}
 	edges := s.loadEdges()
-	total, done, inProg, pending := 0, 0, 0, 0
-	completed := make(map[int]bool)
+	type batchProgress struct {
+		total, done, inProgress, pending int
+		newestTask                       int
+		sealed                           bool
+		completed                        map[int]bool
+		nextUp                           []string
+	}
+	batches := make(map[string]*batchProgress)
+	var batchOrder []string
 	for _, t := range tasks {
+		if st, _ := t["status"].(string); st == StatusDeleted {
+			continue
+		}
+		batchID := taskBatchID(t)
+		progress := batches[batchID]
+		if progress == nil {
+			progress = &batchProgress{completed: make(map[int]bool)}
+			batches[batchID] = progress
+			batchOrder = append(batchOrder, batchID)
+		}
 		id := int(t["id"].(float64))
-		total++
+		if id > progress.newestTask {
+			progress.newestTask = id
+		}
+		progress.total++
+		progress.sealed = progress.sealed || batchSealed(t)
 		switch st, _ := t["status"].(string); st {
 		case StatusCompleted:
-			done++
-			completed[id] = true
+			progress.done++
+			progress.completed[id] = true
 		case StatusInProgress:
-			inProg++
+			progress.inProgress++
 		default:
-			pending++
+			progress.pending++
 		}
 	}
 
-	var nextUp []string
 	for _, t := range tasks {
+		batchID := taskBatchID(t)
+		progress := batches[batchID]
+		if progress == nil {
+			continue
+		}
 		id := int(t["id"].(float64))
 		if st, _ := t["status"].(string); st != StatusPending {
 			continue
 		}
 		ready := true
 		for _, edge := range edges {
-			if edge.To == id && !completed[edge.From] {
+			if edge.To == id && !progress.completed[edge.From] {
 				ready = false
 				break
 			}
 		}
 		if ready {
 			subject, _ := t["subject"].(string)
-			nextUp = append(nextUp, fmt.Sprintf("#%d: %s", id, subject))
+			progress.nextUp = append(progress.nextUp, fmt.Sprintf("#%d: %s", id, subject))
 		}
 	}
 
-	summary := fmt.Sprintf("<progress>%d/%d tasks completed", done, total)
-	if inProg > 0 {
-		summary += fmt.Sprintf(", %d in progress", inProg)
+	if len(batchOrder) == 0 {
+		return ""
 	}
-	if len(nextUp) > 0 {
-		summary += ". Next ready: " + strings.Join(nextUp, ", ")
-	} else if pending > 0 {
-		summary += ". Remaining tasks are blocked by dependencies."
-	} else {
-		summary += ". All tasks done!"
+	// Order by newest task so the tail of the list is what the session is
+	// working on now, which is what survives the cap below.
+	sort.Slice(batchOrder, func(i, j int) bool {
+		return batches[batchOrder[i]].newestTask < batches[batchOrder[j]].newestTask
+	})
+	currentBatch := batchOrder[len(batchOrder)-1]
+
+	var summaries []string
+	for _, batchID := range batchOrder {
+		progress := batches[batchID]
+		finished := progress.done == progress.total
+		// A finished batch is still worth reporting while it is the one in
+		// hand, so the model sees its plan close out.
+		if finished && batchID != currentBatch {
+			continue
+		}
+		label := displayBatchID(batchID)
+		if progress.sealed {
+			label += " (sealed)"
+		}
+		summary := fmt.Sprintf("%s: %d/%d tasks completed", label, progress.done, progress.total)
+		if progress.inProgress > 0 {
+			summary += fmt.Sprintf(", %d in progress", progress.inProgress)
+		}
+		switch {
+		case finished:
+			summary += ". All tasks done!"
+		case len(progress.nextUp) > 0:
+			summary += ". Next ready: " + strings.Join(progress.nextUp, ", ")
+		case progress.pending > 0:
+			summary += ". Remaining tasks are blocked by dependencies."
+		}
+		summaries = append(summaries, summary)
 	}
-	return summary + "</progress>"
+	if len(summaries) == 0 {
+		return ""
+	}
+	// batchOrder is oldest-first, so the tail holds what the session is
+	// actually working on. Older leftovers are counted rather than listed,
+	// otherwise every abandoned plan would grow the prompt forever.
+	header := "Task batches:"
+	if omitted := len(summaries) - maxReportedBatches; omitted > 0 {
+		summaries = summaries[omitted:]
+		header = fmt.Sprintf("Task batches (%d older unfinished batch(es) omitted, see task_dag):", omitted)
+	}
+	return "<task-batches>" + header + "\n" + strings.Join(summaries, "\n") + "</task-batches>"
 }
 
 func hasPath(edges []dagEdge, src, dst int) bool {

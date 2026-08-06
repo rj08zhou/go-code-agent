@@ -217,15 +217,16 @@ func (tm *TeammateManager) Spawn(ctx context.Context, name, role, taskPrompt str
 		lifetimeCtx = context.Background()
 	}
 	tm.wg.Add(1)
+	taskBatchID := task.NewBatchID("teammate-" + name)
 	go func() {
 		defer tm.wg.Done()
-		tm.autonomousLoop(lifetimeCtx, name, role, taskPrompt, lease.WorktreeDir)
+		tm.autonomousLoop(lifetimeCtx, name, role, taskPrompt, lease.WorktreeDir, taskBatchID)
 	}()
 	return fmt.Sprintf("Spawned '%s' (role: %s, workdir: %s)", name, role, lease.WorktreeDir)
 }
 
 // autonomousLoop runs a WORK → IDLE → WORK cycle within the assigned worktree.
-func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, taskPrompt, worktreePath string) {
+func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, taskPrompt, worktreePath, taskBatchID string) {
 	teamName := tm.config.TeamName
 
 	sys := prompt.Render(tm.promptLoader.MustLoad("teammate"), map[string]string{
@@ -238,7 +239,7 @@ func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, taskP
 	msgs := []llm.Message{llm.SystemMessage(sys), llm.UserMessage(taskPrompt)}
 
 	for {
-		if tm.workPhase(ctx, name, worktreePath, &msgs) == "shutdown" {
+		if tm.workPhase(ctx, name, worktreePath, taskBatchID, &msgs) == "shutdown" {
 			return
 		}
 		if !tm.idlePhase(name, role, teamName, &msgs) {
@@ -248,18 +249,24 @@ func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, taskP
 }
 
 // workPhase runs the inner agent loop within the isolated worktree. Returns "shutdown" or "idle".
-func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath string, msgs *[]llm.Message) string {
+func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath, taskBatchID string, msgs *[]llm.Message) string {
+	sourceWorkdir := ""
+	if tm.worktrees != nil {
+		sourceWorkdir = tm.worktrees.PrimaryWorkdir()
+	}
 	scope := &tool.ToolScope{
-		Role:        "teammate",
-		AgentID:     name,
-		Workdir:     worktreePath,
-		CanRead:     true,
-		CanWrite:    team.HasApprovedPlan(tm.protocols, name),
-		CanExecute:  true,
-		CanNetwork:  true,
-		CanTeam:     true,
-		CanMemory:   true,
-		DiffPreview: tm.diffPreview,
+		Role:          "teammate",
+		AgentID:       name,
+		Workdir:       worktreePath,
+		SourceWorkdir: sourceWorkdir,
+		TaskBatch:     tool.NewTaskBatch(taskBatchID),
+		CanRead:       true,
+		CanWrite:      team.HasApprovedPlan(tm.protocols, name),
+		CanExecute:    true,
+		CanNetwork:    true,
+		CanTeam:       true,
+		CanMemory:     true,
+		DiffPreview:   tm.diffPreview,
 	}
 	executor := tm.newExecutor()
 

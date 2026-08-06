@@ -139,7 +139,7 @@ Teammates submit plans via `send_message` before writes; approve/reject with `pl
 
 ## Task Management
 Use task IDs returned by `task_create` (or call `task_list` if unsure). `task_update` changes status only, not subject/description.
-Flow: plan (`task_create` + deps) → review (`task_dag` / `task_ready`) → execute in DAG order, updating status as you go. Use `load_skill` for specialized knowledge.
+Flow: plan (`task_create` + deps) → review (`task_dag` / `task_ready`) → execute in DAG order, updating status as you go. Tasks group into one DAG batch per request: follow-up turns extend the batch you started, and a finished batch is replaced automatically. When the user switches to an unrelated request while tasks are still open, pass `new_plan` to `task_create`. Use `load_skill` for specialized knowledge.
 
 ## Reflection
 After tool calls, check whether the result matches your expectation. If the same approach fails twice, change strategy. Verify quality before marking a task done.

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"go-code-agent/internal/config"
-	"go-code-agent/internal/security"
 )
 
 func filesystemReadTools(d builtinDeps) []ToolDefinition {
@@ -43,7 +42,7 @@ func filesystemReadTools(d builtinDeps) []ToolDefinition {
 			if a.Offset == 0 && a.Limit == 0 {
 				a.Limit = config.ReadFileDefaultLimit
 			}
-			fp, err := security.SecurePath(scope.Workdir, a.Path, false)
+			fp, err := resolveFSPath(scope, a.Path, false)
 			if err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
@@ -111,7 +110,7 @@ func filesystemReadTools(d builtinDeps) []ToolDefinition {
 			}
 			dir := scope.Workdir
 			if a.Path != "" {
-				resolved, err := security.SecurePath(dir, a.Path, false)
+				resolved, err := resolveFSPath(scope, a.Path, false)
 				if err != nil {
 					return Failed(fmt.Sprintf("%v", err))
 				}
@@ -170,7 +169,7 @@ func filesystemReadTools(d builtinDeps) []ToolDefinition {
 			}
 			root := scope.Workdir
 			if a.Path != "" {
-				resolved, err := security.SecurePath(root, a.Path, false)
+				resolved, err := resolveFSPath(scope, a.Path, false)
 				if err != nil {
 					return Failed(fmt.Sprintf("%v", err))
 				}
@@ -246,7 +245,7 @@ func filesystemReadTools(d builtinDeps) []ToolDefinition {
 			}
 			root := scope.Workdir
 			if a.Path != "" {
-				resolved, err := security.SecurePath(root, a.Path, false)
+				resolved, err := resolveFSPath(scope, a.Path, false)
 				if err != nil {
 					return Failed(fmt.Sprintf("%v", err))
 				}

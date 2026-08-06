@@ -98,6 +98,56 @@ func SecurePath(root, rel string, allowWrite bool) (string, error) {
 	return clean, nil
 }
 
+// MapPathIntoWorkdir rewrites an absolute path under sourceRoot to the
+// equivalent path under workdir. This lets worktree-isolated agents accept
+// host-repo absolute paths that appear in lead prompts without escaping the
+// sandbox. Relative paths, empty roots, and paths outside sourceRoot are
+// returned unchanged (SecurePath still enforces the workdir boundary).
+func MapPathIntoWorkdir(workdir, sourceRoot, path string) string {
+	if workdir == "" || sourceRoot == "" || path == "" || !filepath.IsAbs(path) {
+		return path
+	}
+	srcAbs, err := filepath.Abs(sourceRoot)
+	if err != nil {
+		return path
+	}
+	wdAbs, err := filepath.Abs(workdir)
+	if err != nil {
+		return path
+	}
+	if srcAbs == wdAbs {
+		return path
+	}
+
+	srcCmp := srcAbs
+	if resolved, err := filepath.EvalSymlinks(srcAbs); err == nil {
+		srcCmp = resolved
+	}
+	pathAbs := filepath.Clean(path)
+	pathCmp := pathAbs
+	if resolved, err := filepath.EvalSymlinks(pathAbs); err == nil {
+		pathCmp = resolved
+	}
+
+	rel, err := filepath.Rel(srcCmp, pathCmp)
+	if err != nil || !isLocalRel(rel) {
+		rel, err = filepath.Rel(srcAbs, pathAbs)
+		if err != nil || !isLocalRel(rel) {
+			return path
+		}
+	}
+	return filepath.Join(wdAbs, rel)
+}
+
+func isLocalRel(rel string) bool {
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// SecurePathMapped is SecurePath after MapPathIntoWorkdir remapping.
+func SecurePathMapped(workdir, sourceRoot, path string, allowWrite bool) (string, error) {
+	return SecurePath(workdir, MapPathIntoWorkdir(workdir, sourceRoot, path), allowWrite)
+}
+
 func pathWithinRoot(path, root string) bool {
 	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
 }

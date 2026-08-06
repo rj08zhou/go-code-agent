@@ -23,15 +23,16 @@ func NewPlanGate(pl *prompt.Loader, ts *task.Service) *PlanGate {
 
 // Eval returns a nudge message to inject and a policy action for observability
 // ("" / "" if nothing). Called by the runner every turn with the latest
-// state snapshot.
-func (g *PlanGate) Eval(toolRounds int, planEstablished bool, originalTask string) (nudge, action string) {
+// state snapshot. taskBatchID scopes the DAG check to the batch this request
+// is building, so tasks left over from earlier requests never trip it.
+func (g *PlanGate) Eval(toolRounds int, planEstablished bool, originalTask, taskBatchID string) (nudge, action string) {
 	// --- Phase 1: round-0 planning nudge ---
 	if toolRounds == 0 && needsPlan(originalTask, planEstablished) {
 		return g.promptLoader.MustLoad("planning_required"), "require_plan"
 	}
 
 	// --- Phase 2: round-1 DAG nudge ---
-	if msg := g.checkDAGDependency(toolRounds); msg != "" {
+	if msg := g.checkDAGDependency(toolRounds, taskBatchID); msg != "" {
 		return msg, "require_dag_edges"
 	}
 	return "", ""
@@ -92,15 +93,16 @@ func isReadOnlyShellCall(toolName string, definition tool.ToolDefinition, argume
 	return security.ClassifyCommand(command).Verdict == security.VerdictSafe
 }
 
-func (g *PlanGate) checkDAGDependency(toolRounds int) string {
+func (g *PlanGate) checkDAGDependency(toolRounds int, taskBatchID string) string {
 	if toolRounds != 1 {
 		return ""
 	}
-	if g.taskSvc == nil {
+	// An empty batch means this run created no tasks, so there is no DAG of
+	// its own to complain about.
+	if g.taskSvc == nil || taskBatchID == "" {
 		return ""
 	}
-	taskCount := g.taskSvc.TaskCount()
-	edgeCount := g.taskSvc.EdgeCount()
+	taskCount, edgeCount := g.taskSvc.BatchCounts(taskBatchID)
 	if taskCount > 1 && edgeCount == 0 {
 		return prompt.Render(g.promptLoader.MustLoad("dag_required"), map[string]string{
 			"count": fmt.Sprintf("%d", taskCount),
