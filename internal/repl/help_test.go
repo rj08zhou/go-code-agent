@@ -59,7 +59,7 @@ func TestHandleApprovalRequiresConfirmationForAllAuto(t *testing.T) {
 	if mode := effectiveApprovalMode(r.built); mode != "all-auto" {
 		t.Fatalf("confirmed mode = %q, want all-auto", mode)
 	}
-	if r.built.Security.Approval.ShouldPreviewDiff() {
+	if r.built.Security.Approval.ShouldShowDiffUI() {
 		t.Fatal("all-auto should skip diff previews")
 	}
 }
@@ -93,7 +93,7 @@ func TestHandleApprovalCanonicalModes(t *testing.T) {
 func newApprovalTestLoop() *Loop {
 	hitl := hitlaudit.NewHITLManager(nil)
 	hitl.SetEnabled(true)
-	hitl.SetMode(hitlaudit.HITLModeSafeOnly)
+	hitl.SetMode(hitlaudit.HITLModeSafeAuto)
 	approval := security.NewApprovalState()
 	approval.ApplyPreset("safe-auto")
 	return &Loop{built: &application.BuiltRunner{Security: application.SecurityFacade{

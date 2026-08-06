@@ -61,20 +61,20 @@ type DecisionLogger interface {
 	Record(tool, action, reason string, round int)
 }
 
-// PreviewApprovalChecker can display a mutation preview as part of approval.
-type PreviewApprovalChecker interface {
-	AllowToolWithPreview(toolName string, args json.RawMessage, preview string) (bool, string)
+// DiffTextApprovalChecker can attach rendered diff text to an approval decision.
+type DiffTextApprovalChecker interface {
+	AllowToolWithDiffText(toolName string, args json.RawMessage, diffText string) (bool, string)
 }
 
 // DetailedApprovalChecker preserves HITL's allow/reject/modify decision and
 // returns any approved replacement content with the same invocation result.
 type DetailedApprovalChecker interface {
-	DecideTool(toolName string, args json.RawMessage, preview ApprovalPreview) ApprovalResult
+	DecideTool(toolName string, args json.RawMessage, approvalInput MutationApprovalInput) ApprovalResult
 }
 
-type ApprovalPreview struct {
-	Text     string
-	Mutation *PreviewRequest
+type MutationApprovalInput struct {
+	DiffText string
+	Plan     *MutationPlan
 }
 
 type ApprovalResult struct {
@@ -99,12 +99,12 @@ type preparedCall struct {
 	args    json.RawMessage
 }
 
-// authorizedCall is a preparedCall that has passed capability, path, preview,
-// approval, and network gates. ReplacementContent, when set, overrides the
-// mutation body approved for the handler.
+// authorizedCall is a preparedCall that has passed capability, path, mutation
+// planning, approval, and network gates. ReplacementContent, when set, overrides
+// the mutation body approved for the handler.
 type authorizedCall struct {
 	preparedCall
-	preview            ApprovalPreview
+	approvalInput      MutationApprovalInput
 	replacementContent *string
 }
 
@@ -196,12 +196,12 @@ func (e *Executor) authorizeExecution(scope *ToolScope, tc llm.ToolCall, prepare
 		return authorizedCall{}, early, false
 	}
 
-	preview, early, ok := e.preparePreview(scope, def, args)
+	approvalInput, early, ok := e.planMutation(scope, def, args)
 	if !ok {
 		return authorizedCall{}, early, false
 	}
 
-	replacement, early, ok := e.decideApproval(scope, tc.Name, args, preview)
+	replacement, early, ok := e.decideApproval(scope, tc.Name, args, approvalInput)
 	if !ok {
 		return authorizedCall{}, early, false
 	}
@@ -212,7 +212,7 @@ func (e *Executor) authorizeExecution(scope *ToolScope, tc llm.ToolCall, prepare
 
 	return authorizedCall{
 		preparedCall:       prepared,
-		preview:            preview,
+		approvalInput:      approvalInput,
 		replacementContent: replacement,
 	}, Result{}, true
 }
@@ -246,15 +246,15 @@ func (e *Executor) checkAllowedRoots(scope *ToolScope, def ToolDefinition, args 
 	return Result{}, true
 }
 
-func (e *Executor) preparePreview(scope *ToolScope, def ToolDefinition, args json.RawMessage) (ApprovalPreview, Result, bool) {
-	preview := ApprovalPreview{}
-	if def.Preview != nil && scope.DiffPreview == nil {
-		return ApprovalPreview{}, Denied("mutation preview service is required for this tool"), false
+func (e *Executor) planMutation(scope *ToolScope, def ToolDefinition, args json.RawMessage) (MutationApprovalInput, Result, bool) {
+	approvalInput := MutationApprovalInput{}
+	if def.PlanMutation != nil && scope.DiffPreview == nil {
+		return MutationApprovalInput{}, Denied("diff renderer is required for mutating tools"), false
 	}
-	if def.Preview != nil && scope.DiffPreview != nil {
-		req, err := def.Preview(scope, args)
+	if def.PlanMutation != nil && scope.DiffPreview != nil {
+		req, err := def.PlanMutation(scope, args)
 		if err != nil {
-			return ApprovalPreview{}, Denied(fmt.Sprintf("cannot create mutation preview: %v", err)), false
+			return MutationApprovalInput{}, Denied(fmt.Sprintf("cannot plan mutation: %v", err)), false
 		}
 		text, err := scope.DiffPreview.PreviewChange(
 			req.Path,
@@ -262,19 +262,19 @@ func (e *Executor) preparePreview(scope *ToolScope, def ToolDefinition, args jso
 			req.Content,
 		)
 		if err != nil {
-			return ApprovalPreview{}, Denied(fmt.Sprintf("cannot create mutation preview: %v", err)), false
+			return MutationApprovalInput{}, Denied(fmt.Sprintf("cannot render mutation diff: %v", err)), false
 		}
-		preview.Text = text
-		preview.Mutation = &req
+		approvalInput.DiffText = text
+		approvalInput.Plan = &req
 	}
-	return preview, Result{}, true
+	return approvalInput, Result{}, true
 }
 
-func (e *Executor) decideApproval(scope *ToolScope, name string, args json.RawMessage, preview ApprovalPreview) (*string, Result, bool) {
+func (e *Executor) decideApproval(scope *ToolScope, name string, args json.RawMessage, approvalInput MutationApprovalInput) (*string, Result, bool) {
 	var replacementContent *string
 	if e.approval != nil {
 		if detailed, ok := e.approval.(DetailedApprovalChecker); ok {
-			approvalResult := detailed.DecideTool(name, args, preview)
+			approvalResult := detailed.DecideTool(name, args, approvalInput)
 			switch approvalResult.Decision {
 			case ApprovalRejected:
 				return nil, Rejected(approvalResult.Reason), false
@@ -282,13 +282,13 @@ func (e *Executor) decideApproval(scope *ToolScope, name string, args json.RawMe
 				return nil, Modified(approvalResult.Feedback), false
 			}
 			if approvalResult.ReplacementContent != nil {
-				if preview.Mutation == nil || preview.Mutation.Delete {
+				if approvalInput.Plan == nil || approvalInput.Plan.Delete {
 					return nil, Denied("approval returned replacement content for a non-write mutation"), false
 				}
 				replacementContent = approvalResult.ReplacementContent
 			}
-		} else if checker, ok := e.approval.(PreviewApprovalChecker); ok {
-			if allowed, reason := checker.AllowToolWithPreview(name, args, preview.Text); !allowed {
+		} else if checker, ok := e.approval.(DiffTextApprovalChecker); ok {
+			if allowed, reason := checker.AllowToolWithDiffText(name, args, approvalInput.DiffText); !allowed {
 				return nil, Rejected(reason), false
 			}
 		} else if allowed, reason := e.approval.AllowTool(name, args); !allowed {
@@ -338,8 +338,8 @@ func (e *Executor) invokeExecution(ctx context.Context, scope *ToolScope, tc llm
 	resultCh := make(chan Result, 1)
 	handlerScope := *scope
 	handlerScope.Context = callCtx
-	if call.preview.Mutation != nil {
-		request := *call.preview.Mutation
+	if call.approvalInput.Plan != nil {
+		request := *call.approvalInput.Plan
 		request.OriginalContent = append([]byte(nil), request.OriginalContent...)
 		request.Content = append([]byte(nil), request.Content...)
 		if call.replacementContent != nil {

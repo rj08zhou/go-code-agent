@@ -110,15 +110,6 @@ func IsReadOnlyBash(cmd string) bool {
 
 // ---------- Approval ----------
 
-type ApprovalLevel int
-
-const (
-	ApproveAuto    ApprovalLevel = iota // no user input needed
-	ApproveSafe                         // safe writes, always allow if auto-approve-safe
-	ApproveDanger                       // potentially destructive, requires confirmation
-	ApproveBlocked                      // never allowed
-)
-
 // ApprovalState is the session's auto-approve posture for tool risk levels.
 // It answers "may this risk class run without prompting?" and whether
 // file-mutation diff previews should be shown. Distinct from HITLManager,
@@ -154,11 +145,11 @@ func (s *ApprovalState) IsAutoApproveSafe() bool {
 	return s.autoApproveSafe
 }
 
-// ShouldPreviewDiff reports whether file mutation previews should be shown.
-// Diff preview is skipped only when the user has opted into full auto-approve.
-func (s *ApprovalState) ShouldPreviewDiff() bool { return !s.IsAutoApproveAll() }
+// ShouldShowDiffUI reports whether the interactive mutation diff UI should open.
+// It is false only under full auto-approve (all-auto).
+func (s *ApprovalState) ShouldShowDiffUI() bool { return !s.IsAutoApproveAll() }
 
-// ApplyPreset sets the auto-approval and diff-preview posture. Legacy preset
+// ApplyPreset sets the auto-approval and diff-UI posture. Legacy preset
 // names remain accepted for compatibility with stored/internal callers.
 func (s *ApprovalState) ApplyPreset(preset string) {
 	switch strings.ToLower(strings.TrimSpace(preset)) {
@@ -174,33 +165,9 @@ func (s *ApprovalState) ApplyPreset(preset string) {
 	}
 }
 
-func (s *ApprovalState) Decide(level ApprovalLevel, desc string) (allowed bool, reason string) {
-	switch level {
-	case ApproveAuto:
-		return true, ""
-	case ApproveSafe:
-		if s.IsAutoApproveAll() || s.IsAutoApproveSafe() {
-			return true, ""
-		}
-		return false, fmt.Sprintf("[safe] %s requires approval. Use /approval safe-auto to auto-approve lower-risk reviews.", desc)
-	case ApproveDanger:
-		if s.IsAutoApproveAll() {
-			return true, ""
-		}
-		return false, fmt.Sprintf("[DANGER] %s requires confirmation. Use /approval all-auto confirm to bypass prompts (risky!).", desc)
-	case ApproveBlocked:
-		return false, fmt.Sprintf("BLOCKED: %s is not permitted", desc)
-	default:
-		return false, fmt.Sprintf("unknown approval level for %q", desc)
-	}
-}
-
 // ---------- Bash Policy ----------
 
-const (
-	MCPToolPrefix   = "mcp__"
-	MCPDefaultLevel = ApproveSafe
-)
+const MCPToolPrefix = "mcp__"
 
 // allowedCommands is the whitelist of permitted base commands.
 var allowedCommands = map[string]bool{

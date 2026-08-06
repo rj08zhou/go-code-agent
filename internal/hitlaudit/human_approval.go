@@ -33,7 +33,7 @@ const (
 	HITLModeAutoApprove
 	HITLModeAutoReject
 	HITLModeNotifyOnly
-	HITLModeSafeOnly
+	HITLModeSafeAuto
 )
 
 func (m HITLMode) String() string {
@@ -46,26 +46,48 @@ func (m HITLMode) String() string {
 		return "auto-reject"
 	case HITLModeNotifyOnly:
 		return "notify-only"
-	case HITLModeSafeOnly:
-		return "safe-only"
+	case HITLModeSafeAuto:
+		return "safe-auto"
 	default:
 		return "unknown"
 	}
 }
 
+// ReviewSeverity is the HITL review risk class used by SafeAuto and console
+// labels. high and danger both require a prompt under SafeAuto; medium is for
+// ordinary file mutations routed to the general panel in auto-reject/notify.
+type ReviewSeverity string
+
+const (
+	SeverityNone   ReviewSeverity = ""
+	SeverityLow    ReviewSeverity = "low"
+	SeverityMedium ReviewSeverity = "medium"
+	SeverityHigh   ReviewSeverity = "high"
+	SeverityDanger ReviewSeverity = "danger"
+)
+
+func (s ReviewSeverity) String() string { return string(s) }
+
+// RequiresPromptInSafeAuto reports whether SafeAuto must open the interactive
+// panel instead of auto-approving.
+func (s ReviewSeverity) RequiresPromptInSafeAuto() bool {
+	return s == SeverityHigh || s == SeverityDanger
+}
+
 type HITLRequest struct {
 	ToolName  string
 	Arguments string
-	RiskLevel string
+	Severity  ReviewSeverity
 	Reason    string
 	SessionID string
 }
 
 type HITLManager struct {
-	enabled                bool
-	mode                   HITLMode
-	nonTTYFallback         HITLDecision
-	toolsRequiringReview   map[string]bool
+	enabled        bool
+	mode           HITLMode
+	nonTTYFallback HITLDecision
+	// alwaysReviewTools always need HITL when enabled (independent of args).
+	alwaysReviewTools      map[string]bool
 	criticalPathSubstrings []string
 	console                security.InteractiveIO
 	mu                     sync.RWMutex
@@ -87,8 +109,8 @@ func NewHITLManager(pl *prompt.Loader, consoles ...security.InteractiveIO) *HITL
 		nonTTYFallback: fallback,
 		console:        console,
 		promptLoader:   pl,
-		toolsRequiringReview: map[string]bool{
-			"delete_file": true, "bash": true, "execute_command": true, "background_run": true,
+		alwaysReviewTools: map[string]bool{
+			"delete_file": true,
 		},
 		criticalPathSubstrings: []string{
 			".env", ".env.local", ".env.production", "credentials", "secrets",
@@ -103,48 +125,74 @@ func (h *HITLManager) IsEnabled() bool    { h.mu.RLock(); defer h.mu.RUnlock(); 
 func (h *HITLManager) SetMode(m HITLMode) { h.mu.Lock(); defer h.mu.Unlock(); h.mode = m }
 func (h *HITLManager) Mode() HITLMode     { h.mu.RLock(); defer h.mu.RUnlock(); return h.mode }
 
-func (h *HITLManager) NeedsReview(toolName, arguments string) (bool, string, string) {
+func (h *HITLManager) NeedsReview(toolName, arguments string) (bool, ReviewSeverity, string) {
 	if !h.IsEnabled() {
-		return false, "", ""
+		return false, SeverityNone, ""
 	}
-	return h.classifyReview(toolName, arguments)
+	r := h.classifyReview(toolName, arguments)
+	return r.needsReview, r.severity, r.reason
 }
 
 // classifyReview evaluates intrinsic review requirements without re-reading
 // the enabled flag, so callers that already froze a policy snapshot stay
 // consistent for the rest of DecideTool.
-func (h *HITLManager) classifyReview(toolName, arguments string) (bool, string, string) {
+func (h *HITLManager) classifyReview(toolName, arguments string) reviewRequirement {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	isShellTool := toolName == "bash" || toolName == "execute_command" || toolName == "background_run"
-
-	if isShellTool && h.toolsRequiringReview[toolName] {
+	// Shell tools are classified per-command; IsShellTool is the sole gate
+	// (no separate commandClassifiedTools map — bash/execute_command/background_run).
+	if security.IsShellTool(toolName) {
 		// Risk classification is delegated to the single source of truth in
 		// the security package; HITL only maps verdicts to review decisions.
+		// An unparseable or absent command classifies as VerdictDeny, so this
+		// path fails closed. Every branch sets commandClassified so the static
+		// tool RiskDanger cannot overwrite this per-call judgement.
+		//
+		// Caution maps to SeverityHigh (not Medium) so SafeAuto still prompts —
+		// that mode only blocks on high/danger. The labels high and danger
+		// are otherwise equivalent for RequestApproval behaviour.
 		c := security.ClassifyCommand(extractBashCommand(arguments))
 		switch c.Verdict {
 		case security.VerdictDeny, security.VerdictDanger:
-			return true, "high", c.Reason
+			return reviewRequirement{
+				needsReview: true, severity: SeverityHigh, reason: c.Reason,
+				commandClassified: true,
+			}
 		case security.VerdictSafe:
-			return false, "low", c.Reason
+			return reviewRequirement{
+				severity: SeverityLow, reason: c.Reason, commandClassified: true,
+			}
 		default: // VerdictCaution
-			return true, "medium", fmt.Sprintf("shell execution via '%s' requires review: %s", toolName, c.Reason)
+			return reviewRequirement{
+				needsReview:       true,
+				severity:          SeverityHigh,
+				reason:            fmt.Sprintf("shell execution via '%s' requires review: %s", toolName, c.Reason),
+				commandClassified: true,
+			}
 		}
 	}
 
-	if h.toolsRequiringReview[toolName] {
-		return true, "high", fmt.Sprintf("tool '%s' is always reviewed", toolName)
+	if h.alwaysReviewTools[toolName] {
+		return reviewRequirement{
+			needsReview: true,
+			severity:    SeverityHigh,
+			reason:      fmt.Sprintf("tool '%s' is always reviewed", toolName),
+		}
 	}
 
 	if toolName == "write_file" || toolName == "edit_file" || toolName == "delete_file" {
 		if p := extractPathArg(arguments); p != "" {
 			if sub := h.matchCriticalPath(p); sub != "" {
-				return true, "high", fmt.Sprintf("target path '%s' matches critical substring '%s'", p, sub)
+				return reviewRequirement{
+					needsReview: true,
+					severity:    SeverityHigh,
+					reason:      fmt.Sprintf("target path '%s' matches critical substring '%s'", p, sub),
+				}
 			}
 		}
 	}
-	return false, "", ""
+	return reviewRequirement{}
 }
 
 func (h *HITLManager) matchCriticalPath(path string) string {
@@ -167,9 +215,9 @@ func (h *HITLManager) RequestApproval(req HITLRequest) HITLResponse {
 		h.printReviewHeader(req)
 		h.console.WriteInteractive("[hitl] auto-approved\n")
 		return HITLResponse{Decision: HITLApprove}
-	case HITLModeSafeOnly:
+	case HITLModeSafeAuto:
 		// Auto-approve safe requests; the interactive panel fully renders risky ones.
-		if strings.EqualFold(req.RiskLevel, "danger") || strings.EqualFold(req.RiskLevel, "high") {
+		if req.Severity.RequiresPromptInSafeAuto() {
 			return h.promptInteractive(req)
 		}
 		h.printReviewHeader(req)
@@ -177,7 +225,7 @@ func (h *HITLManager) RequestApproval(req HITLRequest) HITLResponse {
 		return HITLResponse{Decision: HITLApprove}
 	case HITLModeAutoReject:
 		h.printReviewHeader(req)
-		h.console.WriteInteractive(fmt.Sprintf("[hitl] auto-rejected (%s)\n", req.RiskLevel))
+		h.console.WriteInteractive(fmt.Sprintf("[hitl] auto-rejected (%s)\n", req.Severity))
 		return HITLResponse{Decision: HITLReject}
 	case HITLModeNotifyOnly:
 		h.printReviewHeader(req)
@@ -191,12 +239,12 @@ func (h *HITLManager) RequestApproval(req HITLRequest) HITLResponse {
 func (h *HITLManager) printReviewHeader(req HITLRequest) {
 	h.console.WriteInteractive("\n")
 	h.console.WriteInteractive(fmt.Sprintf("[hitl] reviewing %s", req.ToolName))
-	if req.RiskLevel != "" {
-		h.console.WriteInteractive(fmt.Sprintf(" [%s]", req.RiskLevel))
+	if req.Severity != SeverityNone {
+		h.console.WriteInteractive(fmt.Sprintf(" [%s]", req.Severity))
 	}
 	h.console.WriteInteractive("\n")
 	if req.Reason != "" {
-		// Reason already contains the diff preview appended by DecideTool.
+		// Reason may already include rendered diff text appended by DecideTool.
 		h.console.WriteInteractive(req.Reason + "\n")
 	}
 }
@@ -216,7 +264,7 @@ func (h *HITLManager) promptInteractive(req HITLRequest) HITLResponse {
 	h.console.WriteInteractive("HUMAN APPROVAL REQUIRED\n")
 	h.console.WriteInteractive(divider + utils.Reset + "\n")
 	h.console.WriteInteractive(fmt.Sprintf("  Tool       : %s%s%s\n", utils.BoldYellow, req.ToolName, utils.Reset))
-	h.console.WriteInteractive(fmt.Sprintf("  Risk level : %s\n", req.RiskLevel))
+	h.console.WriteInteractive(fmt.Sprintf("  Risk level : %s\n", req.Severity))
 	if req.Reason != "" {
 		h.console.WriteInteractive(fmt.Sprintf("  Reason     : %s\n", req.Reason))
 	}

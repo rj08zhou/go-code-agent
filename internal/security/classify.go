@@ -47,6 +47,19 @@ type Classification struct {
 	Reason  string
 }
 
+// IsShellTool reports whether a tool's primary argument is a shell command
+// string. Such tools carry a worst-case static risk level (bash can delete a
+// repository), so callers must judge the individual invocation with
+// ClassifyCommand instead of the tool's declared RiskLevel.
+func IsShellTool(toolName string) bool {
+	switch toolName {
+	case "bash", "execute_command", "background_run":
+		return true
+	default:
+		return false
+	}
+}
+
 // sensitiveEnvVars are environment variables whose assignment as a command
 // prefix can change what code the command executes (library injection,
 // interpreter startup files, lookup-path hijack). Assignments of these are
@@ -178,6 +191,9 @@ func allSegmentsReadOnly(segments []string) bool {
 }
 
 func isReadOnlySegment(seg string) bool {
+	if segmentWritesFile(seg) {
+		return false
+	}
 	tokens := tokenizeShellWords(seg)
 	// Env prefixes were already vetted for sensitive vars by the caller;
 	// plain assignments (GOOS=linux go build) don't affect read-only-ness.
@@ -210,6 +226,35 @@ func isReadOnlySegment(seg string) bool {
 		}
 		if match {
 			return true
+		}
+	}
+	return false
+}
+
+// segmentWritesFile reports whether a segment redirects output into a file.
+// Otherwise read-only commands become writes this way ("go build > out.txt"),
+// which the base-command whitelist alone cannot see. Discarding to /dev/null
+// creates nothing, and ">&N" duplicates a descriptor rather than opening a
+// file, so neither counts.
+func segmentWritesFile(seg string) bool {
+	cleaned := devNullOutputRedirectRegexp.ReplaceAllString(seg, "$1")
+	var quote byte
+	for i := 0; i < len(cleaned); i++ {
+		c := cleaned[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '\'', c == '"':
+			quote = c
+		case c == '\\':
+			i++
+		case c == '>':
+			target := strings.TrimSpace(strings.TrimLeft(cleaned[i+1:], ">"))
+			if !strings.HasPrefix(target, "&") {
+				return true
+			}
 		}
 	}
 	return false

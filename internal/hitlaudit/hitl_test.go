@@ -114,7 +114,7 @@ func TestHITLApprovalAdapter_UsesDefinitionRiskForMCP(t *testing.T) {
 	t.Setenv("HITL_NON_TTY_FALLBACK", "")
 	mgr, adapter := newNonTTYAdapter(t)
 	mgr.SetEnabled(true)
-	mgr.SetMode(HITLModeSafeOnly)
+	mgr.SetMode(HITLModeSafeAuto)
 
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{{
@@ -182,6 +182,57 @@ func TestHITLApprovalAdapter_NeedsReviewForDanger(t *testing.T) {
 	}
 }
 
+func TestHITLApprovalAdapter_ShellClassificationNotOverwrittenByRiskDanger(t *testing.T) {
+	mgr, adapter := newNonTTYAdapter(t)
+	mgr.SetEnabled(true)
+	mgr.SetMode(HITLModeInteractive)
+
+	catalog := tool.NewToolCatalog()
+	catalog.RegisterAll([]tool.ToolDefinition{{
+		Name: "bash", RiskLevel: tool.RiskDanger, Effects: tool.Effects(tool.EffectExecuteProcess),
+		Handler: func(*tool.ToolScope, json.RawMessage) tool.Result { return tool.Succeeded("ok") },
+	}})
+	adapter.SetCatalog(catalog)
+
+	for _, tc := range []struct {
+		name       string
+		command    string
+		wantAllow  bool
+		wantReason string
+	}{
+		{name: "safe", command: "ls -la", wantAllow: true},
+		{
+			name: "caution", command: "mkdir tmp", wantAllow: false,
+			wantReason: "shell execution via 'bash' requires review",
+		},
+		{
+			name: "danger", command: "rm foo.txt", wantAllow: false,
+			wantReason: "command matches a potentially dangerous pattern",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := adapter.DecideTool(
+				"bash",
+				json.RawMessage(fmt.Sprintf(`{"command":%q}`, tc.command)),
+				tool.MutationApprovalInput{},
+			)
+			allowed := result.Decision == tool.ApprovalAllowed
+			if allowed != tc.wantAllow {
+				t.Fatalf("allowed = %v, want %v (decision=%v reason=%q)",
+					allowed, tc.wantAllow, result.Decision, result.Reason)
+			}
+			if tc.wantReason != "" {
+				if !strings.Contains(result.Reason, tc.wantReason) {
+					t.Fatalf("reason = %q, want substring %q", result.Reason, tc.wantReason)
+				}
+				if strings.Contains(result.Reason, "tool is classified as dangerous") {
+					t.Fatalf("static RiskDanger overwrote command reason: %q", result.Reason)
+				}
+			}
+		})
+	}
+}
+
 func TestHITLApprovalAdapter_AllowsWhenDisabled(t *testing.T) {
 	mgr := NewHITLManager(nil)
 	mgr.SetEnabled(false)
@@ -223,9 +274,9 @@ func TestNonInteractiveModesDoNotOpenDiffReview(t *testing.T) {
 			result := adapter.DecideTool(
 				"write_file",
 				json.RawMessage(`{"path":"ordinary.txt","content":"new"}`),
-				tool.ApprovalPreview{
-					Text: "diff preview",
-					Mutation: &tool.PreviewRequest{
+				tool.MutationApprovalInput{
+					DiffText: "diff preview",
+					Plan: &tool.MutationPlan{
 						Path: "ordinary.txt", Content: []byte("new"),
 					},
 				},
@@ -245,9 +296,9 @@ func TestFileReviewUsesWholeOperationForCreateAndDelete(t *testing.T) {
 		result := adapter.DecideTool(
 			"write_file",
 			json.RawMessage(`{"path":"new.txt","content":"first\nsecond\n"}`),
-			tool.ApprovalPreview{
-				Text: "--- original/new.txt\n+++ modified/new.txt\n@@ -0,0 +1 @@\n+first\n@@ -0,0 +2 @@\n+second\n",
-				Mutation: &tool.PreviewRequest{
+			tool.MutationApprovalInput{
+				DiffText: "--- original/new.txt\n+++ modified/new.txt\n@@ -0,0 +1 @@\n+first\n@@ -0,0 +2 @@\n+second\n",
+				Plan: &tool.MutationPlan{
 					Path: "new.txt", Content: []byte(content), Existed: false,
 				},
 			},
@@ -267,9 +318,9 @@ func TestFileReviewUsesWholeOperationForCreateAndDelete(t *testing.T) {
 		result := adapter.DecideTool(
 			"delete_file",
 			json.RawMessage(`{"path":"old.txt"}`),
-			tool.ApprovalPreview{
-				Text: "--- original/old.txt\n+++ modified/old.txt\n@@ -1 +0,0 @@\n-old\n",
-				Mutation: &tool.PreviewRequest{
+			tool.MutationApprovalInput{
+				DiffText: "--- original/old.txt\n+++ modified/old.txt\n@@ -1 +0,0 @@\n-old\n",
+				Plan: &tool.MutationPlan{
 					Path: "old.txt", OriginalContent: []byte("old\n"), Existed: true, Delete: true,
 				},
 			},
@@ -286,15 +337,15 @@ func TestFileReviewUsesWholeOperationForCreateAndDelete(t *testing.T) {
 		name     string
 		toolName string
 		answer   string
-		request  tool.PreviewRequest
+		request  tool.MutationPlan
 	}{
 		{
 			name: "empty create", toolName: "write_file", answer: "a",
-			request: tool.PreviewRequest{Path: "empty.txt"},
+			request: tool.MutationPlan{Path: "empty.txt"},
 		},
 		{
 			name: "empty delete", toolName: "delete_file", answer: "d",
-			request: tool.PreviewRequest{Path: "empty.txt", Existed: true, Delete: true},
+			request: tool.MutationPlan{Path: "empty.txt", Existed: true, Delete: true},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -302,7 +353,7 @@ func TestFileReviewUsesWholeOperationForCreateAndDelete(t *testing.T) {
 			result := newInteractiveApprovalAdapter(term).DecideTool(
 				tc.toolName,
 				json.RawMessage(`{"path":"empty.txt","content":""}`),
-				tool.ApprovalPreview{Mutation: &tc.request},
+				tool.MutationApprovalInput{Plan: &tc.request},
 			)
 			if result.Decision != tool.ApprovalAllowed {
 				t.Fatalf("empty-file result = %#v", result)
@@ -331,9 +382,9 @@ func TestExistingFileReviewSupportsPartialAndAllApproval(t *testing.T) {
 		result := adapter.DecideTool(
 			"edit_file",
 			json.RawMessage(`{"path":"file.txt","old_text":"old","new_text":"new","replace_all":true}`),
-			tool.ApprovalPreview{
-				Text: diff,
-				Mutation: &tool.PreviewRequest{
+			tool.MutationApprovalInput{
+				DiffText: diff,
+				Plan: &tool.MutationPlan{
 					Path:            "file.txt",
 					OriginalContent: []byte(original),
 					Content:         []byte(proposed),
@@ -357,9 +408,9 @@ func TestExistingFileReviewSupportsPartialAndAllApproval(t *testing.T) {
 		result := adapter.DecideTool(
 			"insert_file",
 			json.RawMessage(`{"path":"file.txt","insert_at":1,"content":"unused"}`),
-			tool.ApprovalPreview{
-				Text: diff,
-				Mutation: &tool.PreviewRequest{
+			tool.MutationApprovalInput{
+				DiffText: diff,
+				Plan: &tool.MutationPlan{
 					Path:            "file.txt",
 					OriginalContent: []byte(original),
 					Content:         []byte(proposed),
@@ -407,9 +458,9 @@ func TestConcurrentFileReviewsAreSerializedAndKeepOwnContent(t *testing.T) {
 			result := adapter.DecideTool(
 				"write_file",
 				json.RawMessage(fmt.Sprintf(`{"path":"file-%d.txt","content":%q}`, index, content)),
-				tool.ApprovalPreview{
-					Text: fmt.Sprintf("--- original/file-%d.txt\n+++ modified/file-%d.txt\n@@ -0,0 +1 @@\n+%s\n", index, index, content),
-					Mutation: &tool.PreviewRequest{
+				tool.MutationApprovalInput{
+					DiffText: fmt.Sprintf("--- original/file-%d.txt\n+++ modified/file-%d.txt\n@@ -0,0 +1 @@\n+%s\n", index, index, content),
+					Plan: &tool.MutationPlan{
 						Path: fmt.Sprintf("file-%d.txt", index), Content: []byte(content),
 					},
 				},
@@ -475,7 +526,11 @@ func existingFileDiff(t *testing.T, original, proposed string) string {
 	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	diff, err := security.NewDiffPreview(dir).Preview("file.txt", []byte(proposed))
+	diff, err := security.NewDiffPreview(dir).PreviewChange(
+		"file.txt",
+		[]byte(original),
+		[]byte(proposed),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,12 +563,30 @@ func TestNeedsReview_SafeCommand(t *testing.T) {
 func TestNeedsReview_DangerousCommand(t *testing.T) {
 	mgr := NewHITLManager(nil)
 	mgr.SetEnabled(true)
-	needs, risk, _ := mgr.NeedsReview("bash", `{"command":"rm -rf /var/tmp"}`)
+	needs, risk, reason := mgr.NeedsReview("bash", `{"command":"rm -rf /var/tmp"}`)
 	if !needs {
 		t.Error("rm -rf should need review")
 	}
-	if risk == "" {
-		t.Error("risk level should not be empty")
+	if risk != SeverityHigh {
+		t.Fatalf("risk = %q, want high", risk)
+	}
+	if reason == "" || strings.Contains(reason, "tool is classified as dangerous") {
+		t.Fatalf("reason should keep command-level detail, got %q", reason)
+	}
+}
+
+func TestNeedsReview_CautionCommand(t *testing.T) {
+	mgr := NewHITLManager(nil)
+	mgr.SetEnabled(true)
+	needs, risk, reason := mgr.NeedsReview("bash", `{"command":"mkdir tmp"}`)
+	if !needs {
+		t.Fatal("mkdir should need review")
+	}
+	if risk != SeverityHigh {
+		t.Fatalf("risk = %q, want SeverityHigh so SafeAuto still prompts", risk)
+	}
+	if !strings.Contains(reason, "shell execution") {
+		t.Fatalf("reason = %q", reason)
 	}
 }
 

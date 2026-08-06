@@ -13,7 +13,7 @@ import (
 // mapping below.
 var approvalModeToHITL = map[string]hitlaudit.HITLMode{
 	"manual":      hitlaudit.HITLModeInteractive,
-	"safe-auto":   hitlaudit.HITLModeSafeOnly,
+	"safe-auto":   hitlaudit.HITLModeSafeAuto,
 	"all-auto":    hitlaudit.HITLModeAutoApprove,
 	"reject":      hitlaudit.HITLModeAutoReject,
 	"notify-only": hitlaudit.HITLModeNotifyOnly,
@@ -29,7 +29,7 @@ func effectiveApprovalMode(b *application.BuiltRunner) string {
 	switch b.Security.HITL.Mode() {
 	case hitlaudit.HITLModeInteractive:
 		return "manual"
-	case hitlaudit.HITLModeSafeOnly:
+	case hitlaudit.HITLModeSafeAuto:
 		return "safe-auto"
 	case hitlaudit.HITLModeAutoApprove:
 		return "all-auto"
@@ -49,7 +49,7 @@ func (r *Loop) handleApproval(parts []string) string {
 	if len(parts) == 1 {
 		mode := effectiveApprovalMode(r.built)
 		preview := "skipped"
-		if (mode == "manual" || mode == "safe-auto") && r.built.Security.Approval.ShouldPreviewDiff() {
+		if (mode == "manual" || mode == "safe-auto") && r.built.Security.Approval.ShouldShowDiffUI() {
 			preview = "enabled"
 		}
 		return fmt.Sprintf("Approval mode: %s\nDiff preview: %s", mode, preview)

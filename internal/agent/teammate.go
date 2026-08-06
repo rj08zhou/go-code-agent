@@ -66,7 +66,8 @@ type TeammateManager struct {
 	wg        sync.WaitGroup
 }
 
-// SetDiffPreview makes teammate file mutations go through the same preview gate as lead mutations.
+// SetDiffPreview wires the shared diff renderer so teammate file mutations
+// produce the same DiffText as lead mutations before HITL.
 func (tm *TeammateManager) SetDiffPreview(preview tool.DiffPreview) { tm.diffPreview = preview }
 
 // SetApproval wires the session HITL adapter so teammate tools are gated
@@ -340,7 +341,7 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 				tm.eventSink.Emit(event.Event{Type: event.ToolStarted, TraceID: traceID, AgentID: name, ToolCallID: tc.ID, ToolName: tc.Name, Payload: toolPayload})
 			}
 			// Gate file mutations and process execution by plan approval.
-			if requiresApprovedPlan(executor, tc.Name) && !team.HasApprovedPlan(tm.protocols, name) {
+			if requiresApprovedPlan(executor, tc.Name, tc.Arguments) && !team.HasApprovedPlan(tm.protocols, name) {
 				*msgs = append(*msgs, llm.ToolMessage(
 					"[DENIED] submit_plan approval required before file mutations or process execution", tc.ID))
 				continue
@@ -497,8 +498,8 @@ func (tm *TeammateManager) ShutdownAll() {
 	}
 }
 
-func requiresApprovedPlan(executor *tool.Executor, name string) bool {
+func requiresApprovedPlan(executor *tool.Executor, name, arguments string) bool {
 	definition, known := executor.Definition(name)
-	_, blocked := unplannedToolBlock(definition, known)
+	_, blocked := unplannedToolBlock(name, definition, known, arguments)
 	return blocked
 }

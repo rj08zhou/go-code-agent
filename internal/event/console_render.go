@@ -12,7 +12,7 @@ import (
 func decisionLabel(et EventType) string {
 	switch et {
 	case PlanningDecision:
-		return "planning"
+		return "policy"
 	case ContextDecision:
 		return "context"
 	case TurnComplete:
@@ -71,6 +71,24 @@ func renderConsoleEvent(e Event) string {
 	if e.Type == ModelRetry {
 		mp, _ := e.Payload.(map[string]string)
 		fmt.Fprintf(&out, "%s[retry]%s %s\n", utils.BoldYellow, utils.Reset, mp["summary"])
+		return out.String()
+	}
+
+	// PlanningDecision is a local policy gate (nudge / block), not model
+	// "thinking". Always label it [policy] and surface a short action summary.
+	if e.Type == PlanningDecision {
+		mp, _ := e.Payload.(map[string]string)
+		fmt.Fprintf(&out, "%s[policy]%s %s", utils.BoldMagenta, utils.Reset, policyPlanningSummary(mp, e))
+		if e.AgentID != "" && e.AgentID != "lead" {
+			fmt.Fprintf(&out, " agent=%s", e.AgentID)
+		}
+		if e.Status != "" {
+			fmt.Fprintf(&out, " status=%s", e.Status)
+		}
+		if e.Error != "" {
+			fmt.Fprintf(&out, " %serror=%s%s", utils.Red, consoleLine(e.Error), utils.Reset)
+		}
+		out.WriteByte('\n')
 		return out.String()
 	}
 
@@ -134,7 +152,7 @@ func renderConsoleEvent(e Event) string {
 			if isTaskStateTool(e.ToolName) {
 				preview, total = consoleFullToolOutput(e.Output)
 			} else {
-				preview, total = consoleToolPreview(e.ToolName, e.Output, 8)
+				preview, total = consoleMutationPlanner(e.ToolName, e.Output, 8)
 				previewOmitted = total - len(preview)
 			}
 			fmt.Fprintf(&out, " %s=%d", label, total)
@@ -190,6 +208,33 @@ func renderConsoleEvent(e Event) string {
 	return out.String()
 }
 
+func policyPlanningSummary(mp map[string]string, e Event) string {
+	action := ""
+	if mp != nil {
+		action = mp["action"]
+	}
+	switch action {
+	case "require_plan":
+		return "plan required"
+	case "require_dag_edges":
+		return "dag edges required"
+	case "block_unplanned_side_effect":
+		parts := []string{"blocked unplanned side effect"}
+		if e.ToolName != "" {
+			parts = append(parts, e.ToolName)
+		}
+		if c := mp["classification"]; c != "" {
+			parts = append(parts, c)
+		}
+		return strings.Join(parts, " ")
+	default:
+		if action != "" {
+			return action
+		}
+		return "planning"
+	}
+}
+
 func consoleLine(text string) string {
 	return utils.Truncate(consoleText(strings.Join(strings.Fields(text), " ")), 240)
 }
@@ -237,7 +282,7 @@ func consoleFullToolOutput(text string) ([]string, int) {
 	return output, len(lines)
 }
 
-func consoleToolPreview(toolName, text string, maxLines int) ([]string, int) {
+func consoleMutationPlanner(toolName, text string, maxLines int) ([]string, int) {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" ||
 		(toolName == "search_file" && trimmed == "No files matched.") ||

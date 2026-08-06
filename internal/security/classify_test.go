@@ -24,6 +24,9 @@ func TestClassifyCommand(t *testing.T) {
 		{"sed in-place is danger not caution", "sed 's/a/b/' f.txt", VerdictCaution},
 		{"mixed pipeline", "cat f | tee out.txt", VerdictCaution},
 		{"npm install", "npm install", VerdictCaution},
+		{"relative output redirect", "go build ./... > out.txt", VerdictCaution},
+		{"relative append redirect", "grep foo . >> hits.txt", VerdictCaution},
+		{"redirect inside pipeline", "ls | grep go > names.txt", VerdictCaution},
 
 		// --- danger: confirmable destructive ---
 		{"rm file", "rm foo.txt", VerdictDanger},
@@ -115,5 +118,24 @@ func TestIsReadOnlyBash(t *testing.T) {
 	}
 	if IsReadOnlyBash("LD_PRELOAD=/tmp/e.so ls") {
 		t.Error("sensitive env override must not be read-only")
+	}
+	if IsReadOnlyBash("git diff HEAD > patch.diff") {
+		t.Error("redirecting output into a file must not be read-only")
+	}
+	if !IsReadOnlyBash("git diff HEAD 2>&1") {
+		t.Error("descriptor duplication is not a file write")
+	}
+}
+
+func TestIsShellTool(t *testing.T) {
+	for _, name := range []string{"bash", "execute_command", "background_run"} {
+		if !IsShellTool(name) {
+			t.Errorf("%s should be a shell tool", name)
+		}
+	}
+	for _, name := range []string{"read_file", "write_file", "mcp__demo__exec", ""} {
+		if IsShellTool(name) {
+			t.Errorf("%s should not be a shell tool", name)
+		}
 	}
 }

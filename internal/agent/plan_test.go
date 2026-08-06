@@ -37,9 +37,15 @@ func TestPlanGateUsesDerivedPlanningState(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := gate.Eval(tc.round, tc.planEstablished, tc.task)
+			got, action := gate.Eval(tc.round, tc.planEstablished, tc.task)
 			if tc.wantPrompt != strings.Contains(got, "<planning-required>") {
 				t.Fatalf("Eval() = %q, wantPrompt = %v", got, tc.wantPrompt)
+			}
+			if tc.wantPrompt && action != "require_plan" {
+				t.Fatalf("action = %q, want require_plan", action)
+			}
+			if !tc.wantPrompt && action != "" {
+				t.Fatalf("action = %q, want empty", action)
 			}
 		})
 	}

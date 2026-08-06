@@ -7,10 +7,10 @@ import (
 	"go-code-agent/internal/tool"
 )
 
-func TestDecideApprovalPlanBehaviorMatrix(t *testing.T) {
-	ordinaryMutation := tool.ApprovalPreview{
-		Text: "diff preview",
-		Mutation: &tool.PreviewRequest{
+func TestDecideApprovalDecisionBehaviorMatrix(t *testing.T) {
+	ordinaryMutation := tool.MutationApprovalInput{
+		DiffText: "diff preview",
+		Plan: &tool.MutationPlan{
 			Path: "ordinary.txt", Content: []byte("new"),
 		},
 	}
@@ -19,6 +19,11 @@ func TestDecideApprovalPlanBehaviorMatrix(t *testing.T) {
 		RiskLevel: tool.RiskDanger,
 		Effects:   tool.Effects(tool.EffectNetworkAccess),
 	}
+	bashDef := tool.ToolDefinition{
+		Name:      "bash",
+		RiskLevel: tool.RiskDanger,
+		Effects:   tool.Effects(tool.EffectExecuteProcess),
+	}
 	safeDef := tool.ToolDefinition{
 		Name:      "mcp__demo__read",
 		RiskLevel: tool.RiskAuto,
@@ -26,210 +31,269 @@ func TestDecideApprovalPlanBehaviorMatrix(t *testing.T) {
 	}
 
 	tests := []struct {
-		name            string
-		toolName        string
-		args            string
-		preview         tool.ApprovalPreview
-		snap            approvalPolicySnapshot
-		permissionLevel string
-		earlyReject     bool
-		needsReview     bool
-		riskLevel       string
-		reviewReason    string
-		definition      tool.ToolDefinition
-		hasDefinition   bool
-		want            approvalPlanKind
-		wantRisk        string
+		name              string
+		toolName          string
+		args              string
+		approvalInput     tool.MutationApprovalInput
+		snap              approvalPolicySnapshot
+		permissionLevel   string
+		earlyReject       bool
+		needsReview       bool
+		severity          ReviewSeverity
+		reviewReason      string
+		commandClassified bool
+		definition        tool.ToolDefinition
+		hasDefinition     bool
+		want              approvalDecisionKind
+		wantSeverity      ReviewSeverity
 	}{
 		{
 			name:     "disabled allows dangerous bash without review",
 			toolName: "bash",
 			args:     `{"command":"rm -rf /"}`,
-			snap:     approvalPolicySnapshot{enabled: false, mode: HITLModeInteractive, previewDiff: true},
-			want:     planAllow,
+			snap:     approvalPolicySnapshot{enabled: false, mode: HITLModeInteractive, showDiffUI: true},
+			want:     decisionAllow,
 		},
 		{
 			name:            "confirm permission rejects when HITL disabled",
 			toolName:        "mcp__demo__read",
 			args:            `{}`,
-			snap:            approvalPolicySnapshot{enabled: false, mode: HITLModeInteractive, previewDiff: true},
+			snap:            approvalPolicySnapshot{enabled: false, mode: HITLModeInteractive, showDiffUI: true},
 			permissionLevel: "confirm",
 			earlyReject:     true,
-			want:            planReject,
+			want:            decisionReject,
 		},
 		{
 			name:            "block permission rejects even when HITL enabled",
 			toolName:        "mcp__demo__write",
 			args:            `{}`,
-			snap:            approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, previewDiff: true},
+			snap:            approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, showDiffUI: true},
 			permissionLevel: "block",
 			earlyReject:     true,
-			want:            planReject,
+			want:            decisionReject,
 		},
 		{
-			name:     "interactive mutation opens diff review",
-			toolName: "write_file",
-			args:     `{"path":"ordinary.txt","content":"new"}`,
-			preview:  ordinaryMutation,
-			snap:     approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, previewDiff: true},
-			want:     planPromptMutation,
+			name:          "interactive mutation opens diff review",
+			toolName:      "write_file",
+			args:          `{"path":"ordinary.txt","content":"new"}`,
+			approvalInput: ordinaryMutation,
+			snap:          approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, showDiffUI: true},
+			want:          decisionPromptMutation,
 		},
 		{
-			name:     "safe-only mutation opens diff review",
-			toolName: "write_file",
-			args:     `{"path":"ordinary.txt","content":"new"}`,
-			preview:  ordinaryMutation,
-			snap:     approvalPolicySnapshot{enabled: true, mode: HITLModeSafeOnly, previewDiff: true},
-			want:     planPromptMutation,
+			name:          "safe-auto mutation opens diff review",
+			toolName:      "write_file",
+			args:          `{"path":"ordinary.txt","content":"new"}`,
+			approvalInput: ordinaryMutation,
+			snap:          approvalPolicySnapshot{enabled: true, mode: HITLModeSafeAuto, showDiffUI: true},
+			want:          decisionPromptMutation,
 		},
 		{
-			name:     "auto-approve ordinary mutation is silent allow",
-			toolName: "write_file",
-			args:     `{"path":"ordinary.txt","content":"new"}`,
-			preview:  ordinaryMutation,
-			snap:     approvalPolicySnapshot{enabled: true, mode: HITLModeAutoApprove, previewDiff: false},
-			want:     planAllow,
+			name:          "auto-approve ordinary mutation is silent allow",
+			toolName:      "write_file",
+			args:          `{"path":"ordinary.txt","content":"new"}`,
+			approvalInput: ordinaryMutation,
+			snap:          approvalPolicySnapshot{enabled: true, mode: HITLModeAutoApprove, showDiffUI: false},
+			want:          decisionAllow,
 		},
 		{
-			name:     "auto-reject ordinary mutation becomes general prompt",
-			toolName: "write_file",
-			args:     `{"path":"ordinary.txt","content":"new"}`,
-			preview:  ordinaryMutation,
-			snap:     approvalPolicySnapshot{enabled: true, mode: HITLModeAutoReject, previewDiff: true},
-			want:     planPromptGeneral,
-			wantRisk: "medium",
+			name:          "auto-reject ordinary mutation becomes general prompt",
+			toolName:      "write_file",
+			args:          `{"path":"ordinary.txt","content":"new"}`,
+			approvalInput: ordinaryMutation,
+			snap:          approvalPolicySnapshot{enabled: true, mode: HITLModeAutoReject, showDiffUI: true},
+			want:          decisionPromptGeneral,
+			wantSeverity:  SeverityMedium,
 		},
 		{
-			name:     "notify-only ordinary mutation becomes general prompt",
-			toolName: "write_file",
-			args:     `{"path":"ordinary.txt","content":"new"}`,
-			preview:  ordinaryMutation,
-			snap:     approvalPolicySnapshot{enabled: true, mode: HITLModeNotifyOnly, previewDiff: true},
-			want:     planPromptGeneral,
-			wantRisk: "medium",
+			name:          "notify-only ordinary mutation becomes general prompt",
+			toolName:      "write_file",
+			args:          `{"path":"ordinary.txt","content":"new"}`,
+			approvalInput: ordinaryMutation,
+			snap:          approvalPolicySnapshot{enabled: true, mode: HITLModeNotifyOnly, showDiffUI: true},
+			want:          decisionPromptGeneral,
+			wantSeverity:  SeverityMedium,
 		},
 		{
 			name:         "interactive dangerous shell becomes general prompt",
 			toolName:     "bash",
 			args:         `{"command":"rm -rf /"}`,
-			snap:         approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, previewDiff: true},
+			snap:         approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, showDiffUI: true},
 			needsReview:  true,
-			riskLevel:    "high",
+			severity:     SeverityHigh,
 			reviewReason: "dangerous",
-			want:         planPromptGeneral,
-			wantRisk:     "high",
+			want:         decisionPromptGeneral,
+			wantSeverity: SeverityHigh,
 		},
 		{
-			name:          "safe-only dangerous MCP definition becomes general prompt",
+			name:              "read-only shell command is not re-escalated by bash RiskDanger",
+			toolName:          "bash",
+			args:              `{"command":"ls -la"}`,
+			snap:              approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, showDiffUI: true},
+			severity:          SeverityLow,
+			reviewReason:      "read-only/inspection-only",
+			commandClassified: true,
+			definition:        bashDef,
+			hasDefinition:     true,
+			want:              decisionAllow,
+		},
+		{
+			name:              "permission confirm outranks a classified shell command",
+			toolName:          "bash",
+			args:              `{"command":"ls -la"}`,
+			snap:              approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, showDiffUI: true},
+			permissionLevel:   "confirm",
+			severity:          SeverityLow,
+			commandClassified: true,
+			definition:        bashDef,
+			hasDefinition:     true,
+			want:              decisionPromptGeneral,
+			wantSeverity:      SeverityHigh,
+		},
+		{
+			name:              "classified caution shell keeps command risk, not bash RiskDanger",
+			toolName:          "bash",
+			args:              `{"command":"mkdir tmp"}`,
+			snap:              approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, showDiffUI: true},
+			needsReview:       true,
+			severity:          SeverityHigh,
+			reviewReason:      "shell execution via 'bash' requires review: command has side effects; no dangerous pattern matched",
+			commandClassified: true,
+			definition:        bashDef,
+			hasDefinition:     true,
+			want:              decisionPromptGeneral,
+			wantSeverity:      SeverityHigh,
+		},
+		{
+			name:              "classified danger shell keeps command reason, not bash RiskDanger",
+			toolName:          "bash",
+			args:              `{"command":"rm foo.txt"}`,
+			snap:              approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, showDiffUI: true},
+			needsReview:       true,
+			severity:          SeverityHigh,
+			reviewReason:      "command matches a potentially dangerous pattern",
+			commandClassified: true,
+			definition:        bashDef,
+			hasDefinition:     true,
+			want:              decisionPromptGeneral,
+			wantSeverity:      SeverityHigh,
+		},
+		{
+			name:          "safe-auto dangerous MCP definition becomes general prompt",
 			toolName:      "mcp__demo__delete_user",
 			args:          `{"id":"42"}`,
-			snap:          approvalPolicySnapshot{enabled: true, mode: HITLModeSafeOnly, previewDiff: true},
+			snap:          approvalPolicySnapshot{enabled: true, mode: HITLModeSafeAuto, showDiffUI: true},
 			definition:    dangerDef,
 			hasDefinition: true,
-			want:          planPromptGeneral,
-			wantRisk:      "danger",
+			want:          decisionPromptGeneral,
+			wantSeverity:  SeverityDanger,
 		},
 		{
 			name:            "permission allow suppresses definition risk",
 			toolName:        "mcp__demo__delete_user",
 			args:            `{"id":"42"}`,
-			snap:            approvalPolicySnapshot{enabled: true, mode: HITLModeSafeOnly, previewDiff: true},
+			snap:            approvalPolicySnapshot{enabled: true, mode: HITLModeSafeAuto, showDiffUI: true},
 			permissionLevel: "allow",
 			definition:      dangerDef,
 			hasDefinition:   true,
-			want:            planAllow,
+			want:            decisionAllow,
 		},
 		{
 			name:            "permission allow does not suppress NeedsReview",
 			toolName:        "bash",
 			args:            `{"command":"rm -rf /"}`,
-			snap:            approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, previewDiff: true},
+			snap:            approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, showDiffUI: true},
 			permissionLevel: "allow",
 			needsReview:     true,
-			riskLevel:       "high",
+			severity:        SeverityHigh,
 			reviewReason:    "dangerous",
-			want:            planPromptGeneral,
-			wantRisk:        "high",
+			want:            decisionPromptGeneral,
+			wantSeverity:    SeverityHigh,
 		},
 		{
 			name:            "permission confirm forces general prompt for safe tool",
 			toolName:        "mcp__demo__read",
 			args:            `{}`,
-			snap:            approvalPolicySnapshot{enabled: true, mode: HITLModeAutoReject, previewDiff: true},
+			snap:            approvalPolicySnapshot{enabled: true, mode: HITLModeAutoReject, showDiffUI: true},
 			permissionLevel: "confirm",
 			definition:      safeDef,
 			hasDefinition:   true,
-			want:            planPromptGeneral,
-			wantRisk:        "high",
+			want:            decisionPromptGeneral,
+			wantSeverity:    SeverityHigh,
 		},
 		{
-			name:     "interactive mutation without previewDiff falls through to allow",
-			toolName: "write_file",
-			args:     `{"path":"ordinary.txt","content":"new"}`,
-			preview:  ordinaryMutation,
-			snap:     approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, previewDiff: false},
-			want:     planAllow,
+			name:          "interactive mutation without showDiffUI falls through to allow",
+			toolName:      "write_file",
+			args:          `{"path":"ordinary.txt","content":"new"}`,
+			approvalInput: ordinaryMutation,
+			snap:          approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, showDiffUI: false},
+			want:          decisionAllow,
 		},
 		{
 			name:     "unchanged mutation content does not require review",
 			toolName: "edit_file",
 			args:     `{"path":"same.txt"}`,
-			preview: tool.ApprovalPreview{
-				Mutation: &tool.PreviewRequest{
+			approvalInput: tool.MutationApprovalInput{
+				Plan: &tool.MutationPlan{
 					Path: "same.txt", OriginalContent: []byte("x"), Content: []byte("x"), Existed: true,
 				},
 			},
-			snap: approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, previewDiff: true},
-			want: planAllow,
+			snap: approvalPolicySnapshot{enabled: true, mode: HITLModeInteractive, showDiffUI: true},
+			want: decisionAllow,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var early *approvalPlan
+			var early *approvalDecision
 			if tc.earlyReject {
-				_, early = permissionRejectPlan(tc.permissionLevel, tc.snap.enabled, tc.toolName)
+				_, early = permissionRejectDecision(tc.permissionLevel, tc.snap.enabled, tc.toolName)
 				if early == nil {
-					t.Fatal("expected early reject plan")
+					t.Fatal("expected early reject decision")
 				}
 			}
 			review := resolveReviewRequirement(
-				tc.needsReview, tc.riskLevel, tc.reviewReason,
+				reviewRequirement{
+					needsReview:       tc.needsReview,
+					severity:          tc.severity,
+					reason:            tc.reviewReason,
+					commandClassified: tc.commandClassified,
+				},
 				tc.permissionLevel, tc.snap, tc.definition, tc.hasDefinition,
 			)
-			plan := decideApprovalPlan(
+			decision := decideApprovalDecision(
 				tc.toolName,
 				json.RawMessage(tc.args),
-				tc.preview,
+				tc.approvalInput,
 				tc.snap,
 				tc.permissionLevel,
 				early,
 				review,
 			)
-			if plan.kind != tc.want {
-				t.Fatalf("plan kind = %v, want %v", plan.kind, tc.want)
+			if decision.kind != tc.want {
+				t.Fatalf("decision kind = %v, want %v", decision.kind, tc.want)
 			}
-			if tc.want == planPromptGeneral && tc.wantRisk != "" && plan.general.RiskLevel != tc.wantRisk {
-				t.Fatalf("general risk = %q, want %q", plan.general.RiskLevel, tc.wantRisk)
+			if tc.want == decisionPromptGeneral && tc.wantSeverity != "" && decision.general.Severity != tc.wantSeverity {
+				t.Fatalf("general severity = %q, want %q", decision.general.Severity, tc.wantSeverity)
 			}
 		})
 	}
 }
 
 func TestPermissionRejectPlan(t *testing.T) {
-	_, reject := permissionRejectPlan("block", true, "bash")
-	if reject == nil || reject.kind != planReject {
+	_, reject := permissionRejectDecision("block", true, "bash")
+	if reject == nil || reject.kind != decisionReject {
 		t.Fatalf("block plan = %#v", reject)
 	}
-	_, reject = permissionRejectPlan("confirm", false, "bash")
-	if reject == nil || reject.kind != planReject {
+	_, reject = permissionRejectDecision("confirm", false, "bash")
+	if reject == nil || reject.kind != decisionReject {
 		t.Fatalf("confirm+disabled plan = %#v", reject)
 	}
-	level, reject := permissionRejectPlan("confirm", true, "bash")
+	level, reject := permissionRejectDecision("confirm", true, "bash")
 	if level != "confirm" || reject != nil {
 		t.Fatalf("confirm+enabled = (%q, %#v)", level, reject)
 	}
-	level, reject = permissionRejectPlan("allow", true, "bash")
+	level, reject = permissionRejectDecision("allow", true, "bash")
 	if level != "allow" || reject != nil {
 		t.Fatalf("allow = (%q, %#v)", level, reject)
 	}

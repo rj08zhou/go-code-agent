@@ -63,8 +63,8 @@ type TeamProtocolService interface {
 	ReviewPlan(requestID string, approve bool, feedback string) string
 }
 
-// DiffPreview generates a preview from the exact content captured for a
-// mutating file operation.
+// DiffPreview renders a unified diff from content already captured for a
+// mutating file operation. It does not plan the mutation or prompt the user.
 type DiffPreview interface {
 	PreviewChange(path string, oldContent, newContent []byte) (string, error)
 }

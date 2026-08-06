@@ -129,19 +129,22 @@ const (
 
 // ToolDefinition is a complete, self-contained tool spec.
 type ToolDefinition struct {
-	Name           string
-	Description    string
-	Schema         json.RawMessage
-	Handler        ToolHandler
-	Preview        ToolPreview
+	Name        string
+	Description string
+	Schema      json.RawMessage
+	Handler     ToolHandler
+	// PlanMutation computes the would-be filesystem result without writing.
+	// Distinct from DiffPreview (renders unified diff text) and from HITL's
+	// interactive diff UI (PreviewAndConfirm).
+	PlanMutation   MutationPlanner
 	RiskLevel      RiskLevel
 	Effects        EffectSet
 	Timeout        time.Duration
 	SnapshotPolicy SnapshotPolicy
 }
 
-// PreviewRequest describes a proposed filesystem mutation before it is applied.
-type PreviewRequest struct {
+// MutationPlan describes a proposed filesystem mutation before it is applied.
+type MutationPlan struct {
 	Path            string
 	OriginalContent []byte
 	Content         []byte
@@ -149,8 +152,8 @@ type PreviewRequest struct {
 	Delete          bool
 }
 
-// ToolPreview computes a mutation preview without changing the filesystem.
-type ToolPreview func(scope *ToolScope, args json.RawMessage) (PreviewRequest, error)
+// MutationPlanner computes the planned file contents without writing them.
+type MutationPlanner func(scope *ToolScope, args json.RawMessage) (MutationPlan, error)
 
 // HasEffect checks if this tool definition includes the given effect.
 func (td ToolDefinition) HasEffect(e Effect) bool {
@@ -213,7 +216,7 @@ type ToolScope struct {
 
 	// Set only by Executor after preview and approval. Model-provided arguments
 	// cannot populate this per-invocation mutation plan.
-	approvedMutation *PreviewRequest
+	approvedMutation *MutationPlan
 }
 
 // ApprovalChecker is the interface for tool approval decisions.
