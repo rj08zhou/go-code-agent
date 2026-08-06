@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"go-code-agent/internal/config"
@@ -32,6 +33,9 @@ func shellTools(d builtinDeps) []ToolDefinition {
 			}
 			if e := parseJSON(args, &a); e != "" {
 				return Failed(e)
+			}
+			if reason := hostRepoEscape(scope, a.Command); reason != "" {
+				return Denied("bash blocked: " + reason)
 			}
 			// d.perms is captured from session wiring (may be nil); hard policy
 			// still applies. Reload updates the same *Permissions in place.
@@ -87,6 +91,9 @@ func shellTools(d builtinDeps) []ToolDefinition {
 			if e := parseJSON(args, &a); e != "" {
 				return Failed(e)
 			}
+			if reason := hostRepoEscape(scope, a.Command); reason != "" {
+				return Denied("background command blocked: " + reason)
+			}
 			bashPolicy := security.NewDefaultBashPolicy()
 			allowed, needConfirm, reason := bashPolicy.Validate(a.Command, d.perms)
 			if !allowed {
@@ -128,6 +135,24 @@ func shellTools(d builtinDeps) []ToolDefinition {
 	})
 
 	return defs
+}
+
+// hostRepoEscape rejects a command that reaches back into the host repo while
+// the agent is confined to a worktree. The file tools remap such paths into the
+// worktree, but a shell command runs verbatim: without this the same path would
+// read and write the real repo, quietly undoing the isolation.
+func hostRepoEscape(scope *ToolScope, command string) string {
+	if scope == nil || scope.SourceWorkdir == "" || scope.Workdir == "" {
+		return ""
+	}
+	root := filepath.Clean(scope.SourceWorkdir)
+	if root == filepath.Clean(scope.Workdir) || !strings.Contains(command, root) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%s is the host repo, but this agent works in the worktree %s. "+
+			"Use paths relative to the worktree root instead.",
+		root, scope.Workdir)
 }
 
 // truncateBashOutput caps command output with a head/tail window. Unlike

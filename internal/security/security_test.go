@@ -320,6 +320,65 @@ func TestSecurePathRejectsAbsolutePathOutsideWorkdir(t *testing.T) {
 	}
 }
 
+func TestMapPathIntoWorkdirRemapsHostAbsolute(t *testing.T) {
+	host := t.TempDir()
+	wt := t.TempDir()
+	hostFile := filepath.Join(host, "internal", "agent", "runner.go")
+	if err := os.MkdirAll(filepath.Dir(hostFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hostFile, []byte("host"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wtFile := filepath.Join(wt, "internal", "agent", "runner.go")
+	if err := os.MkdirAll(filepath.Dir(wtFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wtFile, []byte("worktree"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mapped := MapPathIntoWorkdir(wt, host, hostFile)
+	want, _ := filepath.Abs(wtFile)
+	if mapped != want {
+		t.Fatalf("mapped = %q, want %q", mapped, want)
+	}
+	got, err := SecurePathMapped(wt, host, hostFile, false)
+	if err != nil {
+		t.Fatalf("SecurePathMapped: %v", err)
+	}
+	if got != want {
+		t.Fatalf("SecurePathMapped = %q, want %q", got, want)
+	}
+	data, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "worktree" {
+		t.Fatalf("read remapped file = %q, want worktree content", data)
+	}
+}
+
+func TestMapPathIntoWorkdirLeavesOutsideUntouched(t *testing.T) {
+	host := t.TempDir()
+	wt := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if MapPathIntoWorkdir(wt, host, outside) != outside {
+		t.Fatal("outside host paths must not be remapped")
+	}
+	if _, err := SecurePathMapped(wt, host, outside, false); err == nil {
+		t.Fatal("expected escapes workdir for outside absolute path")
+	}
+}
+
+func TestMapPathIntoWorkdirRelativeUnchanged(t *testing.T) {
+	host := t.TempDir()
+	wt := t.TempDir()
+	if got := MapPathIntoWorkdir(wt, host, "internal/agent/runner.go"); got != "internal/agent/runner.go" {
+		t.Fatalf("relative path changed: %q", got)
+	}
+}
+
 // Regression: when the target file does not exist and allowWrite=true,
 // SecurePath must still resolve symlinks in the parent directory chain.
 // Without this, a symlinked parent directory can be used to escape the

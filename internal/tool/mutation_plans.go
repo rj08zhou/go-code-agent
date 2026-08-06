@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-
-	"go-code-agent/internal/security"
 )
 
 func planWriteMutation(scope *ToolScope, args json.RawMessage) (MutationPlan, error) {
@@ -17,7 +15,7 @@ func planWriteMutation(scope *ToolScope, args json.RawMessage) (MutationPlan, er
 	if a.Path == "" {
 		return MutationPlan{}, fmt.Errorf("path is required")
 	}
-	fp, err := security.SecurePath(scope.Workdir, a.Path, true)
+	fp, err := resolveFSPath(scope, a.Path, true)
 	if err != nil {
 		return MutationPlan{}, err
 	}
@@ -44,7 +42,7 @@ func planEditMutation(scope *ToolScope, args json.RawMessage) (MutationPlan, err
 	if err := json.Unmarshal(args, &a); err != nil {
 		return MutationPlan{}, err
 	}
-	fp, err := security.SecurePath(scope.Workdir, a.Path, true)
+	fp, err := resolveFSPath(scope, a.Path, true)
 	if err != nil {
 		return MutationPlan{}, err
 	}
@@ -76,7 +74,7 @@ func planInsertMutation(scope *ToolScope, args json.RawMessage) (MutationPlan, e
 	if err := json.Unmarshal(args, &a); err != nil {
 		return MutationPlan{}, err
 	}
-	fp, err := security.SecurePath(scope.Workdir, a.Path, true)
+	fp, err := resolveFSPath(scope, a.Path, true)
 	if err != nil {
 		return MutationPlan{}, err
 	}
@@ -99,7 +97,7 @@ func planDeleteMutation(scope *ToolScope, args json.RawMessage) (MutationPlan, e
 	if err := json.Unmarshal(args, &a); err != nil {
 		return MutationPlan{}, err
 	}
-	fp, err := security.SecurePath(scope.Workdir, a.Path, true)
+	fp, err := resolveFSPath(scope, a.Path, true)
 	if err != nil {
 		return MutationPlan{}, err
 	}

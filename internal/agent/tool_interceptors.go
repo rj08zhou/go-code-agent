@@ -204,9 +204,7 @@ type turnFlagsInterceptor struct {
 	postExploreNudge string
 }
 
-func (i turnFlagsInterceptor) Before(*toolCallEnv, llm.ToolCall) beforeResult {
-	return beforeResult{}
-}
+func (i turnFlagsInterceptor) Before(*toolCallEnv, llm.ToolCall) beforeResult { return beforeResult{} }
 
 func (i turnFlagsInterceptor) After(env *toolCallEnv, tc llm.ToolCall, result tool.Result) afterResult {
 	var out afterResult

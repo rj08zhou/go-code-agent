@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go-code-agent/internal/config"
-	"go-code-agent/internal/llm"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"go-code-agent/internal/config"
+	"go-code-agent/internal/llm"
+	"go-code-agent/internal/security"
 )
 
 // It owns the ToolCatalog and runs every tool through
@@ -416,6 +418,7 @@ func pathAllowed(scope *ToolScope, raw string) bool {
 	if scope.Workdir == "" {
 		return false
 	}
+	raw = security.MapPathIntoWorkdir(scope.Workdir, scope.SourceWorkdir, raw)
 	// Match SecurePath: absolute inputs must not be Join'd onto workdir
 	// (Go 1.25+ Join keeps both sides: Join("/wd", "/Users/x") → "/wd/Users/x").
 	var candidate string

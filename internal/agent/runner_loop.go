@@ -233,7 +233,7 @@ func (r *Runner) prepareRound(
 	// --- Planning gate (round 0 & 1 only) ---
 	if r.planGate != nil && r.turn.rounds <= 1 {
 		if planMsg, action := r.planGate.Eval(
-			r.turn.rounds, r.turn.planning.PlanEstablished, r.turn.originalTask,
+			r.turn.rounds, r.turn.planning.PlanEstablished, r.turn.originalTask, r.taskBatchID(),
 		); planMsg != "" {
 			r.emit(event.Event{
 				Type:    event.PlanningDecision,

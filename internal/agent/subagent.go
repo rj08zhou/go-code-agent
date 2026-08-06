@@ -9,6 +9,7 @@ import (
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
+	"go-code-agent/internal/task"
 	"go-code-agent/internal/tool"
 	"go-code-agent/internal/utils"
 	"strings"
@@ -96,7 +97,7 @@ func (s *SubagentRunner) SetCompression(c *Compression) {
 }
 
 // Run executes a subagent investigation using the unified Runner and returns a summary.
-func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir string) string {
+func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir, sourceWorkdir string) string {
 	role := agentType
 	if role == "" {
 		role = "explore"
@@ -107,15 +108,16 @@ func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir str
 
 	// Build scope and profile for the subagent
 	scope := &tool.ToolScope{
-		Role:       "explore",
-		Workdir:    workdir,
-		AgentID:    fmt.Sprintf("subagent-%s", agentType),
-		CanRead:    true,
-		CanWrite:   false,
-		CanExecute: true,
-		CanNetwork: (agentType == "web_fetch"),
-		CanTeam:    false,
-		CanMemory:  false,
+		Role:          "explore",
+		Workdir:       workdir,
+		SourceWorkdir: sourceWorkdir,
+		AgentID:       fmt.Sprintf("subagent-%s", agentType),
+		CanRead:       true,
+		CanWrite:      false,
+		CanExecute:    true,
+		CanNetwork:    (agentType == "web_fetch"),
+		CanTeam:       false,
+		CanMemory:     false,
 	}
 
 	profile := NewExploreProfile()
@@ -149,7 +151,7 @@ func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir str
 	}
 
 	traceID := model.NewTraceID()
-	outcome := runner.Run(ctx, messages, traceID)
+	outcome := runner.RunWithTaskBatch(ctx, messages, traceID, task.NewBatchID(agentType))
 
 	finalText := lastAssistantText(outcome.Messages)
 

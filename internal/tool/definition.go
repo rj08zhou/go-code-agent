@@ -190,13 +190,20 @@ type ToolHandler func(scope *ToolScope, args json.RawMessage) Result
 // ToolScope carries the per-invocation execution context.
 // Handlers read from this instead of reaching for global App.
 type ToolScope struct {
-	Context      context.Context
-	ProjectID    string
-	SessionID    string
-	AgentID      string
-	Role         string // "lead", "explore", "teammate"
-	Workdir      string
-	AllowedRoots []string
+	Context   context.Context
+	ProjectID string
+	SessionID string
+	AgentID   string
+	Role      string // "lead", "explore", "teammate"
+	Workdir   string
+	// TaskBatch is the persistent DAG batch this run writes tasks into,
+	// resolved lazily by the first task_create. See TaskBatchRef.
+	TaskBatch *TaskBatchRef
+	// SourceWorkdir is the host repo root when Workdir is an isolated git
+	// worktree. Absolute paths under SourceWorkdir are remapped into Workdir
+	// so teammates can follow lead-provided host paths without escaping.
+	SourceWorkdir string
+	AllowedRoots  []string
 
 	// Capability gates
 	CanRead    bool
