@@ -22,8 +22,13 @@ type HITLApprovalAdapter struct {
 
 type reviewRequirement struct {
 	needsReview bool
-	riskLevel   string
+	severity    ReviewSeverity
 	reason      string
+	// commandClassified marks a decision made by inspecting the actual shell
+	// command rather than the tool's static risk metadata. Per-call
+	// classification is strictly better informed, so definitionReview must
+	// not overwrite it (Safe, Caution, Danger, and Deny alike).
+	commandClassified bool
 }
 
 func NewHITLApprovalAdapter(mgr *HITLManager, consoles ...security.InteractiveIO) *HITLApprovalAdapter {
@@ -48,15 +53,15 @@ func (a *HITLApprovalAdapter) SetCatalog(c *tool.ToolCatalog) { a.catalog = c }
 func (a *HITLApprovalAdapter) SetPermissions(p *security.Permissions) { a.permissions = p }
 
 func (a *HITLApprovalAdapter) AllowTool(toolName string, args json.RawMessage) (bool, string) {
-	result := a.DecideTool(toolName, args, tool.ApprovalPreview{})
+	result := a.DecideTool(toolName, args, tool.MutationApprovalInput{})
 	if result.Decision == tool.ApprovalModified {
 		return false, result.Feedback
 	}
 	return result.Decision == tool.ApprovalAllowed, result.Reason
 }
 
-func (a *HITLApprovalAdapter) AllowToolWithPreview(toolName string, args json.RawMessage, preview string) (bool, string) {
-	result := a.DecideTool(toolName, args, tool.ApprovalPreview{Text: preview})
+func (a *HITLApprovalAdapter) AllowToolWithDiffText(toolName string, args json.RawMessage, diffText string) (bool, string) {
+	result := a.DecideTool(toolName, args, tool.MutationApprovalInput{DiffText: diffText})
 	if result.Decision == tool.ApprovalModified {
 		return false, result.Feedback
 	}
@@ -66,20 +71,20 @@ func (a *HITLApprovalAdapter) AllowToolWithPreview(toolName string, args json.Ra
 // DecideTool separates policy resolution from the interactive review step. The
 // ordering deliberately matches the previous pipeline: permissions, intrinsic
 // review requirements, mutation review, then general HITL approval.
-func (a *HITLApprovalAdapter) DecideTool(toolName string, args json.RawMessage, preview tool.ApprovalPreview) tool.ApprovalResult {
+func (a *HITLApprovalAdapter) DecideTool(toolName string, args json.RawMessage, approvalInput tool.MutationApprovalInput) tool.ApprovalResult {
 	snap := a.policySnapshot()
-	permissionLevel, earlyReject := a.resolvePermissionPlan(toolName, args, snap.enabled)
+	permissionLevel, earlyReject := a.resolvePermissionDecision(toolName, args, snap.enabled)
 	review := a.resolveReviewRequirementFor(toolName, args, permissionLevel, snap)
-	plan := decideApprovalPlan(toolName, args, preview, snap, permissionLevel, earlyReject, review)
-	return a.reviewer.Apply(plan)
+	decision := decideApprovalDecision(toolName, args, approvalInput, snap, permissionLevel, earlyReject, review)
+	return a.reviewer.Apply(decision)
 }
 
-func (a *HITLApprovalAdapter) resolvePermissionPlan(toolName string, args json.RawMessage, hitlEnabled bool) (string, *approvalPlan) {
+func (a *HITLApprovalAdapter) resolvePermissionDecision(toolName string, args json.RawMessage, hitlEnabled bool) (string, *approvalDecision) {
 	if a.permissions == nil {
 		return "", nil
 	}
 	level := a.permissions.Match(toolName, string(args))
-	return permissionRejectPlan(level, hitlEnabled, toolName)
+	return permissionRejectDecision(level, hitlEnabled, toolName)
 }
 
 func (a *HITLApprovalAdapter) resolveReviewRequirementFor(
@@ -88,14 +93,14 @@ func (a *HITLApprovalAdapter) resolveReviewRequirementFor(
 	permissionLevel string,
 	snap approvalPolicySnapshot,
 ) reviewRequirement {
-	needsReview, riskLevel, reason := false, "", ""
+	review := reviewRequirement{}
 	if snap.enabled {
-		needsReview, riskLevel, reason = a.mgr.classifyReview(toolName, string(args))
+		review = a.mgr.classifyReview(toolName, string(args))
 	}
 	var definition tool.ToolDefinition
 	hasDefinition := false
 	if a.catalog != nil {
 		definition, hasDefinition = a.catalog.Load().Definitions[toolName]
 	}
-	return resolveReviewRequirement(needsReview, riskLevel, reason, permissionLevel, snap, definition, hasDefinition)
+	return resolveReviewRequirement(review, permissionLevel, snap, definition, hasDefinition)
 }

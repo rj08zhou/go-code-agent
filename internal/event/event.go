@@ -26,7 +26,7 @@ const (
 	SessionClosed     EventType = "session_closed"
 
 	// Decision events — matching original project's Decision* categories.
-	PlanningDecision EventType = "planning"      // plan gate / DAG nudge
+	PlanningDecision EventType = "planning"      // policy: plan gate / unplanned side-effect block
 	ContextDecision  EventType = "context"       // micro / auto compaction
 	TurnDecision     EventType = "turn"          // per-turn summar
 	TurnComplete     EventType = "turn_complete" // final turn wrap-up

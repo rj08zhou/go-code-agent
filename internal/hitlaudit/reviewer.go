@@ -8,10 +8,10 @@ import (
 	"go-code-agent/internal/tool"
 )
 
-// ApprovalReviewer turns a pure approvalPlan into a tool.ApprovalResult,
+// ApprovalReviewer turns a pure approvalDecision into a tool.ApprovalResult,
 // performing any required terminal interaction.
 type ApprovalReviewer interface {
-	Apply(plan approvalPlan) tool.ApprovalResult
+	Apply(decision approvalDecision) tool.ApprovalResult
 }
 
 // terminalApprovalReviewer owns console I/O and serializes prompts so concurrent
@@ -29,40 +29,40 @@ func newTerminalApprovalReviewer(mgr *HITLManager, console security.InteractiveI
 	return &terminalApprovalReviewer{mgr: mgr, console: console}
 }
 
-func (r *terminalApprovalReviewer) Apply(plan approvalPlan) tool.ApprovalResult {
-	switch plan.kind {
-	case planAllow:
+func (r *terminalApprovalReviewer) Apply(decision approvalDecision) tool.ApprovalResult {
+	switch decision.kind {
+	case decisionAllow:
 		return tool.ApprovalResult{Decision: tool.ApprovalAllowed}
-	case planReject:
-		return planToRejectResult(plan)
-	case planPromptMutation:
-		if plan.mutation == nil {
-			return tool.ApprovalResult{Decision: tool.ApprovalRejected, Reason: "mutation preview missing"}
+	case decisionReject:
+		return decisionToRejectResult(decision)
+	case decisionPromptMutation:
+		if decision.mutation == nil {
+			return tool.ApprovalResult{Decision: tool.ApprovalRejected, Reason: "mutation plan missing"}
 		}
-		return r.reviewMutation(*plan.mutation, plan.previewText)
-	case planPromptGeneral:
-		return generalApprovalResult(r.requestGeneralApproval(plan.general), plan.toolName, plan.general.Reason)
+		return r.reviewMutation(*decision.mutation, decision.diffText)
+	case decisionPromptGeneral:
+		return generalApprovalResult(r.requestGeneralApproval(decision.general), decision.toolName, decision.general.Reason)
 	default:
-		return tool.ApprovalResult{Decision: tool.ApprovalRejected, Reason: "unknown approval plan"}
+		return tool.ApprovalResult{Decision: tool.ApprovalRejected, Reason: "unknown approval decision"}
 	}
 }
 
-func (r *terminalApprovalReviewer) reviewMutation(request tool.PreviewRequest, previewText string) tool.ApprovalResult {
+func (r *terminalApprovalReviewer) reviewMutation(mutation tool.MutationPlan, diffText string) tool.ApprovalResult {
 	var accepted string
 	var ok bool
 
 	r.mu.Lock()
 	switch {
-	case request.Delete:
-		ok = security.PreviewDeleteAndConfirm(request.Path, previewText, r.console)
-	case !request.Existed:
-		accepted, ok = security.PreviewCreateAndConfirm(request.Path, string(request.Content), previewText, r.console)
+	case mutation.Delete:
+		ok = security.PreviewDeleteAndConfirm(mutation.Path, diffText, r.console)
+	case !mutation.Existed:
+		accepted, ok = security.PreviewCreateAndConfirm(mutation.Path, string(mutation.Content), diffText, r.console)
 	default:
 		accepted, ok = security.PreviewAndConfirm(
-			request.Path,
-			string(request.OriginalContent),
-			string(request.Content),
-			previewText,
+			mutation.Path,
+			string(mutation.OriginalContent),
+			string(mutation.Content),
+			diffText,
 			r.console,
 		)
 	}
@@ -72,7 +72,7 @@ func (r *terminalApprovalReviewer) reviewMutation(request tool.PreviewRequest, p
 		return tool.ApprovalResult{Decision: tool.ApprovalRejected, Reason: "changes rejected by operator"}
 	}
 	result := tool.ApprovalResult{Decision: tool.ApprovalAllowed}
-	if !request.Delete {
+	if !mutation.Delete {
 		result.ReplacementContent = &accepted
 	}
 	return result

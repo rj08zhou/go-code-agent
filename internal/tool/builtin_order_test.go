@@ -97,8 +97,8 @@ func TestBuiltinTools_KeyWiring(t *testing.T) {
 		if tc.effect != 0 && !d.HasEffect(tc.effect) {
 			t.Fatalf("%s missing effect %v", tc.name, tc.effect)
 		}
-		if (d.Preview != nil) != tc.preview {
-			t.Fatalf("%s Preview=%v, want %v", tc.name, d.Preview != nil, tc.preview)
+		if (d.PlanMutation != nil) != tc.preview {
+			t.Fatalf("%s Preview=%v, want %v", tc.name, d.PlanMutation != nil, tc.preview)
 		}
 	}
 }

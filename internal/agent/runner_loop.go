@@ -232,12 +232,15 @@ func (r *Runner) prepareRound(
 
 	// --- Planning gate (round 0 & 1 only) ---
 	if r.planGate != nil && r.turn.rounds <= 1 {
-		if planMsg := r.planGate.Eval(
+		if planMsg, action := r.planGate.Eval(
 			r.turn.rounds, r.turn.planning.PlanEstablished, r.turn.originalTask,
 		); planMsg != "" {
 			r.emit(event.Event{
 				Type:    event.PlanningDecision,
 				TraceID: traceID,
+				Payload: map[string]string{
+					"action": action,
+				},
 			})
 			messages = append(messages, llm.UserMessage(planMsg))
 		}
@@ -558,7 +561,7 @@ func (r *Runner) executeToolBatch(
 		var result tool.Result
 		if enforcePlanning {
 			definition, known := r.executor.Definition(tc.Name)
-			if classification, blocked := unplannedToolBlock(definition, known); blocked {
+			if classification, blocked := unplannedToolBlock(tc.Name, definition, known, tc.Arguments); blocked {
 				reason := fmt.Sprintf(
 					"tool %q blocked: this non-trivial run has no established plan (%s); "+
 						"successfully call TodoWrite or task_create, then retry this tool in the next model round",

@@ -253,7 +253,7 @@ Session Switch / New / Archive
 | `--session <id>` | — | Resume a specific session |
 | `--new-session` | false | Force a new session |
 | `--human` | false | Escalate approval mode to `manual` |
-| `--human-mode` | (keep default) | `interactive` \| `safe-only` \| `auto-approve` \| `auto-reject` \| `notify-only` |
+| `--human-mode` | (keep default) | `interactive` \| `safe-auto` \| `auto-approve` \| `auto-reject` \| `notify-only` (aliases: `safe-only`) |
 
 ### LLM-as-Judge Env Vars
 
@@ -470,14 +470,82 @@ Whitelist of common safe base commands plus deny/confirm regexps for destructive
 
 ### 3. Approval Levels & HITL
 
-Two cooperating pieces:
+Two cooperating pieces, switched together via `ApplyMode` so they cannot drift:
 
 | Piece | Role |
 |-------|------|
-| `security.ApprovalState` | Internal auto-approval flags and diff-preview posture |
-| `hitlaudit.HITLManager` | Implements the effective `manual`, `safe-auto`, `all-auto`, `reject`, and `notify-only` modes |
+| `security.ApprovalState` | Session `/approval` posture: `manual` / `safe-auto` / `all-auto`; auto-approve flags and whether diff preview is shown |
+| `hitlaudit.HITLManager` | Interactive modes: `interactive`, `safe-auto`, `auto-approve`, `auto-reject`, `notify-only` |
 
-`HITLApprovalAdapter` adapts both into `tool.ApprovalChecker` for the executor (including chunked diff confirmation). Tool definition risk metadata is enforced here as well: dangerous and interactive tools require review, and unclassified MCP tools cannot run without an approval policy. `permissions.json` block/confirm rules apply to MCP names and arguments before HITL.
+`HITLApprovalAdapter` adapts both into the executor's `tool.ApprovalChecker`. Default startup mode is **`safe-auto`** (internal `HITLModeSafeAuto`); `--human` escalates to `manual`, or use `--human-mode` / REPL `/approval`.
+
+#### Mutation plan, diff render, and HITL (three layers)
+
+Mutating file tools go through two **non-interactive** prep steps before HITL:
+
+| Layer | Symbols | Job |
+|-------|---------|-----|
+| 1. Mutation plan | `def.PlanMutation` → `MutationPlan` | **Compute** would-be contents (path / old / new); no diff text |
+| 2. Diff render | `DiffPreview.PreviewChange` | Render the plan as unified diff **text** |
+| 3. HITL | `DecideTool` → `PreviewAndConfirm` etc. | **Decide** allow/reject; with a plan, open diff / hunk UI from layer 2 |
+
+The DTO passed into approval is `MutationApprovalInput{DiffText, Plan}`. Without a plan (e.g. `bash`), HITL uses the general y/n/m panel; with a plan and `ShouldShowDiffUI()`, the interactive diff UI is a HITL *presentation*, not another planning step.
+
+#### Runtime data flow
+
+Before a tool runs, `Executor` does `prepare → authorize → invoke`:
+
+```text
+ToolCall
+  → prepare (resolve definition / args)
+  → authorize
+       → [Plan]  if PlanMutation set: build MutationPlan (no interaction)
+       → [Diff]  DiffPreview.PreviewChange → DiffText (no interaction)
+       → [HITL]  DecideTool(tool, args, MutationApprovalInput)
+            1. permissions.json (block / confirm / allow)
+            2. classifyReview (shell → ClassifyCommand; critical paths; …)
+            3. resolveReviewRequirement (static tool RiskLevel → ReviewSeverity only when there is no per-call classifier)
+            4. decideApprovalDecision
+                 · Plan + manual/safe-auto + showDiffUI → decisionPromptMutation (diff UI)
+                 · else needsReview → decisionPromptGeneral
+                 · else allow
+            5. ApprovalReviewer.Apply (PreviewAndConfirm / y/n/m / or auto-decide)
+  → invoke handler
+       → bash still has BashPolicy hard-deny (VerdictDeny never runs, even if HITL approved)
+```
+
+Key packages: `internal/tool/` (PlanMutation + Executor), `internal/security/diff_preview.go` (render), `internal/security/diff_review.go` (interactive UI), `internal/hitlaudit/` (HITL), `internal/security/classify.go` (command risk).
+
+Tool definition risk metadata still applies where there is no per-call classifier: dangerous and interactive tools require review, and unclassified MCP tools cannot run without an approval policy. `permissions.json` block/confirm rules apply to tool names and arguments before HITL.
+
+#### How shell commands are judged
+
+`bash` / `execute_command` / `background_run` declare a **worst-case** tool `RiskLevel` (`RiskDanger`). Whether a call is reviewed depends on **this command**:
+
+| `ClassifyCommand` | HITL | Default safe-auto |
+|-------------------|------|-------------------|
+| Safe (`ls` / `grep` / `git status`) | No review; `commandClassified` | Runs immediately |
+| Caution (`mkdir` / `git commit`) | Review; `ReviewSeverity=high`; keeps command-level reason | Prompts |
+| Danger (`rm …`) | Review; `ReviewSeverity=high`; keeps command-level reason | Prompts |
+| Deny (`sudo` / `\| sh`) | May still prompt | Hard-denied in the handler |
+
+Once a command is classified, the static tool `RiskDanger` **does not** overwrite it (no high→danger double pass that replaces the reason with “tool is classified as dangerous”). User `permissions.json` `confirm` / `block` rules still outrank command classification.
+
+#### Mode behaviour (summary)
+
+| REPL `/approval` | Internal mode | Read-only bash | Caution/Danger bash, dangerous MCP | File mutations (have PlanMutation) |
+|------------------|---------------|----------------|------------------------------------|------------------------------------|
+| `manual` | interactive | Allow | y/n/m panel | HITL uses DiffText for diff UI |
+| `safe-auto` (default) | safe-auto | Allow | Prompt when severity is high/danger | HITL uses DiffText for diff UI |
+| `all-auto` (needs `confirm`) | auto-approve | Allow | Print then approve | Plan+Diff still computed; diff UI skipped |
+| `reject` | auto-reject | Allow | Print then reject | DiffText may attach to general review → reject |
+| `notify-only` | notify-only | Allow | Print then allow | DiffText may attach to general review → allow |
+
+On a non-TTY, interactive mode rejects by default; set `HITL_NON_TTY_FALLBACK=approve` to allow instead.
+
+#### Relation to PlanGate
+
+PlanGate is a separate layer: without an established plan it blocks file mutations / non-read-only shell / delegation. Clearing PlanGate does not skip HITL. Both consume `ClassifyCommand`; neither calls the other.
 
 ### 4. Secrets Sanitizer
 
@@ -485,7 +553,6 @@ Tool outputs are sanitized before returning to the model / logs.
 
 ### Additional Security Features
 
-- Diff preview for mutating file tools (skipped under confirmed `all-auto`)
 - Optional git snapshot + rollback on failure (`SNAPSHOT_ENABLED=1`)
 - Decision audit log (`decisions.jsonl`)
 - Session event log (`session.log`)

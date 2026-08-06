@@ -39,3 +39,39 @@ func TestRenderConsoleEventFormatsTurnDecision(t *testing.T) {
 		t.Fatalf("turn decision summary = %q", rendered)
 	}
 }
+
+func TestRenderConsoleEventFormatsPlanningDecisionAsPolicy(t *testing.T) {
+	nudge := renderConsoleEvent(Event{
+		Type: PlanningDecision,
+		Payload: map[string]string{
+			"action": "require_plan",
+		},
+	})
+	if !strings.Contains(nudge, "[policy]") || !strings.Contains(nudge, "plan required") {
+		t.Fatalf("nudge = %q", nudge)
+	}
+	if strings.Contains(nudge, "[planning]") {
+		t.Fatalf("nudge still uses [planning]: %q", nudge)
+	}
+
+	blocked := renderConsoleEvent(Event{
+		Type:     PlanningDecision,
+		ToolName: "bash",
+		Status:   "blocked",
+		Error:    `tool "bash" blocked: ...`,
+		Payload: map[string]string{
+			"action":         "block_unplanned_side_effect",
+			"classification": "process_execution",
+		},
+	})
+	for _, want := range []string{
+		"[policy]", "blocked unplanned side effect", "bash", "process_execution", "status=blocked",
+	} {
+		if !strings.Contains(blocked, want) {
+			t.Fatalf("blocked missing %q: %q", want, blocked)
+		}
+	}
+	if strings.Contains(blocked, "[bash]") {
+		t.Fatalf("blocked should use [policy], not [bash]: %q", blocked)
+	}
+}

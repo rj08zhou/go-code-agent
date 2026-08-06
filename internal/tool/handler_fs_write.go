@@ -12,7 +12,7 @@ import (
 	"go-code-agent/internal/store"
 )
 
-func approvedMutationFor(scope *ToolScope, path, resolvedPath string, deleting bool) (*PreviewRequest, error) {
+func approvedMutationFor(scope *ToolScope, path, resolvedPath string, deleting bool) (*MutationPlan, error) {
 	if scope == nil || scope.approvedMutation == nil {
 		return nil, nil
 	}
@@ -24,17 +24,17 @@ func approvedMutationFor(scope *ToolScope, path, resolvedPath string, deleting b
 	current, err := os.ReadFile(resolvedPath)
 	if mutation.Existed {
 		if err != nil {
-			return nil, fmt.Errorf("file changed since preview; review again: %w", err)
+			return nil, fmt.Errorf("file changed since plan; review again: %w", err)
 		}
 		if !bytes.Equal(current, mutation.OriginalContent) {
-			return nil, fmt.Errorf("file changed since preview; review again")
+			return nil, fmt.Errorf("file changed since plan; review again")
 		}
 	} else {
 		if err == nil {
-			return nil, fmt.Errorf("file was created after preview; review again")
+			return nil, fmt.Errorf("file was created after plan; review again")
 		}
 		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("verify file since preview: %w", err)
+			return nil, fmt.Errorf("verify file since plan: %w", err)
 		}
 	}
 	return mutation, nil
@@ -44,11 +44,11 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 	var defs []ToolDefinition
 
 	defs = append(defs, ToolDefinition{
-		Name:        "write_file",
-		Description: "Write content to file.",
-		RiskLevel:   RiskDanger,
-		Effects:     Effects(EffectWriteFile),
-		Preview:     previewWriteFile,
+		Name:         "write_file",
+		Description:  "Write content to file.",
+		RiskLevel:    RiskDanger,
+		Effects:      Effects(EffectWriteFile),
+		PlanMutation: planWriteMutation,
 		Schema: MustMarshalJSON(map[string]any{
 			"type": "object", "required": []string{"path", "content"},
 			"properties": map[string]any{
@@ -82,29 +82,19 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 			if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
-			previewText := ""
-			if scope.DiffPreview != nil && mutation != nil {
-				if preview, previewErr := scope.DiffPreview.PreviewChange(
-					a.Path,
-					mutation.OriginalContent,
-					content,
-				); previewErr == nil && preview != "(no changes)" {
-					previewText = "\nDiff preview:\n" + preview
-				}
-			}
 			if err := store.AtomicWrite(fp, content); err != nil {
 				return Failed(fmt.Sprintf("%v", err))
 			}
-			return Succeeded(fmt.Sprintf("Wrote %d bytes to %s%s", len(content), a.Path, previewText))
+			return Succeeded(fmt.Sprintf("Wrote %d bytes to %s", len(content), a.Path))
 		},
 	})
 
 	defs = append(defs, ToolDefinition{
-		Name:        "edit_file",
-		Description: "Replace exact text in file.",
-		RiskLevel:   RiskDanger,
-		Effects:     Effects(EffectWriteFile),
-		Preview:     previewEditFile,
+		Name:         "edit_file",
+		Description:  "Replace exact text in file.",
+		RiskLevel:    RiskDanger,
+		Effects:      Effects(EffectWriteFile),
+		PlanMutation: planEditMutation,
 		Schema: MustMarshalJSON(map[string]any{
 			"type": "object", "required": []string{"path", "old_text", "new_text"},
 			"properties": map[string]any{
@@ -157,11 +147,11 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 	})
 
 	defs = append(defs, ToolDefinition{
-		Name:        "delete_file",
-		Description: "Delete a file.",
-		RiskLevel:   RiskDanger,
-		Effects:     Effects(EffectDeleteFile),
-		Preview:     previewDeleteFile,
+		Name:         "delete_file",
+		Description:  "Delete a file.",
+		RiskLevel:    RiskDanger,
+		Effects:      Effects(EffectDeleteFile),
+		PlanMutation: planDeleteMutation,
 		Schema: MustMarshalJSON(map[string]any{
 			"type": "object", "required": []string{"path"},
 			"properties": map[string]any{
@@ -190,11 +180,11 @@ func filesystemWriteTools(d builtinDeps) []ToolDefinition {
 	})
 
 	defs = append(defs, ToolDefinition{
-		Name:        "insert_file",
-		Description: "Insert text at a specific line in a file. Returns the updated content.",
-		RiskLevel:   RiskDanger,
-		Effects:     Effects(EffectWriteFile),
-		Preview:     previewInsertFile,
+		Name:         "insert_file",
+		Description:  "Insert text at a specific line in a file. Returns the updated content.",
+		RiskLevel:    RiskDanger,
+		Effects:      Effects(EffectWriteFile),
+		PlanMutation: planInsertMutation,
 		Schema: MustMarshalJSON(map[string]any{
 			"type": "object", "required": []string{"path", "insert_at", "content"},
 			"properties": map[string]any{

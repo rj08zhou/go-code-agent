@@ -13,7 +13,7 @@ import (
 func TestRenderBannerShowsOneCompleteStatusCard(t *testing.T) {
 	hitl := hitlaudit.NewHITLManager(nil)
 	hitl.SetEnabled(true)
-	hitl.SetMode(hitlaudit.HITLModeSafeOnly)
+	hitl.SetMode(hitlaudit.HITLModeSafeAuto)
 	approval := security.NewApprovalState()
 	approval.ApplyPreset("safe-auto")
 	built := &application.BuiltRunner{

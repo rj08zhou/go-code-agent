@@ -81,7 +81,7 @@ func parseFlags() (*runOptions, string, error) {
 	sessionID := flag.String("session", "", "Resume a specific session ID")
 	newSession := flag.Bool("new-session", false, "Start a fresh session")
 	human := flag.Bool("human", false, "Use manual approval mode")
-	humanMode := flag.String("human-mode", "", "Advanced compatibility override: interactive|safe-only|auto-approve|auto-reject|notify-only")
+	humanMode := flag.String("human-mode", "", "Advanced compatibility override: interactive|safe-auto|auto-approve|auto-reject|notify-only (alias: safe-only)")
 	flag.Parse()
 
 	if *sessionID != "" && *newSession {
