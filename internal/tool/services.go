@@ -4,7 +4,13 @@ import "context"
 
 // TaskService is the interface for task CRUD.
 type TaskService interface {
-	Create(subject, desc string, deps []int) string
+	CreateForBatch(batchID, subject, desc string, deps []int) string
+	// ResolveActiveBatch returns the batch a new task belongs to: the one the
+	// current request is already using, or a fresh one when that work is done.
+	ResolveActiveBatch(prefix string) string
+	// StartNewBatch seals the active batch and opens a fresh one, for requests
+	// unrelated to the plan still sitting on the board.
+	StartNewBatch(prefix string) string
 	Get(id int) string
 	Update(id int, status string) string
 	ListAll() string
@@ -15,7 +21,7 @@ type TaskService interface {
 	TopoView() string
 	ProgressSummary() string
 	ClearCompleted() string
-	Reset()
+	Reset() string
 }
 
 // TodoService manages the current model-facing checklist separately from
@@ -63,8 +69,8 @@ type TeamProtocolService interface {
 	ReviewPlan(requestID string, approve bool, feedback string) string
 }
 
-// DiffPreview generates a preview from the exact content captured for a
-// mutating file operation.
+// DiffPreview renders a unified diff from content already captured for a
+// mutating file operation. It does not plan the mutation or prompt the user.
 type DiffPreview interface {
 	PreviewChange(path string, oldContent, newContent []byte) (string, error)
 }
@@ -76,8 +82,11 @@ type BackgroundService interface {
 }
 
 // SubagentService executes an isolated sub-/explore agent investigation.
+// sourceWorkdir is the host repo root when workdir is a git worktree, so the
+// subagent inherits the parent's path remapping instead of rejecting absolute
+// host paths it was handed in the prompt.
 type SubagentService interface {
-	Run(ctx context.Context, prompt, agentType, workdir string) string
+	Run(ctx context.Context, prompt, agentType, workdir, sourceWorkdir string) string
 }
 
 // WebService provides the Web capabilities exposed as Agent tools.

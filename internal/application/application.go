@@ -487,7 +487,7 @@ func (app *Application) configureSessionSecurity(opts BuildOptions) sessionSecur
 	approval := security.NewApprovalState()
 	// Default approval mode is safe-auto. --human alone escalates to manual.
 	// --human-mode is retained as the advanced compatibility override.
-	hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeSafeOnly)
+	hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeSafeAuto)
 	if opts.Human && opts.HumanMode == "" {
 		hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeInteractive)
 	}

@@ -6,17 +6,19 @@ func (r *Loop) handleTaskCommand(parts []string) {
 	switch parts[0] {
 	case "/task":
 		if len(parts) < 2 {
-			fmt.Println("Usage: /task clear|reset")
+			fmt.Println("Usage: /task new|clear|reset")
+			fmt.Println("  new   — seal the current DAG batch so the next plan starts clean")
 			fmt.Println("  clear — mark all completed tasks as deleted (hide from /dag)")
 			fmt.Println("  reset — remove all tasks and start fresh")
 			return
 		}
 		switch parts[1] {
+		case "new":
+			fmt.Println(r.built.Tasks.Service.SealActiveBatch())
 		case "clear":
 			fmt.Println(r.built.Tasks.Service.ClearCompleted())
 		case "reset":
-			r.built.Tasks.Service.Reset()
-			fmt.Println("All tasks cleared.")
+			fmt.Println(r.built.Tasks.Service.Reset())
 		default:
 			fmt.Printf("Unknown: %s\n", parts[1])
 		}

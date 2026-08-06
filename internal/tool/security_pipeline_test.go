@@ -13,16 +13,16 @@ import (
 
 type previewApproval struct {
 	decision    ApprovalDecision
-	seen        ApprovalPreview
+	seen        MutationApprovalInput
 	replacement *string
-	onDecide    func(ApprovalPreview)
+	onDecide    func(MutationApprovalInput)
 }
 
 func (a *previewApproval) AllowTool(string, json.RawMessage) (bool, string) { return true, "" }
-func (a *previewApproval) DecideTool(_ string, _ json.RawMessage, preview ApprovalPreview) ApprovalResult {
-	a.seen = preview
+func (a *previewApproval) DecideTool(_ string, _ json.RawMessage, approvalInput MutationApprovalInput) ApprovalResult {
+	a.seen = approvalInput
 	if a.onDecide != nil {
-		a.onDecide(preview)
+		a.onDecide(approvalInput)
 	}
 	return ApprovalResult{
 		Decision:           a.decision,
@@ -39,7 +39,7 @@ func TestPreviewEditFileUsesSnakeCaseFields(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	preview, err := previewEditFile(&ToolScope{Workdir: dir}, json.RawMessage(`{"path":"file.txt","old_text":"before","new_text":"after"}`))
+	preview, err := planEditMutation(&ToolScope{Workdir: dir}, json.RawMessage(`{"path":"file.txt","old_text":"before","new_text":"after"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,8 +62,8 @@ func TestExecutor_DiffPreviewBeforeMutationRejects(t *testing.T) {
 	}
 	approval := &previewApproval{decision: ApprovalRejected}
 	catalog := NewToolCatalog()
-	catalog.RegisterAll([]ToolDefinition{{Name: "mutate", Effects: Effects(EffectWriteFile), Preview: func(_ *ToolScope, _ json.RawMessage) (PreviewRequest, error) {
-		return PreviewRequest{Path: "file.txt", Content: []byte("after\n")}, nil
+	catalog.RegisterAll([]ToolDefinition{{Name: "mutate", Effects: Effects(EffectWriteFile), PlanMutation: func(_ *ToolScope, _ json.RawMessage) (MutationPlan, error) {
+		return MutationPlan{Path: "file.txt", Content: []byte("after\n")}, nil
 	}, Handler: func(scope *ToolScope, _ json.RawMessage) Result {
 		_ = os.WriteFile(filepath.Join(scope.Workdir, "file.txt"), []byte("after\n"), 0o644)
 		return Succeeded("mutated")
@@ -73,7 +73,7 @@ func TestExecutor_DiffPreviewBeforeMutationRejects(t *testing.T) {
 	if result.Status != StatusRejected {
 		t.Fatalf("status=%s, want rejected", result.Status)
 	}
-	if approval.seen.Text == "" || approval.seen.Mutation == nil {
+	if approval.seen.DiffText == "" || approval.seen.Plan == nil {
 		t.Fatal("approval did not receive a structured diff preview")
 	}
 	data, _ := os.ReadFile(path)
@@ -88,8 +88,8 @@ func TestExecutor_DiffPreviewModifyDoesNotMutate(t *testing.T) {
 	_ = os.WriteFile(path, []byte("before\n"), 0o644)
 	approval := &previewApproval{decision: ApprovalModified}
 	catalog := NewToolCatalog()
-	catalog.RegisterAll([]ToolDefinition{{Name: "mutate", Effects: Effects(EffectWriteFile), Preview: func(_ *ToolScope, _ json.RawMessage) (PreviewRequest, error) {
-		return PreviewRequest{Path: "file.txt", Content: []byte("after\n")}, nil
+	catalog.RegisterAll([]ToolDefinition{{Name: "mutate", Effects: Effects(EffectWriteFile), PlanMutation: func(_ *ToolScope, _ json.RawMessage) (MutationPlan, error) {
+		return MutationPlan{Path: "file.txt", Content: []byte("after\n")}, nil
 	}, Handler: func(scope *ToolScope, _ json.RawMessage) Result {
 		_ = os.WriteFile(filepath.Join(scope.Workdir, "file.txt"), []byte("after\n"), 0o644)
 		return Succeeded("mutated")
@@ -146,9 +146,9 @@ func TestExecutorAppliesApprovedFullContentForExistingFileMutations(t *testing.T
 			if string(got) != approved {
 				t.Fatalf("file content = %q, want approved content %q", got, approved)
 			}
-			if approval.seen.Mutation == nil || !approval.seen.Mutation.Existed ||
-				string(approval.seen.Mutation.OriginalContent) != original {
-				t.Fatalf("approval preview = %#v", approval.seen.Mutation)
+			if approval.seen.Plan == nil || !approval.seen.Plan.Existed ||
+				string(approval.seen.Plan.OriginalContent) != original {
+				t.Fatalf("approval preview = %#v", approval.seen.Plan)
 			}
 		})
 	}
@@ -192,8 +192,8 @@ func TestExecutorUsesWholePreviewForNewAndDeletedFiles(t *testing.T) {
 		if !result.Succeeded() {
 			t.Fatalf("status=%s output=%s", result.Status, result.Output)
 		}
-		if approval.seen.Mutation == nil || approval.seen.Mutation.Existed || approval.seen.Mutation.Delete {
-			t.Fatalf("new file preview = %#v", approval.seen.Mutation)
+		if approval.seen.Plan == nil || approval.seen.Plan.Existed || approval.seen.Plan.Delete {
+			t.Fatalf("new file preview = %#v", approval.seen.Plan)
 		}
 		got, err := os.ReadFile(filepath.Join(dir, "new.txt"))
 		if err != nil || string(got) != "new content" {
@@ -217,8 +217,8 @@ func TestExecutorUsesWholePreviewForNewAndDeletedFiles(t *testing.T) {
 		if !result.Succeeded() {
 			t.Fatalf("status=%s output=%s", result.Status, result.Output)
 		}
-		if approval.seen.Mutation == nil || !approval.seen.Mutation.Existed || !approval.seen.Mutation.Delete {
-			t.Fatalf("delete preview = %#v", approval.seen.Mutation)
+		if approval.seen.Plan == nil || !approval.seen.Plan.Existed || !approval.seen.Plan.Delete {
+			t.Fatalf("delete preview = %#v", approval.seen.Plan)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("file still exists after approved deletion: %v", err)
@@ -233,7 +233,7 @@ func TestExecutorRejectsMutationWhenFileChangesAfterPreview(t *testing.T) {
 		t.Fatal(err)
 	}
 	approval := &previewApproval{decision: ApprovalAllowed}
-	approval.onDecide = func(ApprovalPreview) {
+	approval.onDecide = func(MutationApprovalInput) {
 		if err := os.WriteFile(path, []byte("concurrent update"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -245,7 +245,7 @@ func TestExecutorRejectsMutationWhenFileChangesAfterPreview(t *testing.T) {
 		filesystemTestScope(dir),
 		llm.ToolCall{Name: "edit_file", Arguments: `{"path":"file.txt","old_text":"before","new_text":"proposed"}`},
 	)
-	if result.Status != StatusFailed || !strings.Contains(result.Output, "changed since preview") {
+	if result.Status != StatusFailed || !strings.Contains(result.Output, "changed since plan") {
 		t.Fatalf("status=%s output=%q", result.Status, result.Output)
 	}
 	got, err := os.ReadFile(path)

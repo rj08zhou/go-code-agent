@@ -17,15 +17,16 @@ func ParseMode(value string) (HITLMode, error) {
 		return HITLModeAutoReject, nil
 	case "notify-only", "notify":
 		return HITLModeNotifyOnly, nil
-	case "safe-only", "safeonly":
-		return HITLModeSafeOnly, nil
+	case "safe-auto", "safeauto", "safe-only", "safeonly":
+		// safe-only / safeonly remain accepted CLI spellings for compatibility.
+		return HITLModeSafeAuto, nil
 	default:
 		return HITLModeInteractive, fmt.Errorf("unknown HITL mode %q", value)
 	}
 }
 
 // ApplyMode enables HITL, sets its mode, and syncs ApprovalState's
-// auto-approve/diff-preview posture in one place. Callers (CLI startup,
+// auto-approve / ShouldShowDiffUI posture in one place. Callers (CLI startup,
 // REPL /approval) must go through this instead of setting HITLManager and
 // ApprovalState separately, so the two can never drift out of sync.
 func ApplyMode(mgr *HITLManager, approval *security.ApprovalState, mode HITLMode) {
@@ -44,7 +45,7 @@ func presetForMode(mode HITLMode) string {
 	switch mode {
 	case HITLModeAutoApprove:
 		return "all-auto"
-	case HITLModeSafeOnly:
+	case HITLModeSafeAuto:
 		return "safe-auto"
 	default: // HITLModeInteractive, HITLModeAutoReject, HITLModeNotifyOnly
 		return "manual"

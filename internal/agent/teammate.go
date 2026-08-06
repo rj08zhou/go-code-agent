@@ -66,7 +66,8 @@ type TeammateManager struct {
 	wg        sync.WaitGroup
 }
 
-// SetDiffPreview makes teammate file mutations go through the same preview gate as lead mutations.
+// SetDiffPreview wires the shared diff renderer so teammate file mutations
+// produce the same DiffText as lead mutations before HITL.
 func (tm *TeammateManager) SetDiffPreview(preview tool.DiffPreview) { tm.diffPreview = preview }
 
 // SetApproval wires the session HITL adapter so teammate tools are gated
@@ -216,15 +217,16 @@ func (tm *TeammateManager) Spawn(ctx context.Context, name, role, taskPrompt str
 		lifetimeCtx = context.Background()
 	}
 	tm.wg.Add(1)
+	taskBatchID := task.NewBatchID("teammate-" + name)
 	go func() {
 		defer tm.wg.Done()
-		tm.autonomousLoop(lifetimeCtx, name, role, taskPrompt, lease.WorktreeDir)
+		tm.autonomousLoop(lifetimeCtx, name, role, taskPrompt, lease.WorktreeDir, taskBatchID)
 	}()
 	return fmt.Sprintf("Spawned '%s' (role: %s, workdir: %s)", name, role, lease.WorktreeDir)
 }
 
 // autonomousLoop runs a WORK → IDLE → WORK cycle within the assigned worktree.
-func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, taskPrompt, worktreePath string) {
+func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, taskPrompt, worktreePath, taskBatchID string) {
 	teamName := tm.config.TeamName
 
 	sys := prompt.Render(tm.promptLoader.MustLoad("teammate"), map[string]string{
@@ -237,7 +239,7 @@ func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, taskP
 	msgs := []llm.Message{llm.SystemMessage(sys), llm.UserMessage(taskPrompt)}
 
 	for {
-		if tm.workPhase(ctx, name, worktreePath, &msgs) == "shutdown" {
+		if tm.workPhase(ctx, name, worktreePath, taskBatchID, &msgs) == "shutdown" {
 			return
 		}
 		if !tm.idlePhase(name, role, teamName, &msgs) {
@@ -247,18 +249,24 @@ func (tm *TeammateManager) autonomousLoop(ctx context.Context, name, role, taskP
 }
 
 // workPhase runs the inner agent loop within the isolated worktree. Returns "shutdown" or "idle".
-func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath string, msgs *[]llm.Message) string {
+func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath, taskBatchID string, msgs *[]llm.Message) string {
+	sourceWorkdir := ""
+	if tm.worktrees != nil {
+		sourceWorkdir = tm.worktrees.PrimaryWorkdir()
+	}
 	scope := &tool.ToolScope{
-		Role:        "teammate",
-		AgentID:     name,
-		Workdir:     worktreePath,
-		CanRead:     true,
-		CanWrite:    team.HasApprovedPlan(tm.protocols, name),
-		CanExecute:  true,
-		CanNetwork:  true,
-		CanTeam:     true,
-		CanMemory:   true,
-		DiffPreview: tm.diffPreview,
+		Role:          "teammate",
+		AgentID:       name,
+		Workdir:       worktreePath,
+		SourceWorkdir: sourceWorkdir,
+		TaskBatch:     tool.NewTaskBatch(taskBatchID),
+		CanRead:       true,
+		CanWrite:      team.HasApprovedPlan(tm.protocols, name),
+		CanExecute:    true,
+		CanNetwork:    true,
+		CanTeam:       true,
+		CanMemory:     true,
+		DiffPreview:   tm.diffPreview,
 	}
 	executor := tm.newExecutor()
 
@@ -340,7 +348,7 @@ func (tm *TeammateManager) workPhase(ctx context.Context, name, worktreePath str
 				tm.eventSink.Emit(event.Event{Type: event.ToolStarted, TraceID: traceID, AgentID: name, ToolCallID: tc.ID, ToolName: tc.Name, Payload: toolPayload})
 			}
 			// Gate file mutations and process execution by plan approval.
-			if requiresApprovedPlan(executor, tc.Name) && !team.HasApprovedPlan(tm.protocols, name) {
+			if requiresApprovedPlan(executor, tc.Name, tc.Arguments) && !team.HasApprovedPlan(tm.protocols, name) {
 				*msgs = append(*msgs, llm.ToolMessage(
 					"[DENIED] submit_plan approval required before file mutations or process execution", tc.ID))
 				continue
@@ -497,8 +505,8 @@ func (tm *TeammateManager) ShutdownAll() {
 	}
 }
 
-func requiresApprovedPlan(executor *tool.Executor, name string) bool {
+func requiresApprovedPlan(executor *tool.Executor, name, arguments string) bool {
 	definition, known := executor.Definition(name)
-	_, blocked := unplannedToolBlock(definition, known)
+	_, blocked := unplannedToolBlock(name, definition, known, arguments)
 	return blocked
 }

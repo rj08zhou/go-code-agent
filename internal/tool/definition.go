@@ -129,19 +129,22 @@ const (
 
 // ToolDefinition is a complete, self-contained tool spec.
 type ToolDefinition struct {
-	Name           string
-	Description    string
-	Schema         json.RawMessage
-	Handler        ToolHandler
-	Preview        ToolPreview
+	Name        string
+	Description string
+	Schema      json.RawMessage
+	Handler     ToolHandler
+	// PlanMutation computes the would-be filesystem result without writing.
+	// Distinct from DiffPreview (renders unified diff text) and from HITL's
+	// interactive diff UI (PreviewAndConfirm).
+	PlanMutation   MutationPlanner
 	RiskLevel      RiskLevel
 	Effects        EffectSet
 	Timeout        time.Duration
 	SnapshotPolicy SnapshotPolicy
 }
 
-// PreviewRequest describes a proposed filesystem mutation before it is applied.
-type PreviewRequest struct {
+// MutationPlan describes a proposed filesystem mutation before it is applied.
+type MutationPlan struct {
 	Path            string
 	OriginalContent []byte
 	Content         []byte
@@ -149,8 +152,8 @@ type PreviewRequest struct {
 	Delete          bool
 }
 
-// ToolPreview computes a mutation preview without changing the filesystem.
-type ToolPreview func(scope *ToolScope, args json.RawMessage) (PreviewRequest, error)
+// MutationPlanner computes the planned file contents without writing them.
+type MutationPlanner func(scope *ToolScope, args json.RawMessage) (MutationPlan, error)
 
 // HasEffect checks if this tool definition includes the given effect.
 func (td ToolDefinition) HasEffect(e Effect) bool {
@@ -187,13 +190,20 @@ type ToolHandler func(scope *ToolScope, args json.RawMessage) Result
 // ToolScope carries the per-invocation execution context.
 // Handlers read from this instead of reaching for global App.
 type ToolScope struct {
-	Context      context.Context
-	ProjectID    string
-	SessionID    string
-	AgentID      string
-	Role         string // "lead", "explore", "teammate"
-	Workdir      string
-	AllowedRoots []string
+	Context   context.Context
+	ProjectID string
+	SessionID string
+	AgentID   string
+	Role      string // "lead", "explore", "teammate"
+	Workdir   string
+	// TaskBatch is the persistent DAG batch this run writes tasks into,
+	// resolved lazily by the first task_create. See TaskBatchRef.
+	TaskBatch *TaskBatchRef
+	// SourceWorkdir is the host repo root when Workdir is an isolated git
+	// worktree. Absolute paths under SourceWorkdir are remapped into Workdir
+	// so teammates can follow lead-provided host paths without escaping.
+	SourceWorkdir string
+	AllowedRoots  []string
 
 	// Capability gates
 	CanRead    bool
@@ -213,7 +223,7 @@ type ToolScope struct {
 
 	// Set only by Executor after preview and approval. Model-provided arguments
 	// cannot populate this per-invocation mutation plan.
-	approvedMutation *PreviewRequest
+	approvedMutation *MutationPlan
 }
 
 // ApprovalChecker is the interface for tool approval decisions.

@@ -7,12 +7,12 @@ import (
 )
 
 type stubReviewer struct {
-	last approvalPlan
+	last approvalDecision
 	out  tool.ApprovalResult
 }
 
-func (s *stubReviewer) Apply(plan approvalPlan) tool.ApprovalResult {
-	s.last = plan
+func (s *stubReviewer) Apply(decision approvalDecision) tool.ApprovalResult {
+	s.last = decision
 	return s.out
 }
 
@@ -24,19 +24,19 @@ func TestAdapterDelegatesPlanToReviewer(t *testing.T) {
 	stub := &stubReviewer{out: tool.ApprovalResult{Decision: tool.ApprovalAllowed}}
 	adapter.reviewer = stub
 
-	result := adapter.DecideTool("read_file", nil, tool.ApprovalPreview{})
+	result := adapter.DecideTool("read_file", nil, tool.MutationApprovalInput{})
 	if result.Decision != tool.ApprovalAllowed {
 		t.Fatalf("result = %#v", result)
 	}
-	if stub.last.kind != planAllow {
-		t.Fatalf("reviewer saw plan kind %v, want allow", stub.last.kind)
+	if stub.last.kind != decisionAllow {
+		t.Fatalf("reviewer saw decision kind %v, want allow", stub.last.kind)
 	}
 }
 
 func TestTerminalReviewerRejectsMissingMutation(t *testing.T) {
 	mgr := NewHITLManager(nil)
 	reviewer := newTerminalApprovalReviewer(mgr, nil)
-	result := reviewer.Apply(approvalPlan{kind: planPromptMutation, toolName: "write_file"})
+	result := reviewer.Apply(approvalDecision{kind: decisionPromptMutation, toolName: "write_file"})
 	if result.Decision != tool.ApprovalRejected {
 		t.Fatalf("result = %#v, want rejected", result)
 	}

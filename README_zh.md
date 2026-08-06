@@ -255,7 +255,7 @@ REPL 将新消息追加到 HistoryStore
 | `--session <id>` | — | 恢复指定会话 |
 | `--new-session` | false | 强制新建会话 |
 | `--human` | false | 将审批模式提升为 `manual` |
-| `--human-mode` | （保持默认） | `interactive` \| `safe-only` \| `auto-approve` \| `auto-reject` \| `notify-only` |
+| `--human-mode` | （保持默认） | `interactive` \| `safe-auto` \| `auto-approve` \| `auto-reject` \| `notify-only`（别名：`safe-only`） |
 
 ### LLM-as-Judge 环境变量
 
@@ -362,7 +362,7 @@ go-code-agent/
 | `/session archive` | 归档当前会话 |
 | `/tasks` | 渲染短期 Todo |
 | `/dag` | 显示持久化任务 DAG |
-| `/task clear\|reset` | 清理已完成 / 清空全部任务 |
+| `/task new\|clear\|reset` | 封存当前 DAG 批次 / 清理已完成 / 清空全部任务 |
 | `/memory` | 记忆统计 |
 | `/mcp` | 列出 MCP 服务器 |
 | `/mcp pending` / `approve <name>` | 待批准 MCP |
@@ -409,7 +409,7 @@ go-code-agent/
 | 工具 | 说明 |
 |------|------|
 | `TodoWrite` | 短期清单 |
-| `task_create` / `task_list` / `task_update` / `task_get` | 持久化任务 |
+| `task_create` / `task_list` / `task_update` / `task_get` | 持久化任务，按请求归入 DAG 批次 |
 | `task_add_dep` / `task_remove_dep` / `task_ready` / `task_dag` / `claim_task` | DAG 调度 |
 
 ### 多 Agent 协作
@@ -473,14 +473,80 @@ MCP 服务器启动/批准后，以 `mcp__<server>__<tool>` 形式注册到会�
 
 ### 3. 审批级别与 HITL
 
-两套协作组件：
+两套协作组件，由 `ApplyMode` 一并切换，避免姿态漂移：
 
 | 组件 | 作用 |
 |------|------|
 | `security.ApprovalState` | 会话 `/approval` 姿态：`manual` / `safe-auto` / `all-auto`；控制自动放行与是否展示 diff preview |
-| `hitlaudit.HITLManager` | 交互模式：`safe-only`、`interactive`、`auto-approve`、`auto-reject`、`notify-only` |
+| `hitlaudit.HITLManager` | 交互模式：`interactive`、`safe-auto`、`auto-approve`、`auto-reject`、`notify-only` |
 
-`HITLApprovalAdapter` 将二者适配为 executor 使用的 `tool.ApprovalChecker`（含分块 diff 确认）。
+`HITLApprovalAdapter` 将二者适配为 executor 使用的 `tool.ApprovalChecker`。启动默认模式为 **`safe-auto`**（内部 `HITLModeSafeAuto`）；`--human` 提升为 `manual`，也可用 `--human-mode` / REPL `/approval` 切换。
+
+#### 变更计划、Diff 渲染与 HITL（三层）
+
+写文件工具在审批前会经过两步**无交互**准备，再进入 HITL：
+
+| 层 | 符号 | 职责 |
+|----|------|------|
+| 1. Mutation plan | `def.PlanMutation` → `MutationPlan` | **算出**拟写入内容（path / 原文 / 新文），不生成 diff |
+| 2. Diff render | `DiffPreview.PreviewChange` | 把计划渲染成 unified diff **文本** |
+| 3. HITL | `DecideTool` → `PreviewAndConfirm` 等 | **决定**是否放行；有计划时用第 2 层文本开 diff / hunk UI |
+
+打包给审批的 DTO 是 `MutationApprovalInput{DiffText, Plan}`。没有计划时（如 `bash`）HITL 走通用 y/n/m；有计划且 `ShouldShowDiffUI()` 为真时才开交互 diff UI——那是 HITL 的展示，不是又一次 plan。
+
+#### 执行时数据流
+
+工具真正执行前，`Executor` 走 `prepare → authorize → invoke`：
+
+```text
+ToolCall
+  → prepare（解析定义 / 参数）
+  → authorize
+       → [Plan]   若有 PlanMutation：算出 MutationPlan（无交互）
+       → [Diff]   DiffPreview.PreviewChange → DiffText（无交互）
+       → [HITL]   DecideTool(tool, args, MutationApprovalInput)
+            1. permissions.json（block / confirm / allow）
+            2. classifyReview（shell → ClassifyCommand；敏感路径等）
+            3. resolveReviewRequirement（无 per-call 分类时，才用工具静态 RiskLevel → ReviewSeverity 兜底）
+            4. decideApprovalDecision
+                 · 有 Plan + manual/safe-auto + showDiffUI → decisionPromptMutation（diff UI）
+                 · 否则 needsReview → decisionPromptGeneral
+                 · 否则 allow
+            5. ApprovalReviewer.Apply（PreviewAndConfirm / y/n/m / 或自动决策）
+  → invoke handler
+       → bash 另有 BashPolicy 硬拒绝（VerdictDeny 即使 HITL 批准也不执行）
+```
+
+关键包：`internal/tool/`（PlanMutation + Executor）、`internal/security/diff_preview.go`（渲染）、`internal/security/diff_review.go`（交互 UI）、`internal/hitlaudit/`（HITL）、`internal/security/classify.go`（命令风险）。
+
+#### Shell 命令如何判定
+
+`bash` / `execute_command` / `background_run` 的工具级 `RiskLevel` 是**最坏情况**（`RiskDanger`）。真正是否审查看**这一次命令**：
+
+| `ClassifyCommand` | HITL | 默认 safe-auto |
+|-------------------|------|----------------|
+| Safe（`ls` / `grep` / `git status`） | 不审，`commandClassified` | 直接执行 |
+| Caution（`mkdir` / `git commit`） | 审，`ReviewSeverity=high`，保留命令级 reason | 弹窗确认 |
+| Danger（`rm …`） | 审，`ReviewSeverity=high`，保留命令级 reason | 弹窗确认 |
+| Deny（`sudo` / `\| sh`） | 可能仍弹窗 | handler 内硬拒绝 |
+
+命令一旦分类完成，**不再**被工具静态 `RiskDanger` 覆盖（避免先 high 再 danger、reason 被冲成 “tool is classified as dangerous”）。用户 `permissions.json` 的 `confirm` / `block` 规则仍优先于命令分类。
+
+#### 模式行为（摘要）
+
+| REPL `/approval` | 内部模式 | 只读 bash | Caution/Danger bash、危险 MCP | 文件变更（有 PlanMutation） |
+|------------------|----------|----------|-------------------------------|------------------------------|
+| `manual` | interactive | 放行 | y/n/m 面板 | HITL 用 DiffText 开 diff UI |
+| `safe-auto`（默认） | safe-auto | 放行 | severity 为 high/danger 时弹窗 | HITL 用 DiffText 开 diff UI |
+| `all-auto`（需 `confirm`） | auto-approve | 放行 | 打印后自动批 | 仍算 Plan+Diff，但跳过 diff UI |
+| `reject` | auto-reject | 放行 | 打印后拒 | DiffText 可附在通用审里 → 拒 |
+| `notify-only` | notify-only | 放行 | 打印后放行 | DiffText 可附在通用审里 → 放行 |
+
+非 TTY 下 interactive 默认拒绝；可用环境变量 `HITL_NON_TTY_FALLBACK=approve` 改为放行。
+
+#### 与 PlanGate 的关系
+
+PlanGate（规划闸）是另一层：无既定 plan 时拦写文件 / 非只读 shell / 委派。过了 PlanGate 仍可能进入 HITL。两者都消费 `ClassifyCommand`，但互不调用。
 
 ### 4. 密钥脱敏
 
@@ -488,7 +554,6 @@ MCP 服务器启动/批准后，以 `mcp__<server>__<tool>` 形式注册到会�
 
 ### 其他安全能力
 
-- 写文件工具的 diff preview（确认启用 `all-auto` 时跳过）
 - 可选 git snapshot + 失败回滚（`SNAPSHOT_ENABLED=1`）
 - 决策审计日志（`decisions.jsonl`）
 - 会话事件日志（`session.log`）
@@ -522,7 +587,7 @@ MCP 服务器启动/批准后，以 `mcp__<server>__<tool>` 形式注册到会�
 
 ### DAG 调度
 
-带依赖边的持久化任务（`task_*` 工具）。就绪任务可被认领；`/dag` 展示拓扑与进度。
+带依赖边的持久化任务（`task_*` 工具）。任务按请求归入 DAG 批次：同一请求的后续轮次继续扩展当前批次，批次做完后下一个任务自动开新批次。批次未完成时切换到无关需求，会封存旧批次（`new_plan` 参数或 `/task new`）而不是并入。就绪任务可被认领；`/dag` 按批次展示拓扑与进度。
 
 ### Auto-Lesson
 

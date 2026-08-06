@@ -5,37 +5,18 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 )
 
-// DiffPreview generates unified diffs for workspace file changes.
+// DiffPreview renders unified diffs from already-resolved file contents.
+// It does not plan mutations (see tool.MutationPlanner) and does not prompt
+// the operator (see PreviewAndConfirm). The workdir field is retained for
+// wiring identity; PreviewChange does not read the filesystem.
 type DiffPreview struct{ workdir string }
 
 func NewDiffPreview(workdir string) *DiffPreview { return &DiffPreview{workdir: workdir} }
 
-func (d *DiffPreview) Preview(relPath string, newContent []byte) (string, error) {
-	fp := filepath.Join(d.workdir, relPath)
-	oldContent, err := os.ReadFile(fp)
-	if err != nil && !os.IsNotExist(err) {
-		return "", err
-	}
-	if os.IsNotExist(err) {
-		oldContent = nil
-	}
-	return generateUnifiedDiff(string(oldContent), string(newContent), relPath)
-}
-
-func (d *DiffPreview) PreviewDelete(relPath string) (string, error) {
-	fp := filepath.Join(d.workdir, relPath)
-	oldContent, err := os.ReadFile(fp)
-	if err != nil {
-		return "", err
-	}
-	return generateUnifiedDiff(string(oldContent), "", relPath)
-}
-
-// PreviewChange generates a diff from content already resolved in the actual
-// ToolScope. It is independent of the workdir attached to this service.
+// PreviewChange generates a unified diff from content already resolved by a
+// MutationPlanner. It does not re-read the workdir (avoids TOCTOU vs the plan).
 func (d *DiffPreview) PreviewChange(path string, oldContent, newContent []byte) (string, error) {
 	return generateUnifiedDiff(string(oldContent), string(newContent), path)
 }

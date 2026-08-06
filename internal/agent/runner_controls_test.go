@@ -112,7 +112,10 @@ func TestRunnerPlanningGuardBlocksSideEffectsAndUnclassifiedTools(t *testing.T) 
 	}{
 		{name: "write", toolName: "write_file", effects: tool.Effects(tool.EffectWriteFile), arguments: `{}`, classification: "file_mutation"},
 		{name: "delete", toolName: "delete_file", effects: tool.Effects(tool.EffectDeleteFile), arguments: `{}`, classification: "file_mutation"},
-		{name: "read-only bash", toolName: "bash", effects: tool.Effects(tool.EffectExecuteProcess), arguments: `{"command":"git status"}`, classification: "process_execution"},
+		{name: "mutating bash", toolName: "bash", effects: tool.Effects(tool.EffectExecuteProcess), arguments: `{"command":"rm -rf build"}`, classification: "process_execution"},
+		{name: "bash without command", toolName: "bash", effects: tool.Effects(tool.EffectExecuteProcess), arguments: `{}`, classification: "process_execution"},
+		{name: "bash redirecting output to a file", toolName: "bash", effects: tool.Effects(tool.EffectExecuteProcess), arguments: `{"command":"go build ./... > out.txt"}`, classification: "process_execution"},
+		{name: "non-shell process tool", toolName: "run_container", effects: tool.Effects(tool.EffectExecuteProcess), arguments: `{"command":"ls"}`, classification: "process_execution"},
 		{name: "spawn teammate delegation", toolName: "spawn_teammate", effects: tool.Effects(tool.EffectTeamMutation, tool.EffectDelegation), arguments: `{"name":"w","prompt":"edit"}`, classification: "delegation"},
 		{name: "plan approval delegation", toolName: "plan_approval", effects: tool.Effects(tool.EffectTeamMutation, tool.EffectDelegation), arguments: `{"request_id":"1","approve":true}`, classification: "delegation"},
 		{name: "unclassified dynamic tool", toolName: "dynamic_tool", arguments: `{}`, classification: "unclassified_effects"},
@@ -162,23 +165,45 @@ func TestRunnerPlanningGuardBlocksSideEffectsAndUnclassifiedTools(t *testing.T) 
 				!strings.Contains(decision.Output, "round=0") {
 				t.Fatalf("planning event = %#v", *decision)
 			}
+			mp, _ := decision.Payload.(map[string]string)
+			if mp["action"] != "block_unplanned_side_effect" || mp["classification"] != tc.classification {
+				t.Fatalf("planning payload = %#v", decision.Payload)
+			}
 		})
 	}
 }
 
 func TestRunnerPlanningGuardAllowsReadOnlyAndExplicitlySafeTools(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		effects tool.EffectSet
+		name      string
+		toolName  string
+		effects   tool.EffectSet
+		arguments string
 	}{
 		{name: "read_file", effects: tool.Effects(tool.EffectReadFile)},
 		{name: "search_content", effects: tool.Effects()},
 		{name: "send_message", effects: tool.Effects(tool.EffectTeamMutation)},
+		{
+			name: "inspection-only bash", toolName: "bash",
+			effects: tool.Effects(tool.EffectExecuteProcess), arguments: `{"command":"git status"}`,
+		},
+		{
+			name: "inspection-only bash pipeline", toolName: "bash",
+			effects: tool.Effects(tool.EffectExecuteProcess), arguments: `{"command":"ls -la | grep go"}`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			toolName := tc.toolName
+			if toolName == "" {
+				toolName = tc.name
+			}
+			arguments := tc.arguments
+			if arguments == "" {
+				arguments = `{}`
+			}
 			executed := false
 			runner := newPlanningGuardRunner([]tool.ToolDefinition{{
-				Name:    tc.name,
+				Name:    toolName,
 				Effects: tc.effects,
 				Handler: func(*tool.ToolScope, json.RawMessage) tool.Result {
 					executed = true
@@ -187,7 +212,7 @@ func TestRunnerPlanningGuardAllowsReadOnlyAndExplicitlySafeTools(t *testing.T) {
 			}}, "analyze the architecture and explain how the complete request flow works")
 			out := &TurnOutcome{}
 			runner.executeToolBatch(context.Background(), nil, []llm.ToolCall{{
-				ID: "safe", Name: tc.name, Arguments: `{}`,
+				ID: "safe", Name: toolName, Arguments: arguments,
 			}}, "planning-safe", out)
 			if !executed || len(out.ToolResults) != 1 || out.ToolResults[0].Status != tool.StatusSucceeded {
 				t.Fatalf("safe tool did not execute: executed=%v results=%#v", executed, out.ToolResults)
@@ -325,7 +350,7 @@ func TestRunnerPlanningGuardRecordsSessionLogDecision(t *testing.T) {
 
 	out := &TurnOutcome{}
 	runner.executeToolBatch(context.Background(), nil, []llm.ToolCall{{
-		ID: "bash", Name: "bash", Arguments: `{"command":"git status"}`,
+		ID: "bash", Name: "bash", Arguments: `{"command":"rm -rf build"}`,
 	}}, "session-log-planning", out)
 	if err := logSink.Close(); err != nil {
 		t.Fatal(err)

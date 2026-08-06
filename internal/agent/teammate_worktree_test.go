@@ -64,12 +64,23 @@ func TestTeammatePlanApprovalUsesToolEffects(t *testing.T) {
 	})
 	executor := tool.NewExecutor(catalog, nil, nil)
 
-	if requiresApprovedPlan(executor, "read_file") {
+	if requiresApprovedPlan(executor, "read_file", `{}`) {
 		t.Fatal("read-only tool should not require teammate plan approval")
 	}
-	for _, name := range []string{"insert_file", "background_run", "dynamic", "missing"} {
-		if !requiresApprovedPlan(executor, name) {
-			t.Errorf("%s should require teammate plan approval", name)
+	if requiresApprovedPlan(executor, "background_run", `{"command":"git status"}`) {
+		t.Fatal("inspection-only shell command should not require teammate plan approval")
+	}
+	for _, tc := range []struct{ name, arguments string }{
+		{"insert_file", `{}`},
+		{"background_run", `{"command":"rm -rf build"}`},
+		{"background_run", `{"command":"go build ./... > out.txt"}`},
+		{"background_run", `{}`},
+		{"background_run", `not json`},
+		{"dynamic", `{}`},
+		{"missing", `{}`},
+	} {
+		if !requiresApprovedPlan(executor, tc.name, tc.arguments) {
+			t.Errorf("%s %s should require teammate plan approval", tc.name, tc.arguments)
 		}
 	}
 }

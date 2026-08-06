@@ -144,6 +144,15 @@ func (r *Runner) SetSnapshot(sm *SnapshotManager) { r.snapshot = sm }
 func (r *Runner) SetSubagentRunner(sr *SubagentRunner) { r.subagent = sr }
 func (r *Runner) SetPlanGate(pg *PlanGate)             { r.planGate = pg }
 
+// taskBatchID is the DAG batch this run has landed on, empty until the first
+// task_create resolves one.
+func (r *Runner) taskBatchID() string {
+	if r.scope == nil {
+		return ""
+	}
+	return r.scope.TaskBatch.ID()
+}
+
 // SetPromptLoader wires the template loader used for inline prompts
 // (response-truncation message, post-explore nudge).
 func (r *Runner) SetPromptLoader(pl *prompt.Loader) { r.promptLoader = pl }
@@ -194,7 +203,20 @@ type ToolResultRecord struct {
 
 // Run drives the agent loop, integrating all modules.
 // Stage details live in runner_loop.go; this method is the state-machine skeleton.
+// The DAG batch is left unresolved: the first task_create picks up whichever
+// batch the request is already using, so a multi-turn request keeps one DAG.
 func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) (result TurnOutcome) {
+	return r.RunWithTaskBatch(ctx, thread, traceID, "")
+}
+
+// RunWithTaskBatch pins the run to an explicit DAG batch, for callers whose
+// task ownership is known up front (subagents and teammates own theirs). The
+// batch ID is deliberately separate from traceID, which is observability only.
+func (r *Runner) RunWithTaskBatch(
+	ctx context.Context,
+	thread []llm.Message,
+	traceID, taskBatchID string,
+) (result TurnOutcome) {
 	defer func() {
 		result.Messages = stripInjectedTurnContext(result.Messages)
 	}()
@@ -202,6 +224,11 @@ func (r *Runner) Run(ctx context.Context, thread []llm.Message, traceID string) 
 	// Runner instances are reused across REPL turns; loop counters and gates
 	// are per turn, so reset them before starting a new execution.
 	r.resetTurnState()
+	if r.scope != nil {
+		// A fresh reference per run: the previous run's resolution must not
+		// leak into this one, or a finished batch would keep absorbing tasks.
+		r.scope.TaskBatch = tool.NewTaskBatch(strings.TrimSpace(taskBatchID))
+	}
 
 	ctx = model.WithTraceID(ctx, traceID)
 	// Capture original task for plan gate and inject dynamic context once per

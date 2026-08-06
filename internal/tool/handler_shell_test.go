@@ -41,6 +41,45 @@ func TestBashReportsNonZeroExitAsFailed(t *testing.T) {
 	}
 }
 
+func TestShellRejectsHostRepoPathsFromAWorktree(t *testing.T) {
+	host := t.TempDir()
+	worktree := t.TempDir()
+	bg := &recordingBackgroundService{}
+	defs := shellTools(builtinDeps{bgSvc: bg})
+	bash, background := defs[0], defs[1]
+	isolated := &ToolScope{SessionID: "test", Workdir: worktree, SourceWorkdir: host}
+
+	denied := bash.Handler(isolated, mustCommand(t, "cat "+host+"/internal/agent/runner.go"))
+	if denied.Status != StatusDenied || !strings.Contains(denied.Output, "worktree") {
+		t.Fatalf("host path not blocked: %+v", denied)
+	}
+	if got := background.Handler(isolated, mustCommand(t, "go build "+host+"/...")); got.Status != StatusDenied {
+		t.Fatalf("background host path not blocked: %+v", got)
+	}
+	if bg.called {
+		t.Fatal("background service ran a command aimed at the host repo")
+	}
+
+	// Relative work inside the worktree stays allowed.
+	if got := bash.Handler(isolated, mustCommand(t, "echo fine")); got.Status != StatusSucceeded {
+		t.Fatalf("relative command blocked: %+v", got)
+	}
+	// The lead has no worktree, so nothing is remapped and nothing is blocked.
+	lead := &ToolScope{SessionID: "test", Workdir: host}
+	if got := bash.Handler(lead, mustCommand(t, "echo "+host)); got.Status != StatusSucceeded {
+		t.Fatalf("lead command blocked: %+v", got)
+	}
+}
+
+func mustCommand(t *testing.T, command string) json.RawMessage {
+	t.Helper()
+	args, err := json.Marshal(map[string]string{"command": command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return args
+}
+
 func TestBackgroundRunAppliesBashPolicy(t *testing.T) {
 	bg := &recordingBackgroundService{}
 	defs := shellTools(builtinDeps{bgSvc: bg})

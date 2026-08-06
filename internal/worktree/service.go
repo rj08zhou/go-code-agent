@@ -32,6 +32,8 @@ func New(workdir, dataDir string) *Service {
 	}
 }
 
+func (s *Service) PrimaryWorkdir() string { return s.workdir }
+
 func (s *Service) runGit(dir string, args ...string) error {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 	out, err := cmd.CombinedOutput()

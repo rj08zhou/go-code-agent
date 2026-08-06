@@ -98,6 +98,56 @@ func SecurePath(root, rel string, allowWrite bool) (string, error) {
 	return clean, nil
 }
 
+// MapPathIntoWorkdir rewrites an absolute path under sourceRoot to the
+// equivalent path under workdir. This lets worktree-isolated agents accept
+// host-repo absolute paths that appear in lead prompts without escaping the
+// sandbox. Relative paths, empty roots, and paths outside sourceRoot are
+// returned unchanged (SecurePath still enforces the workdir boundary).
+func MapPathIntoWorkdir(workdir, sourceRoot, path string) string {
+	if workdir == "" || sourceRoot == "" || path == "" || !filepath.IsAbs(path) {
+		return path
+	}
+	srcAbs, err := filepath.Abs(sourceRoot)
+	if err != nil {
+		return path
+	}
+	wdAbs, err := filepath.Abs(workdir)
+	if err != nil {
+		return path
+	}
+	if srcAbs == wdAbs {
+		return path
+	}
+
+	srcCmp := srcAbs
+	if resolved, err := filepath.EvalSymlinks(srcAbs); err == nil {
+		srcCmp = resolved
+	}
+	pathAbs := filepath.Clean(path)
+	pathCmp := pathAbs
+	if resolved, err := filepath.EvalSymlinks(pathAbs); err == nil {
+		pathCmp = resolved
+	}
+
+	rel, err := filepath.Rel(srcCmp, pathCmp)
+	if err != nil || !isLocalRel(rel) {
+		rel, err = filepath.Rel(srcAbs, pathAbs)
+		if err != nil || !isLocalRel(rel) {
+			return path
+		}
+	}
+	return filepath.Join(wdAbs, rel)
+}
+
+func isLocalRel(rel string) bool {
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// SecurePathMapped is SecurePath after MapPathIntoWorkdir remapping.
+func SecurePathMapped(workdir, sourceRoot, path string, allowWrite bool) (string, error) {
+	return SecurePath(workdir, MapPathIntoWorkdir(workdir, sourceRoot, path), allowWrite)
+}
+
 func pathWithinRoot(path, root string) bool {
 	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
 }
@@ -109,15 +159,6 @@ func IsReadOnlyBash(cmd string) bool {
 }
 
 // ---------- Approval ----------
-
-type ApprovalLevel int
-
-const (
-	ApproveAuto    ApprovalLevel = iota // no user input needed
-	ApproveSafe                         // safe writes, always allow if auto-approve-safe
-	ApproveDanger                       // potentially destructive, requires confirmation
-	ApproveBlocked                      // never allowed
-)
 
 // ApprovalState is the session's auto-approve posture for tool risk levels.
 // It answers "may this risk class run without prompting?" and whether
@@ -154,11 +195,11 @@ func (s *ApprovalState) IsAutoApproveSafe() bool {
 	return s.autoApproveSafe
 }
 
-// ShouldPreviewDiff reports whether file mutation previews should be shown.
-// Diff preview is skipped only when the user has opted into full auto-approve.
-func (s *ApprovalState) ShouldPreviewDiff() bool { return !s.IsAutoApproveAll() }
+// ShouldShowDiffUI reports whether the interactive mutation diff UI should open.
+// It is false only under full auto-approve (all-auto).
+func (s *ApprovalState) ShouldShowDiffUI() bool { return !s.IsAutoApproveAll() }
 
-// ApplyPreset sets the auto-approval and diff-preview posture. Legacy preset
+// ApplyPreset sets the auto-approval and diff-UI posture. Legacy preset
 // names remain accepted for compatibility with stored/internal callers.
 func (s *ApprovalState) ApplyPreset(preset string) {
 	switch strings.ToLower(strings.TrimSpace(preset)) {
@@ -174,33 +215,9 @@ func (s *ApprovalState) ApplyPreset(preset string) {
 	}
 }
 
-func (s *ApprovalState) Decide(level ApprovalLevel, desc string) (allowed bool, reason string) {
-	switch level {
-	case ApproveAuto:
-		return true, ""
-	case ApproveSafe:
-		if s.IsAutoApproveAll() || s.IsAutoApproveSafe() {
-			return true, ""
-		}
-		return false, fmt.Sprintf("[safe] %s requires approval. Use /approval safe-auto to auto-approve lower-risk reviews.", desc)
-	case ApproveDanger:
-		if s.IsAutoApproveAll() {
-			return true, ""
-		}
-		return false, fmt.Sprintf("[DANGER] %s requires confirmation. Use /approval all-auto confirm to bypass prompts (risky!).", desc)
-	case ApproveBlocked:
-		return false, fmt.Sprintf("BLOCKED: %s is not permitted", desc)
-	default:
-		return false, fmt.Sprintf("unknown approval level for %q", desc)
-	}
-}
-
 // ---------- Bash Policy ----------
 
-const (
-	MCPToolPrefix   = "mcp__"
-	MCPDefaultLevel = ApproveSafe
-)
+const MCPToolPrefix = "mcp__"
 
 // allowedCommands is the whitelist of permitted base commands.
 var allowedCommands = map[string]bool{
