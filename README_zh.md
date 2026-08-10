@@ -321,7 +321,7 @@ go-code-agent/
 │   ├── agent/                   # Runner 循环、explore、teammate、judge、压缩
 │   ├── tool/                    # Catalog、executor、内置 handlers
 │   ├── model/                   # Gateway + provider 实现
-│   ├── hitlaudit/               # HITL manager + ApprovalAdapter
+│   ├── hitl/               # HITL manager + ApprovalAdapter
 │   ├── security/                # 路径沙箱、bash 策略、ApprovalState、SSRF、diff
 │   ├── session/                 # 会话索引与 meta.json
 │   ├── history/                 # 对话 JSONL + checkpoint
@@ -478,7 +478,7 @@ MCP 服务器启动/批准后，以 `mcp__<server>__<tool>` 形式注册到会�
 | 组件 | 作用 |
 |------|------|
 | `security.ApprovalState` | 会话 `/approval` 姿态：`manual` / `safe-auto` / `all-auto`；控制自动放行与是否展示 diff preview |
-| `hitlaudit.HITLManager` | 交互模式：`interactive`、`safe-auto`、`auto-approve`、`auto-reject`、`notify-only` |
+| `hitl.HITLManager` | 交互模式：`interactive`、`safe-auto`、`auto-approve`、`auto-reject`、`notify-only` |
 
 `HITLApprovalAdapter` 将二者适配为 executor 使用的 `tool.ApprovalChecker`。启动默认模式为 **`safe-auto`**（内部 `HITLModeSafeAuto`）；`--human` 提升为 `manual`，也可用 `--human-mode` / REPL `/approval` 切换。
 
@@ -517,7 +517,7 @@ ToolCall
        → bash 另有 BashPolicy 硬拒绝（VerdictDeny 即使 HITL 批准也不执行）
 ```
 
-关键包：`internal/tool/`（PlanMutation + Executor）、`internal/security/diff_preview.go`（渲染）、`internal/security/diff_review.go`（交互 UI）、`internal/hitlaudit/`（HITL）、`internal/security/classify.go`（命令风险）。
+关键包：`internal/tool/`（PlanMutation + Executor）、`internal/hitl/`（diff 渲染、交互评审 UI 与 HITL 策略）、`internal/security/classify.go`（命令风险）。
 
 #### Shell 命令如何判定
 
@@ -730,9 +730,9 @@ $ JUDGE_ENABLED=1 ./agent
 > 好，把 HITLApprovalAdapter 拆到单独文件。
 
 [hitl] reviewing write_file [safe]
-[write_file] internal/hitlaudit/approval_adapter.go
-[edit_file] internal/hitlaudit/human_approval.go
-[bash] go test ./internal/hitlaudit/
+[write_file] internal/hitl/approval_adapter.go
+[edit_file] internal/hitl/human_approval.go
+[bash] go test ./internal/hitl/
 
 [judge] score=9 approved
 Done.

@@ -8,7 +8,7 @@ import (
 
 // Verdict is the single source of truth for shell-command risk across the
 // codebase. Both the bash policy gate (BashPolicy.Validate) and the HITL
-// review gate (hitlaudit.NeedsReview) consume ClassifyCommand; neither may
+// review gate (hitl.NeedsReview) consume ClassifyCommand; neither may
 // implement its own command parsing or risk rules.
 type Verdict int
 

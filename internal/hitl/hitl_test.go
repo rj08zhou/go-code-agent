@@ -1,4 +1,4 @@
-package hitlaudit
+package hitl
 
 import (
 	"context"
@@ -431,7 +431,7 @@ func TestExistingFileReviewSupportsPartialAndAllApproval(t *testing.T) {
 func TestConcurrentFileReviewsAreSerializedAndKeepOwnContent(t *testing.T) {
 	var active atomic.Int32
 	var maximum atomic.Int32
-	term := security.NewInteractiveIO(nil, func(string) (string, error) {
+	term := NewInteractiveIO(nil, func(string) (string, error) {
 		current := active.Add(1)
 		for {
 			previous := maximum.Load()
@@ -482,7 +482,7 @@ func TestConcurrentFileReviewsAreSerializedAndKeepOwnContent(t *testing.T) {
 	}
 }
 
-func newInteractiveApprovalAdapter(ios ...security.InteractiveIO) *HITLApprovalAdapter {
+func newInteractiveApprovalAdapter(ios ...InteractiveIO) *HITLApprovalAdapter {
 	console := nonTTYIO()
 	if len(ios) > 0 && ios[0] != nil {
 		console = ios[0]
@@ -500,16 +500,16 @@ func newNonTTYAdapter(t *testing.T) (*HITLManager, *HITLApprovalAdapter) {
 	return mgr, NewHITLApprovalAdapter(mgr, term)
 }
 
-func nonTTYIO() security.InteractiveIO {
-	return security.NewInteractiveIO(nil, func(string) (string, error) {
+func nonTTYIO() InteractiveIO {
+	return NewInteractiveIO(nil, func(string) (string, error) {
 		return "", io.EOF
 	}, false)
 }
 
-func scriptedIO(t *testing.T, tty bool, answers ...string) (security.InteractiveIO, *atomic.Int32) {
+func scriptedIO(t *testing.T, tty bool, answers ...string) (InteractiveIO, *atomic.Int32) {
 	t.Helper()
 	var calls atomic.Int32
-	term := security.NewInteractiveIO(nil, func(string) (string, error) {
+	term := NewInteractiveIO(nil, func(string) (string, error) {
 		index := int(calls.Add(1)) - 1
 		if index >= len(answers) {
 			return "", io.EOF
@@ -526,7 +526,7 @@ func existingFileDiff(t *testing.T, original, proposed string) string {
 	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	diff, err := security.NewDiffPreview(dir).PreviewChange(
+	diff, err := NewDiffPreview(dir).PreviewChange(
 		"file.txt",
 		[]byte(original),
 		[]byte(proposed),

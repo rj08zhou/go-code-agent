@@ -1,8 +1,9 @@
-package security
+package utils
 
 import "strings"
 
-// WhitespaceNormalize collapses all whitespace into single spaces.
+// WhitespaceNormalize collapses runs of whitespace into a single space and
+// trims the ends. Used by edit_file's whitespace-tolerant match fallback.
 func WhitespaceNormalize(s string) string {
 	var b strings.Builder
 	prevSpace := false

@@ -13,7 +13,7 @@ import (
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
-	"go-code-agent/internal/hitlaudit"
+	"go-code-agent/internal/hitl"
 	"go-code-agent/internal/memory"
 	"go-code-agent/internal/model"
 	"go-code-agent/internal/model/provider"
@@ -39,7 +39,7 @@ type Application struct {
 	sessionRepo   *session.Repository
 	memStore      *memory.Store
 	consoleSink   *event.ConsoleSink
-	interactiveIO security.InteractiveIO
+	interactiveIO hitl.InteractiveIO
 
 	// Active runtime
 	runtime         *SessionRuntime
@@ -134,9 +134,9 @@ func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gatewa
 	if consoleSink == nil {
 		consoleSink = event.NewConsoleSink()
 	}
-	var interactiveIO security.InteractiveIO
+	var interactiveIO hitl.InteractiveIO
 	if boot.hasReader {
-		interactiveIO = security.NewInteractiveIO(consoleSink, boot.readLine, boot.isTTY)
+		interactiveIO = hitl.NewInteractiveIO(consoleSink, boot.readLine, boot.isTTY)
 	}
 
 	return &Application{
@@ -165,14 +165,14 @@ func (a *Application) DataDir() string { return a.dataDir }
 // Config returns the process-wide configuration.
 func (a *Application) Config() *config.Config { return a.cfg }
 
-func (a *Application) interactive() security.InteractiveIO {
+func (a *Application) interactive() hitl.InteractiveIO {
 	if a != nil && a.interactiveIO != nil {
 		return a.interactiveIO
 	}
 	if a != nil && a.consoleSink != nil {
-		return security.NewInteractiveIO(a.consoleSink, nil, false)
+		return hitl.NewInteractiveIO(a.consoleSink, nil, false)
 	}
-	return security.DefaultInteractiveIO()
+	return hitl.DefaultInteractiveIO()
 }
 
 // CloseSession stops the active session runtime and releases its ownership.
@@ -319,10 +319,10 @@ type openedSession struct {
 }
 
 type sessionSecurity struct {
-	hitlMgr      *hitlaudit.HITLManager
+	hitlMgr      *hitl.HITLManager
 	approval     *security.ApprovalState
 	permissions  *security.Permissions
-	diffPreview  *security.DiffPreview
+	diffPreview  *hitl.DiffPreview
 	promptLoader *prompt.Loader
 	cfg          *config.Config
 }
@@ -483,17 +483,17 @@ func (app *Application) configureSessionSecurity(opts BuildOptions) sessionSecur
 		cfg = &config.Config{ModelID: "default"}
 	}
 
-	hitlMgr := hitlaudit.NewHITLManager(promptLoader, app.interactive())
+	hitlMgr := hitl.NewHITLManager(promptLoader, app.interactive())
 	approval := security.NewApprovalState()
 	// Default approval mode is safe-auto. --human alone escalates to manual.
 	// --human-mode is retained as the advanced compatibility override.
-	hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeSafeAuto)
+	hitl.ApplyMode(hitlMgr, approval, hitl.HITLModeSafeAuto)
 	if opts.Human && opts.HumanMode == "" {
-		hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeInteractive)
+		hitl.ApplyMode(hitlMgr, approval, hitl.HITLModeInteractive)
 	}
 	if opts.HumanMode != "" {
-		if mode, err := hitlaudit.ParseMode(opts.HumanMode); err == nil {
-			hitlaudit.ApplyMode(hitlMgr, approval, mode)
+		if mode, err := hitl.ParseMode(opts.HumanMode); err == nil {
+			hitl.ApplyMode(hitlMgr, approval, mode)
 		} else {
 			fmt.Fprintf(os.Stderr, "[warn] %v\n", err)
 		}
@@ -505,7 +505,7 @@ func (app *Application) configureSessionSecurity(opts BuildOptions) sessionSecur
 		hitlMgr:      hitlMgr,
 		approval:     approval,
 		permissions:  permissions,
-		diffPreview:  security.NewDiffPreview(app.workdir),
+		diffPreview:  hitl.NewDiffPreview(app.workdir),
 		promptLoader: promptLoader,
 		cfg:          cfg,
 	}

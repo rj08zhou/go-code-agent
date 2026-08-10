@@ -1,10 +1,9 @@
-package hitlaudit
+package hitl
 
 import (
 	"fmt"
 	"sync"
 
-	"go-code-agent/internal/security"
 	"go-code-agent/internal/tool"
 )
 
@@ -18,13 +17,13 @@ type ApprovalReviewer interface {
 // tool calls cannot interleave mutation reviews or general HITL panels.
 type terminalApprovalReviewer struct {
 	mgr     *HITLManager
-	console security.InteractiveIO
+	console InteractiveIO
 	mu      sync.Mutex
 }
 
-func newTerminalApprovalReviewer(mgr *HITLManager, console security.InteractiveIO) *terminalApprovalReviewer {
+func newTerminalApprovalReviewer(mgr *HITLManager, console InteractiveIO) *terminalApprovalReviewer {
 	if console == nil {
-		console = security.DefaultInteractiveIO()
+		console = DefaultInteractiveIO()
 	}
 	return &terminalApprovalReviewer{mgr: mgr, console: console}
 }
@@ -54,11 +53,11 @@ func (r *terminalApprovalReviewer) reviewMutation(mutation tool.MutationPlan, di
 	r.mu.Lock()
 	switch {
 	case mutation.Delete:
-		ok = security.PreviewDeleteAndConfirm(mutation.Path, diffText, r.console)
+		ok = PreviewDeleteAndConfirm(mutation.Path, diffText, r.console)
 	case !mutation.Existed:
-		accepted, ok = security.PreviewCreateAndConfirm(mutation.Path, string(mutation.Content), diffText, r.console)
+		accepted, ok = PreviewCreateAndConfirm(mutation.Path, string(mutation.Content), diffText, r.console)
 	default:
-		accepted, ok = security.PreviewAndConfirm(
+		accepted, ok = PreviewAndConfirm(
 			mutation.Path,
 			string(mutation.OriginalContent),
 			string(mutation.Content),

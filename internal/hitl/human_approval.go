@@ -1,4 +1,13 @@
-package hitlaudit
+// Package hitl decides whether a tool call needs a human and runs the
+// review when it does. Policy resolution is pure (policy.go); everything the
+// operator sees or types lives here too — the diff renderer, the hunk-by-hunk
+// review UI, and the stdin line reader — so the prompt and the decision that
+// depends on it cannot drift apart.
+//
+// It builds on internal/security for the underlying constraints (command
+// classification, permission rules, approval state). That dependency is
+// one-way: security never prompts.
+package hitl
 
 import (
 	"encoding/json"
@@ -89,17 +98,17 @@ type HITLManager struct {
 	// alwaysReviewTools always need HITL when enabled (independent of args).
 	alwaysReviewTools      map[string]bool
 	criticalPathSubstrings []string
-	console                security.InteractiveIO
+	console                InteractiveIO
 	mu                     sync.RWMutex
 	promptLoader           *prompt.Loader
 }
 
-func NewHITLManager(pl *prompt.Loader, consoles ...security.InteractiveIO) *HITLManager {
+func NewHITLManager(pl *prompt.Loader, consoles ...InteractiveIO) *HITLManager {
 	fallback := HITLReject
 	if os.Getenv("HITL_NON_TTY_FALLBACK") == "approve" {
 		fallback = HITLApprove
 	}
-	console := security.DefaultInteractiveIO()
+	console := DefaultInteractiveIO()
 	if len(consoles) > 0 && consoles[0] != nil {
 		console = consoles[0]
 	}
@@ -280,8 +289,8 @@ func (h *HITLManager) promptInteractive(req HITLRequest) HITLResponse {
 	return readInteractiveDecision(h.console)
 }
 
-func readInteractiveDecision(consoles ...security.InteractiveIO) HITLResponse {
-	console := security.DefaultInteractiveIO()
+func readInteractiveDecision(consoles ...InteractiveIO) HITLResponse {
+	console := DefaultInteractiveIO()
 	if len(consoles) > 0 && consoles[0] != nil {
 		console = consoles[0]
 	}

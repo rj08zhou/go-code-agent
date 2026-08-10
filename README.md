@@ -319,7 +319,7 @@ go-code-agent/
 │   ├── agent/                   # Runner loop, explore, teammates, judge, compression
 │   ├── tool/                    # Catalog, executor, builtin handlers
 │   ├── model/                   # Gateway + provider implementations
-│   ├── hitlaudit/               # HITL manager + ApprovalAdapter
+│   ├── hitl/               # HITL manager + ApprovalAdapter
 │   ├── security/                # Path sandbox, bash policy, ApprovalState, SSRF, diff
 │   ├── session/                 # Session index + meta.json
 │   ├── history/                 # Conversation JSONL + checkpoints
@@ -475,7 +475,7 @@ Two cooperating pieces, switched together via `ApplyMode` so they cannot drift:
 | Piece | Role |
 |-------|------|
 | `security.ApprovalState` | Session `/approval` posture: `manual` / `safe-auto` / `all-auto`; auto-approve flags and whether diff preview is shown |
-| `hitlaudit.HITLManager` | Interactive modes: `interactive`, `safe-auto`, `auto-approve`, `auto-reject`, `notify-only` |
+| `hitl.HITLManager` | Interactive modes: `interactive`, `safe-auto`, `auto-approve`, `auto-reject`, `notify-only` |
 
 `HITLApprovalAdapter` adapts both into the executor's `tool.ApprovalChecker`. Default startup mode is **`safe-auto`** (internal `HITLModeSafeAuto`); `--human` escalates to `manual`, or use `--human-mode` / REPL `/approval`.
 
@@ -514,7 +514,7 @@ ToolCall
        → bash still has BashPolicy hard-deny (VerdictDeny never runs, even if HITL approved)
 ```
 
-Key packages: `internal/tool/` (PlanMutation + Executor), `internal/security/diff_preview.go` (render), `internal/security/diff_review.go` (interactive UI), `internal/hitlaudit/` (HITL), `internal/security/classify.go` (command risk).
+Key packages: `internal/tool/` (PlanMutation + Executor), `internal/hitl/` (diff render, interactive review UI, and HITL policy), `internal/security/classify.go` (command risk).
 
 Tool definition risk metadata still applies where there is no per-call classifier: dangerous and interactive tools require review, and unclassified MCP tools cannot run without an approval policy. `permissions.json` block/confirm rules apply to tool names and arguments before HITL.
 
@@ -735,9 +735,9 @@ $ JUDGE_ENABLED=1 ./agent
 > OK, extract HITLApprovalAdapter into its own file.
 
 [hitl] reviewing write_file [safe]
-[write_file] internal/hitlaudit/approval_adapter.go
-[edit_file] internal/hitlaudit/human_approval.go
-[bash] go test ./internal/hitlaudit/
+[write_file] internal/hitl/approval_adapter.go
+[edit_file] internal/hitl/human_approval.go
+[bash] go test ./internal/hitl/
 
 [judge] score=9 approved
 Done.

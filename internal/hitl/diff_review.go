@@ -1,4 +1,4 @@
-package security
+package hitl
 
 import (
 	"fmt"
@@ -61,7 +61,7 @@ func colorizeDiff(diff string) string {
 // PreviewCreateAndConfirm reviews a newly-created file as one operation.
 func PreviewCreateAndConfirm(path, newContent, diff string, consoles ...InteractiveIO) (string, bool) {
 	console := resolveInteractiveIO(consoles...)
-	printReviewHeader("Proposed new file", path, console)
+	printDiffHeader("Proposed new file", path, console)
 	if previewWholeChange(diff, false, console) {
 		return newContent, true
 	}
@@ -71,7 +71,7 @@ func PreviewCreateAndConfirm(path, newContent, diff string, consoles ...Interact
 // PreviewDeleteAndConfirm reviews deletion of the entire file as one operation.
 func PreviewDeleteAndConfirm(path, diff string, consoles ...InteractiveIO) bool {
 	console := resolveInteractiveIO(consoles...)
-	printReviewHeader("Proposed deletion of", path, console)
+	printDiffHeader("Proposed deletion of", path, console)
 	return previewWholeChange(diff, true, console)
 }
 
@@ -79,7 +79,7 @@ func PreviewDeleteAndConfirm(path, diff string, consoles ...InteractiveIO) bool 
 // Returns (finalContent, ok). ok=true means apply the returned content.
 func PreviewAndConfirm(path, oldContent, newContent, diff string, consoles ...InteractiveIO) (string, bool) {
 	console := resolveInteractiveIO(consoles...)
-	printReviewHeader("Proposed changes to", path, console)
+	printDiffHeader("Proposed changes to", path, console)
 
 	hunks := parseHunks(diff)
 	if len(hunks) == 0 {
@@ -102,7 +102,7 @@ func resolveInteractiveIO(consoles ...InteractiveIO) InteractiveIO {
 	return DefaultInteractiveIO()
 }
 
-func printReviewHeader(action, path string, consoles ...InteractiveIO) {
+func printDiffHeader(action, path string, consoles ...InteractiveIO) {
 	console := resolveInteractiveIO(consoles...)
 	console.WriteInteractive("\n")
 	console.WriteInteractive(fmt.Sprintf("%s─── %s %s ───%s\n", utils.Bold, action, path, utils.Reset))

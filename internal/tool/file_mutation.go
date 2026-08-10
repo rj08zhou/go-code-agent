@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strings"
 
-	"go-code-agent/internal/security"
+	"go-code-agent/internal/utils"
 )
 
 var errMutationTextNotFound = errors.New("text not found")
@@ -16,7 +16,7 @@ func replaceFileContent(content, oldText, newText string, replaceAll bool) (stri
 	matchedText := oldText
 	if !strings.Contains(content, matchedText) {
 		for _, line := range strings.Split(content, "\n") {
-			if security.WhitespaceNormalize(line) == security.WhitespaceNormalize(matchedText) {
+			if utils.WhitespaceNormalize(line) == utils.WhitespaceNormalize(matchedText) {
 				matchedText = line
 				break
 			}

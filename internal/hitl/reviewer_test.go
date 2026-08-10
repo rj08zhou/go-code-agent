@@ -1,4 +1,4 @@
-package hitlaudit
+package hitl
 
 import (
 	"testing"

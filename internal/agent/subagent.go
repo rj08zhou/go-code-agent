@@ -62,30 +62,36 @@ type SubagentRunner struct {
 	sanitizer    tool.OutputSanitizer
 }
 
-func NewSubagentRunner(gw *model.Gateway, catalog *tool.ToolCatalog, cfg *config.Config, pl *prompt.Loader) *SubagentRunner {
+// NewSubagentRunner requires the session HITL adapter and shared executor
+// security up front. A nil approval checker fail-closes bash out of the
+// explore whitelist; network/sanitizer nils disable those gates (tests only).
+func NewSubagentRunner(
+	gw *model.Gateway,
+	catalog *tool.ToolCatalog,
+	cfg *config.Config,
+	pl *prompt.Loader,
+	approval tool.ApprovalChecker,
+	network tool.NetworkChecker,
+	sanitizer tool.OutputSanitizer,
+) *SubagentRunner {
 	modelID := "default"
 	if cfg != nil && cfg.ModelID != "" {
 		modelID = cfg.ModelID
 	}
-	return &SubagentRunner{gateway: gw, catalog: catalog, cfg: cfg, modelID: modelID, promptLoader: pl}
+	return &SubagentRunner{
+		gateway:      gw,
+		catalog:      catalog,
+		cfg:          cfg,
+		modelID:      modelID,
+		promptLoader: pl,
+		approval:     approval,
+		network:      network,
+		sanitizer:    sanitizer,
+	}
 }
 
 func (s *SubagentRunner) SetEventSink(sink event.Sink) {
 	s.eventSink = sink
-}
-
-// SetApproval wires the session HITL adapter so explore tools are gated
-// the same way as lead tools.
-func (s *SubagentRunner) SetApproval(a tool.ApprovalChecker) {
-	s.approval = a
-}
-
-// SetExecutorSecurity applies the session's shared preflight and redaction
-// policy to every subagent executor. Subagents add output truncation after
-// the shared sanitizer to keep their prompt budget bounded.
-func (s *SubagentRunner) SetExecutorSecurity(network tool.NetworkChecker, sanitizer tool.OutputSanitizer) {
-	s.network = network
-	s.sanitizer = sanitizer
 }
 
 // SetCompression enables auto-compaction for subagent runners.

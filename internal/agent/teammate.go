@@ -70,23 +70,14 @@ type TeammateManager struct {
 // produce the same DiffText as lead mutations before HITL.
 func (tm *TeammateManager) SetDiffPreview(preview tool.DiffPreview) { tm.diffPreview = preview }
 
-// SetApproval wires the session HITL adapter so teammate tools are gated
-// the same way as lead tools (plan gate still controls CanWrite).
-func (tm *TeammateManager) SetApproval(a tool.ApprovalChecker) { tm.approval = a }
-
-// SetExecutorSecurity applies the session's shared network preflight and
-// output redaction policy to each teammate work phase.
-func (tm *TeammateManager) SetExecutorSecurity(network tool.NetworkChecker, sanitizer tool.OutputSanitizer) {
-	tm.network = network
-	tm.sanitizer = sanitizer
-}
-
 func (tm *TeammateManager) SetEventSink(sink event.Sink) { tm.eventSink = sink }
 
 func (tm *TeammateManager) SetReasoningConfig(cfg *config.Config) {
 	tm.reasoning = reasoningRequestFromConfig(cfg)
 }
 
+// NewTeammateManager requires the session HITL adapter and shared executor
+// security up front so teammate work phases cannot silently run ungated.
 func NewTeammateManager(
 	dir string,
 	gw *model.Gateway,
@@ -97,6 +88,9 @@ func NewTeammateManager(
 	catalog *tool.ToolCatalog,
 	modelID string,
 	pl *prompt.Loader,
+	approval tool.ApprovalChecker,
+	network tool.NetworkChecker,
+	sanitizer tool.OutputSanitizer,
 ) *TeammateManager {
 	store.EnsurePrivateDir(dir)
 	tm := &TeammateManager{
@@ -110,6 +104,9 @@ func NewTeammateManager(
 		catalog:      catalog,
 		modelID:      modelID,
 		promptLoader: pl,
+		approval:     approval,
+		network:      network,
+		sanitizer:    sanitizer,
 	}
 	if data, err := os.ReadFile(tm.configPath); err == nil {
 		json.Unmarshal(data, &tm.config)

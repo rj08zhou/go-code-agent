@@ -11,7 +11,7 @@ import (
 )
 
 func TestTeammateSpawnFailsClosedWithoutWorktreeService(t *testing.T) {
-	tm := NewTeammateManager(t.TempDir(), nil, nil, nil, nil, nil, nil, "", nil)
+	tm := NewTeammateManager(t.TempDir(), nil, nil, nil, nil, nil, nil, "", nil, nil, nil, nil)
 
 	got := tm.Spawn(context.Background(), "worker", "coder", "do work")
 	if !strings.Contains(got, "worktree service unavailable") {
@@ -25,7 +25,7 @@ func TestTeammateSpawnFailsClosedWithoutWorktreeService(t *testing.T) {
 func TestTeammateSpawnFailsClosedWhenWorktreeAcquireFails(t *testing.T) {
 	nonRepo := t.TempDir()
 	wt := worktree.New(nonRepo, t.TempDir())
-	tm := NewTeammateManager(t.TempDir(), nil, nil, nil, nil, wt, nil, "", nil)
+	tm := NewTeammateManager(t.TempDir(), nil, nil, nil, nil, wt, nil, "", nil, nil, nil, nil)
 
 	got := tm.Spawn(context.Background(), "worker", "coder", "do work")
 	if !strings.Contains(got, "worktree isolation failed") {

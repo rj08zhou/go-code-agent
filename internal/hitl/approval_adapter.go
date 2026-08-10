@@ -1,4 +1,4 @@
-package hitlaudit
+package hitl
 
 import (
 	"encoding/json"
@@ -31,8 +31,8 @@ type reviewRequirement struct {
 	commandClassified bool
 }
 
-func NewHITLApprovalAdapter(mgr *HITLManager, consoles ...security.InteractiveIO) *HITLApprovalAdapter {
-	console := security.DefaultInteractiveIO()
+func NewHITLApprovalAdapter(mgr *HITLManager, consoles ...InteractiveIO) *HITLApprovalAdapter {
+	console := DefaultInteractiveIO()
 	if len(consoles) > 0 && consoles[0] != nil {
 		console = consoles[0]
 	}

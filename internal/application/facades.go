@@ -6,7 +6,7 @@ import (
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/background"
 	"go-code-agent/internal/history"
-	"go-code-agent/internal/hitlaudit"
+	"go-code-agent/internal/hitl"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/mcp"
 	"go-code-agent/internal/memory"
@@ -46,10 +46,10 @@ type SessionFacade struct {
 
 // SecurityFacade covers HITL, approvals, permissions, and audit.
 type SecurityFacade struct {
-	HITL              *hitlaudit.HITLManager
+	HITL              *hitl.HITLManager
 	Approval          *security.ApprovalState
 	Permissions       *security.Permissions
-	DiffPreview       *security.DiffPreview
+	DiffPreview       *hitl.DiffPreview
 	DecisionLog       *agent.DecisionLog
 	ReloadPermissions func() error
 }
