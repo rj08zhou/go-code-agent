@@ -13,10 +13,10 @@ import (
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
+	"go-code-agent/internal/gateway"
+	"go-code-agent/internal/gateway/provider"
 	"go-code-agent/internal/hitl"
 	"go-code-agent/internal/memory"
-	"go-code-agent/internal/model"
-	"go-code-agent/internal/model/provider"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/session"
@@ -34,7 +34,7 @@ type Application struct {
 	dataDir string
 
 	// Project-level services (process lifetime)
-	gateway       *model.Gateway
+	gateway       *gateway.Gateway
 	registry      *provider.Registry
 	sessionRepo   *session.Repository
 	memStore      *memory.Store
@@ -94,6 +94,9 @@ func New(cfgDir, workdir string, opts ...Option) (*Application, error) {
 	if cfg.AnthropicAPIKey != "" {
 		reg.Register(provider.NewAnthropic(cfg.AnthropicAPIKey, cfg.AnthropicBaseURL))
 	}
+	if cfg.DeepSeekAPIKey != "" {
+		reg.Register(provider.NewDeepSeek(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL))
+	}
 
 	gw, throttle, err := provider.BuildGateway(cfg, reg)
 	if err != nil {
@@ -108,7 +111,7 @@ func New(cfgDir, workdir string, opts ...Option) (*Application, error) {
 
 // NewWithGateway constructs an Application from a pre-built gateway/registry.
 // Production code uses New(); tests inject a fake provider without API keys.
-func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gateway, reg *provider.Registry, opts ...Option) (*Application, error) {
+func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *gateway.Gateway, reg *provider.Registry, opts ...Option) (*Application, error) {
 	if cfg == nil {
 		cfg = &config.Config{ModelID: "default"}
 	}
@@ -154,7 +157,7 @@ func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gatewa
 }
 
 // Gateway returns the model gateway.
-func (a *Application) Gateway() *model.Gateway { return a.gateway }
+func (a *Application) Gateway() *gateway.Gateway { return a.gateway }
 
 // SessionRepo returns the session repository.
 func (a *Application) SessionRepo() *session.Repository { return a.sessionRepo }
@@ -227,7 +230,7 @@ type ShutdownHook struct {
 // It holds only the shared services it actually needs, not a circular
 // reference back to Application.
 type SessionRuntime struct {
-	gateway     *model.Gateway
+	gateway     *gateway.Gateway
 	workdir     string
 	catalog     *tool.ToolCatalog
 	sessionRepo *session.Repository
@@ -242,7 +245,7 @@ type SessionRuntime struct {
 
 // NewSessionRuntime creates a runtime for the given session state.
 // It receives only the shared services it uses — no Application pointer.
-func NewSessionRuntime(parent context.Context, gw *model.Gateway, workdir string, catalog *tool.ToolCatalog, repo *session.Repository, st *session.State) *SessionRuntime {
+func NewSessionRuntime(parent context.Context, gw *gateway.Gateway, workdir string, catalog *tool.ToolCatalog, repo *session.Repository, st *session.State) *SessionRuntime {
 	if parent == nil {
 		parent = context.Background()
 	}

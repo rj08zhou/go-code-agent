@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"testing"
 
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/openai/openai-go"
@@ -62,6 +62,26 @@ func TestToAnthropicOutputConfig(t *testing.T) {
 	}
 }
 
+func TestToDeepSeekTextFormat(t *testing.T) {
+	text, ok := toDeepSeekTextFormat(testStructuredOutput())
+	if !ok {
+		t.Fatal("expected DeepSeek text.format")
+	}
+	format := text.Format.OfJSONSchema
+	if format == nil {
+		t.Fatal("DeepSeek text.format.json_schema was not set")
+	}
+	if format.Name != "test_result" {
+		t.Fatalf("schema name = %q", format.Name)
+	}
+	if strict := format.Strict; !strict.Valid() || !strict.Value {
+		t.Fatalf("strict = %#v, want true", strict)
+	}
+	if format.Schema == nil {
+		t.Fatal("schema body was not propagated")
+	}
+}
+
 func TestToGeminiGenerationConfig(t *testing.T) {
 	generationConfig, ok := toGeminiGenerationConfig(testStructuredOutput())
 	if !ok {
@@ -103,23 +123,36 @@ func TestProviderErrorAdapters(t *testing.T) {
 			t.Fatal("Anthropic source error was not retained")
 		}
 	})
+
+	t.Run("DeepSeek", func(t *testing.T) {
+		source := &openai.Error{
+			StatusCode: http.StatusTooManyRequests,
+			Code:       "rate_limit_exceeded",
+			Message:    "slow down",
+		}
+		got := requireProviderError(t, toDeepSeekProviderError(source))
+		assertProviderError(t, got, "deepseek", http.StatusTooManyRequests, "rate_limit_exceeded", true)
+		if !errors.Is(got, source) {
+			t.Fatal("DeepSeek source error was not retained")
+		}
+	})
 }
 
-func requireProviderError(t *testing.T, err error) *model.ProviderError {
+func requireProviderError(t *testing.T, err error) *gateway.ProviderError {
 	t.Helper()
 	if err == nil {
 		t.Fatal("expected provider error")
 	}
-	var providerErr *model.ProviderError
+	var providerErr *gateway.ProviderError
 	if !errors.As(err, &providerErr) {
-		t.Fatalf("error type = %T, want *model.ProviderError", err)
+		t.Fatalf("error type = %T, want *gateway.ProviderError", err)
 	}
 	return providerErr
 }
 
 func assertProviderError(
 	t *testing.T,
-	got *model.ProviderError,
+	got *gateway.ProviderError,
 	provider string,
 	statusCode int,
 	code string,

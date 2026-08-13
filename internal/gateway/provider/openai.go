@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"sort"
 	"strings"
 
@@ -20,7 +20,7 @@ type OpenAIProvider struct {
 	instanceID string
 }
 
-func NewOpenAI(apiKey, baseURL string) model.Provider {
+func NewOpenAI(apiKey, baseURL string) gateway.Provider {
 	opts := []option.RequestOption{}
 	if apiKey != "" {
 		opts = append(opts, option.WithAPIKey(apiKey))
@@ -30,15 +30,15 @@ func NewOpenAI(apiKey, baseURL string) model.Provider {
 	}
 	return &OpenAIProvider{
 		client:     openai.NewClient(opts...),
-		instanceID: model.StableProviderInstanceID("openai", baseURL),
+		instanceID: gateway.StableProviderInstanceID("openai", baseURL),
 	}
 }
 
 func (p *OpenAIProvider) Name() string       { return "openai" }
 func (p *OpenAIProvider) InstanceID() string { return p.instanceID }
 
-func (p *OpenAIProvider) Capabilities() model.ProviderCapabilities {
-	return model.ProviderCapabilities{
+func (p *OpenAIProvider) Capabilities() gateway.ProviderCapabilities {
+	return gateway.ProviderCapabilities{
 		StructuredOutput: true,
 		ToolCalling:      true,
 		Streaming:        true,
@@ -106,7 +106,7 @@ func toOpenAIProviderError(err error) error {
 			code = apiErr.Type
 		}
 	}
-	return model.NewProviderError("openai", statusCode, code, err)
+	return gateway.NewProviderError("openai", statusCode, code, err)
 }
 
 func toOpenAIResponseFormat(output *llm.StructuredOutput) (openai.ChatCompletionNewParamsResponseFormatUnion, bool) {
@@ -150,7 +150,7 @@ func (p *OpenAIProvider) Call(ctx context.Context, params llm.CallParams) (*llm.
 	return mapOpenAIResponse(resp, p.instanceID, params.Model), nil
 }
 
-func (p *OpenAIProvider) Stream(ctx context.Context, params llm.CallParams, sink model.StreamSink) (*llm.StreamResult, error) {
+func (p *OpenAIProvider) Stream(ctx context.Context, params llm.CallParams, sink gateway.StreamSink) (*llm.StreamResult, error) {
 	msgs := toOpenAIMessages(params.Messages, p.instanceID, params.Model)
 	tools := toOpenAITools(params.Tools)
 
@@ -239,7 +239,7 @@ func newOpenAIReasoning(content, providerInstanceID, modelID string, keepContent
 	}
 }
 
-func (a *openAIStreamAccum) apply(evt openai.ChatCompletionChunk, sink model.StreamSink) {
+func (a *openAIStreamAccum) apply(evt openai.ChatCompletionChunk, sink gateway.StreamSink) {
 	for _, choice := range evt.Choices {
 		// Compatible APIs stream rationale separately from answer text.
 		// Accumulate for tool-loop continuation; also forward displayable
@@ -280,7 +280,7 @@ func (a *openAIStreamAccum) apply(evt openai.ChatCompletionChunk, sink model.Str
 	}
 }
 
-func (a *openAIStreamAccum) finalize(sink model.StreamSink) *llm.StreamResult {
+func (a *openAIStreamAccum) finalize(sink gateway.StreamSink) *llm.StreamResult {
 	if clean, dsmlCalls, parsed := parseDSMLToolCalls(a.result.Content); parsed {
 		a.result.Content = clean
 		a.result.ToolCalls = append(a.result.ToolCalls, dsmlCalls...)

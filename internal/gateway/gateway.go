@@ -1,5 +1,5 @@
-// Package model provides the LLM gateway abstraction.
-package model
+// Package gateway provides the LLM gateway abstraction.
+package gateway
 
 import (
 	"context"

@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"go-code-agent/internal/config"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 )
 
 func TestRunnerPropagatesReasoningConfigToModelCalls(t *testing.T) {
@@ -26,7 +26,7 @@ func TestRunnerPropagatesReasoningConfigToModelCalls(t *testing.T) {
 			fake := &fakeProvider{name: "reasoner", reasoning: true, content: "done"}
 			runner := NewRunner(
 				NewExploreProfile(),
-				model.NewGateway(fake, model.NewRoleThrottle(10)),
+				gateway.NewGateway(fake, gateway.NewRoleThrottle(10)),
 				nil, nil, tc.cfg,
 			)
 			out := &TurnOutcome{}

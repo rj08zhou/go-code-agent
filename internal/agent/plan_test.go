@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	taskpkg "go-code-agent/internal/task"
 	"go-code-agent/internal/tool"
@@ -109,7 +109,7 @@ func TestRunnerPlanEstablishedOnlyBySuccessfulPlanningMutations(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeProvider{name: "fake", content: "done"}
-			gateway := model.NewGateway(fake, model.NewRoleThrottle(10))
+			gw := gateway.NewGateway(fake, gateway.NewRoleThrottle(10))
 			catalog := tool.NewToolCatalog()
 			catalog.RegisterAll([]tool.ToolDefinition{{
 				Name:    tc.toolName,
@@ -118,7 +118,7 @@ func TestRunnerPlanEstablishedOnlyBySuccessfulPlanningMutations(t *testing.T) {
 			}})
 			runner := NewRunner(
 				NewLeadProfile("test"),
-				gateway,
+				gw,
 				tool.NewExecutor(catalog, nil, nil),
 				&tool.ToolScope{Role: "lead"},
 				nil,
@@ -158,13 +158,13 @@ func TestRunnerPlanStateMatchesProductionPlanningTools(t *testing.T) {
 				ID: "plan", Name: tc.toolName, Arguments: tc.arguments,
 			}}}
 			fake.withOneShot()
-			gateway := model.NewGateway(fake, model.NewRoleThrottle(10))
+			gw := gateway.NewGateway(fake, gateway.NewRoleThrottle(10))
 			catalog := tool.NewToolCatalog()
 			catalog.RegisterAll(tool.BuiltinTools(
 				taskpkg.NewService(t.TempDir()), &taskpkg.TodoManager{}, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 			))
 			runner := NewRunner(
-				NewLeadProfile("test"), gateway, tool.NewExecutor(catalog, nil, nil),
+				NewLeadProfile("test"), gw, tool.NewExecutor(catalog, nil, nil),
 				&tool.ToolScope{Role: "lead", CanRead: true, CanWrite: true, CanExecute: true}, nil,
 			)
 
@@ -184,7 +184,7 @@ func TestRunnerPlanStateMatchesProductionPlanningTools(t *testing.T) {
 
 func TestRunnerResetsPlanEstablishedForEveryRun(t *testing.T) {
 	fake := &fakeProvider{name: "fake", content: "done"}
-	gateway := model.NewGateway(fake, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fake, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{{
 		Name:    "TodoWrite",
@@ -193,7 +193,7 @@ func TestRunnerResetsPlanEstablishedForEveryRun(t *testing.T) {
 	}})
 	runner := NewRunner(
 		NewLeadProfile("test"),
-		gateway,
+		gw,
 		tool.NewExecutor(catalog, nil, nil),
 		&tool.ToolScope{Role: "lead"},
 		nil,

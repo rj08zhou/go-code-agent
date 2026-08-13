@@ -35,7 +35,7 @@
 ### 环境要求
 
 - Go `1.25.3`（以 `go.mod` 为准）
-- 至少一个 LLM API Key（`OPENAI_API_KEY` 或 `ANTHROPIC_API_KEY`）
+- 至少一个 LLM API Key（`OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 或 `DEEPSEEK_API_KEY`）
 - 建议安装 Git（Teammate worktree 与可选 snapshot 依赖 Git）
 
 ### 安装
@@ -59,14 +59,19 @@ export OPENAI_API_KEY="sk-..."
 export MODEL_ID="gpt-4o"
 ./agent
 
-# OpenAI 兼容接口（如智谱 GLM、DeepSeek、本地 Ollama）
+# OpenAI 兼容接口（如智谱 GLM、本地 Ollama、DeepSeek Chat Completions）
 export OPENAI_API_KEY="<key>"
 export OPENAI_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
 export MODEL_ID="glm-4.7-flash"
 ./agent
 
+# DeepSeek Responses API（deepseek-v4-flash / deepseek-v4-pro）
+export DEEPSEEK_API_KEY="sk-..."
+export MODEL_ID="deepseek-v4-flash"
+./agent
+
 # 强制指定提供商（忽略 MODEL_ID 前缀推断）
-export LLM_PROVIDER="anthropic"  # openai | anthropic
+export LLM_PROVIDER="anthropic"  # openai | anthropic | deepseek
 ./agent
 
 # 启用 LLM-as-Judge（默认配置）
@@ -135,9 +140,10 @@ export SNAPSHOT_ENABLED=1
                ▼                               ▼
 ┌──────────────────────────┐   ┌───────────────────────────────────┐
 │  MODEL GATEWAY           │   │  TOOL PIPELINE                    │
-│  (internal/model)        │   │  (internal/tool)                  │
+│  (internal/gateway)      │   │  (internal/tool)                  │
 │                          │   │                                   │
-│  openai / anthropic      │   │  39 built-in + mcp__* tools       │
+│  openai / anthropic /    │   │  39 built-in + mcp__* tools       │
+│  deepseek                │   │                                   │
 │  role throttle + retry   │   │  validate → capability → preview  │
 │                          │   │  → HITL → timeout → sanitize      │
 └──────────────────────────┘   └────────────────┬──────────────────┘
@@ -228,13 +234,15 @@ REPL 将新消息追加到 HistoryStore
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `MODEL_ID` | `claude-opus-4.7` | 模型 ID（也用于推断提供商） |
-| `LLM_PROVIDER` | 自动推断 | 强制提供商：`openai` \| `anthropic` |
+| `LLM_PROVIDER` | 自动推断 | 强制提供商：`openai` \| `anthropic` \| `deepseek` |
 | `ANTHROPIC_API_KEY` | — | Anthropic 模型必需 |
 | `ANTHROPIC_BASE_URL` | SDK 默认 | Anthropic 网关/代理 |
 | `OPENAI_API_KEY` | — | OpenAI / 兼容接口必需 |
 | `OPENAI_BASE_URL` | SDK 默认 | 代理或本地模型端点 |
+| `DEEPSEEK_API_KEY` | — | DeepSeek Responses（`deepseek-v4-*`）必需 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek Responses 端点 |
 | `REASONING_ENABLED` | 关闭 | 为 Agent 调用启用 Provider 原生推理；思考过程以暗色品红 `[thinking]` 流式展示，不透明状态不会写入会话历史 |
-| `REASONING_EFFORT` | `medium` | OpenAI 兼容推理强度：`minimal` \| `low` \| `medium` \| `high` |
+| `REASONING_EFFORT` | `medium` | 推理强度：`minimal` \| `low` \| `medium` \| `high`（DeepSeek Responses 将 `minimal` 映射为 `low`） |
 | `LLM_MAX_QPS` | `4.0` | 进程级 LLM 请求/秒 |
 | `LLM_MAX_BURST` | `8` | 令牌桶突发容量 |
 | `LLM_MAX_CONCURRENCY` | `4` | 最大并发 LLM 调用 |
@@ -320,7 +328,7 @@ go-code-agent/
 │   ├── application/             # 组合根（Application、SessionRuntime）
 │   ├── agent/                   # Runner 循环、explore、teammate、judge、压缩
 │   ├── tool/                    # Catalog、executor、内置 handlers
-│   ├── model/                   # Gateway + provider 实现
+│   ├── gateway/                 # LLM gateway + provider 实现
 │   ├── hitl/               # HITL manager + ApprovalAdapter
 │   ├── security/                # 路径沙箱、bash 策略、ApprovalState、SSRF、diff
 │   ├── session/                 # 会话索引与 meta.json
@@ -445,7 +453,10 @@ MCP 服务器启动/批准后，以 `mcp__<server>__<tool>` 形式注册到会�
 支持的后端：
 
 - Anthropic API（`anthropic-sdk-go`）
-- OpenAI API 及 OpenAI 兼容端点（`openai-go`）
+- OpenAI Chat Completions 及 OpenAI 兼容端点（`openai-go`）
+- DeepSeek Responses API（`openai-go` Responses 客户端，`deepseek-v4-*`）
+
+设置 `DEEPSEEK_API_KEY` 后，`deepseek-v4-flash` / `deepseek-v4-pro` 会走独立的 DeepSeek Responses 适配器。旧版 DeepSeek Chat Completions 模型（如 `deepseek-chat`）仍通过 `OPENAI_API_KEY` + `OPENAI_BASE_URL`。
 
 ### 提供商选择逻辑
 
@@ -710,7 +721,7 @@ LLM 调用会追加到 `{sessionDir}/usage.jsonl`，并同时向 event sinks 发
 | 包 | 用途 |
 |----|------|
 | `github.com/anthropics/anthropic-sdk-go` | Anthropic API 客户端 |
-| `github.com/openai/openai-go` | OpenAI / 兼容 API 客户端 |
+| `github.com/openai/openai-go` | OpenAI Chat Completions、兼容接口，以及 DeepSeek Responses |
 | `github.com/chzyer/readline` | 带历史的交互 REPL |
 | `golang.org/x/net` | web fetch/search 的 HTML 解析 |
 

@@ -33,7 +33,7 @@ This project is a CLI/REPL application — not an HTTP service and not an IDE pl
 ### Prerequisites
 
 - Go `1.25.3` (see `go.mod`)
-- At least one LLM API key (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`)
+- At least one LLM API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `DEEPSEEK_API_KEY`)
 - Git recommended (teammate worktrees and optional snapshots depend on it)
 
 ### Installation
@@ -57,14 +57,19 @@ export OPENAI_API_KEY="sk-..."
 export MODEL_ID="gpt-4o"
 ./agent
 
-# OpenAI-compatible (e.g. Zhipu GLM, DeepSeek, local Ollama)
+# OpenAI-compatible (e.g. Zhipu GLM, local Ollama, DeepSeek Chat Completions)
 export OPENAI_API_KEY="<key>"
 export OPENAI_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
 export MODEL_ID="glm-4.7-flash"
 ./agent
 
+# DeepSeek Responses API (deepseek-v4-flash / deepseek-v4-pro)
+export DEEPSEEK_API_KEY="sk-..."
+export MODEL_ID="deepseek-v4-flash"
+./agent
+
 # Force provider regardless of MODEL_ID prefix
-export LLM_PROVIDER="anthropic"  # openai | anthropic
+export LLM_PROVIDER="anthropic"  # openai | anthropic | deepseek
 ./agent
 
 # Enable LLM-as-Judge with default settings
@@ -133,9 +138,10 @@ Default approval mode: **`safe-auto`** (lower-risk reviews continue automaticall
                ▼                               ▼
 ┌──────────────────────────┐   ┌───────────────────────────────────┐
 │  MODEL GATEWAY           │   │  TOOL PIPELINE                    │
-│  (internal/model)        │   │  (internal/tool)                  │
+│  (internal/gateway)      │   │  (internal/tool)                  │
 │                          │   │                                   │
-│  openai / anthropic      │   │  39 built-in + mcp__* tools       │
+│  openai / anthropic /    │   │  39 built-in + mcp__* tools       │
+│  deepseek                │   │                                   │
 │  role throttle + retry   │   │  validate → capability → preview  │
 │                          │   │  → HITL → timeout → sanitize      │
 └──────────────────────────┘   └────────────────┬──────────────────┘
@@ -226,13 +232,15 @@ Session Switch / New / Archive
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_ID` | `claude-opus-4.7` | Model identifier (also helps infer provider) |
-| `LLM_PROVIDER` | auto-infer | Force provider: `openai` \| `anthropic` |
+| `LLM_PROVIDER` | auto-infer | Force provider: `openai` \| `anthropic` \| `deepseek` |
 | `ANTHROPIC_API_KEY` | — | Required for Anthropic models |
 | `ANTHROPIC_BASE_URL` | SDK default | Gateway/proxy override for Anthropic |
 | `OPENAI_API_KEY` | — | Required for OpenAI / compatible models |
 | `OPENAI_BASE_URL` | SDK default | Proxy/local model endpoint |
+| `DEEPSEEK_API_KEY` | — | Required for DeepSeek Responses (`deepseek-v4-*`) |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek Responses endpoint |
 | `REASONING_ENABLED` | off | Opt into provider-native reasoning for agent calls; thinking streams to the terminal in dim magenta (`[thinking]`), opaque state is never persisted in history |
-| `REASONING_EFFORT` | `medium` | OpenAI-compatible effort hint: `minimal` \| `low` \| `medium` \| `high` |
+| `REASONING_EFFORT` | `medium` | Effort hint: `minimal` \| `low` \| `medium` \| `high` (DeepSeek Responses maps `minimal` → `low`) |
 | `LLM_MAX_QPS` | `4.0` | Process-wide LLM requests/sec |
 | `LLM_MAX_BURST` | `8` | Token-bucket burst |
 | `LLM_MAX_CONCURRENCY` | `4` | Max in-flight LLM calls |
@@ -318,7 +326,7 @@ go-code-agent/
 │   ├── application/             # Composition root (Application, SessionRuntime)
 │   ├── agent/                   # Runner loop, explore, teammates, judge, compression
 │   ├── tool/                    # Catalog, executor, builtin handlers
-│   ├── model/                   # Gateway + provider implementations
+│   ├── gateway/                 # LLM gateway + provider implementations
 │   ├── hitl/               # HITL manager + ApprovalAdapter
 │   ├── security/                # Path sandbox, bash policy, ApprovalState, SSRF, diff
 │   ├── session/                 # Session index + meta.json
@@ -442,7 +450,10 @@ Tools registered at runtime as `mcp__<server>__<tool>` after MCP servers start /
 Supported backends:
 
 - Anthropic API (`anthropic-sdk-go`)
-- OpenAI API and OpenAI-compatible endpoints (`openai-go`)
+- OpenAI Chat Completions and OpenAI-compatible endpoints (`openai-go`)
+- DeepSeek Responses API (`openai-go` Responses client, `deepseek-v4-*`)
+
+`deepseek-v4-flash` / `deepseek-v4-pro` are selected as the dedicated DeepSeek provider when `DEEPSEEK_API_KEY` is set. Older DeepSeek Chat Completions models (`deepseek-chat`, …) still go through `OPENAI_API_KEY` + `OPENAI_BASE_URL`.
 
 ### Provider Selection Logic
 
@@ -667,7 +678,7 @@ Workspace `.mcp.json` and/or `MCP_SERVERS` style configuration (see manager for 
 MCP subprocesses receive a minimal baseline environment (`PATH`, `HOME`, locale,
 terminal, and temporary-directory variables). Only variables explicitly declared
 in the server's `env` configuration are added on top; host credentials such as
-`OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are not inherited automatically.
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `DEEPSEEK_API_KEY` are not inherited automatically.
 
 ### Circuit Breaker / Safety
 
@@ -715,7 +726,7 @@ View aggregates with `/usage`.
 | Package | Purpose |
 |---------|---------|
 | `github.com/anthropics/anthropic-sdk-go` | Anthropic API client |
-| `github.com/openai/openai-go` | OpenAI / compatible API client |
+| `github.com/openai/openai-go` | OpenAI Chat Completions, compatible APIs, and DeepSeek Responses |
 | `github.com/chzyer/readline` | Interactive REPL with history |
 | `golang.org/x/net` | HTML parsing for web fetch/search |
 

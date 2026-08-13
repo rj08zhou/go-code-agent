@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/tool"
 	"go-code-agent/internal/utils"
@@ -60,11 +60,11 @@ type Judge struct {
 	minScore     int
 	maxHistory   int
 	promptLoader *prompt.Loader
-	gateway      *model.Gateway
+	gateway      *gateway.Gateway
 	mu           sync.RWMutex
 }
 
-func NewJudge(enabled bool, model string, minScore int, pl *prompt.Loader, gw *model.Gateway) *Judge {
+func NewJudge(enabled bool, model string, minScore int, pl *prompt.Loader, gw *gateway.Gateway) *Judge {
 	if minScore <= 0 {
 		minScore = 7
 	}

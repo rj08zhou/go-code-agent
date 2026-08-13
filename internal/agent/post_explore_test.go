@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"go-code-agent/internal/config"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/tool"
 )
@@ -91,7 +91,7 @@ func TestRunner_PostExploreReadBudgetAndNudge(t *testing.T) {
 			{}, // final answer
 		},
 	}
-	gw := model.NewGateway(fake, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fake, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{
@@ -146,7 +146,7 @@ func TestExecuteToolBatch_InjectsPostExploreNudge(t *testing.T) {
 			return tool.Succeeded("summary")
 		},
 	}})
-	runner := NewRunner(NewLeadProfile("test"), model.NewGateway(&fakeProvider{name: "fake"}, model.NewRoleThrottle(10)),
+	runner := NewRunner(NewLeadProfile("test"), gateway.NewGateway(&fakeProvider{name: "fake"}, gateway.NewRoleThrottle(10)),
 		tool.NewExecutor(catalog, nil, nil), &tool.ToolScope{Role: "lead", CanRead: true}, nil)
 
 	out := &TurnOutcome{}
@@ -179,7 +179,7 @@ func TestRunner_PostExploreBlocksBashFind(t *testing.T) {
 			{},
 		},
 	}
-	gw := model.NewGateway(fake, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fake, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{

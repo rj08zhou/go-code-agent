@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/task"
 	"go-code-agent/internal/tool"
@@ -50,7 +50,7 @@ func exploreToolNames(agentType string, hasApproval bool) []string {
 // SubagentRunner runs an isolated read-only agent loop using the unified Runner
 // and returns a summary string.
 type SubagentRunner struct {
-	gateway      *model.Gateway
+	gateway      *gateway.Gateway
 	catalog      *tool.ToolCatalog
 	cfg          *config.Config
 	modelID      string
@@ -66,7 +66,7 @@ type SubagentRunner struct {
 // security up front. A nil approval checker fail-closes bash out of the
 // explore whitelist; network/sanitizer nils disable those gates (tests only).
 func NewSubagentRunner(
-	gw *model.Gateway,
+	gw *gateway.Gateway,
 	catalog *tool.ToolCatalog,
 	cfg *config.Config,
 	pl *prompt.Loader,
@@ -156,7 +156,7 @@ func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir, so
 		llm.UserMessage(prompt),
 	}
 
-	traceID := model.NewTraceID()
+	traceID := gateway.NewTraceID()
 	outcome := runner.RunWithTaskBatch(ctx, messages, traceID, task.NewBatchID(agentType))
 
 	finalText := lastAssistantText(outcome.Messages)
@@ -276,7 +276,7 @@ func lastAssistantText(msgs []llm.Message) string {
 	return ""
 }
 
-// prefixedSink wraps a model.StreamSink with a prefix and color consistent
+// prefixedSink wraps a gateway.StreamSink with a prefix and color consistent
 // with the original project's terminal output conventions.
 //
 //	lead   → green body, no [lead] prefix

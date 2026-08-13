@@ -13,12 +13,12 @@ import (
 	"go-code-agent/internal/background"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/history"
 	"go-code-agent/internal/hitl"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/mcp"
 	"go-code-agent/internal/memory"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/skill"
@@ -147,6 +147,8 @@ func providerEndpointHost(cfg *config.Config, providerName string) string {
 		return safeEndpointHost(cfg.OpenAIBaseURL, "api.openai.com")
 	case "anthropic":
 		return safeEndpointHost(cfg.AnthropicBaseURL, "api.anthropic.com")
+	case "deepseek":
+		return safeEndpointHost(cfg.DeepSeekBaseURL, "api.deepseek.com")
 	case "gemini":
 		return "generativelanguage.googleapis.com"
 	default:
@@ -333,13 +335,13 @@ func wireObservability(rt *SessionRuntime, params RunnerParams, wb *wireBundle, 
 	// Gateway is process-scoped; observers are session-scoped. Carry them on
 	// the runtime context so every call made by this session sees the same
 	// event sink and usage recorder without mutating shared Gateway state.
-	observers := model.CallObservers{Events: allEvents}
+	observers := gateway.CallObservers{Events: allEvents}
 	if params.Usage != nil {
 		observers.Usage = func(role, providerName, modelID, traceID string, usage llm.Usage, duration float64) {
 			params.Usage.Record(providerName, role, modelID, traceID, usage, duration)
 		}
 	}
-	rt.Ctx = model.WithCallObservers(rt.Ctx, observers)
+	rt.Ctx = gateway.WithCallObservers(rt.Ctx, observers)
 	wb.teamMgr.SetSessionCtx(rt.Ctx)
 	return sessionLog
 }

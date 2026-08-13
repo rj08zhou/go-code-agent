@@ -11,9 +11,9 @@ import (
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/application"
 	"go-code-agent/internal/background"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/history"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/tool"
 )
 
@@ -67,13 +67,13 @@ func TestAppendHistoryMessagesReturnsWriteError(t *testing.T) {
 type replPersistenceProvider struct{}
 
 func (replPersistenceProvider) Name() string { return "repl-persistence-test" }
-func (replPersistenceProvider) Capabilities() model.ProviderCapabilities {
-	return model.ProviderCapabilities{Streaming: true}
+func (replPersistenceProvider) Capabilities() gateway.ProviderCapabilities {
+	return gateway.ProviderCapabilities{Streaming: true}
 }
 func (replPersistenceProvider) Call(context.Context, llm.CallParams) (*llm.Completion, error) {
 	return &llm.Completion{Content: "answer", FinishReason: "stop"}, nil
 }
-func (replPersistenceProvider) Stream(_ context.Context, _ llm.CallParams, sink model.StreamSink) (*llm.StreamResult, error) {
+func (replPersistenceProvider) Stream(_ context.Context, _ llm.CallParams, sink gateway.StreamSink) (*llm.StreamResult, error) {
 	sink.OnTextDelta("answer")
 	sink.OnDone()
 	return &llm.StreamResult{Content: "answer", FinishReason: "stop"}, nil
@@ -89,7 +89,7 @@ func TestReplContinuesInMemoryAfterUserHistoryFailure(t *testing.T) {
 	catalog := tool.NewToolCatalog()
 	runner := agent.NewRunner(
 		agent.NewLeadProfile("system"),
-		model.NewGateway(replPersistenceProvider{}, model.NewRoleThrottle(1)),
+		gateway.NewGateway(replPersistenceProvider{}, gateway.NewRoleThrottle(1)),
 		tool.NewExecutor(catalog, nil, nil),
 		nil,
 		nil,

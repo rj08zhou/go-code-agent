@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/store"
 	"go-code-agent/internal/task"
@@ -42,7 +42,7 @@ type TeammateManager struct {
 	config     teamConfig
 	mu         sync.Mutex
 
-	gateway   *model.Gateway
+	gateway   *gateway.Gateway
 	bus       *team.MessageBus
 	taskSvc   *task.Service
 	protocols *team.ProtocolStore
@@ -80,7 +80,7 @@ func (tm *TeammateManager) SetReasoningConfig(cfg *config.Config) {
 // security up front so teammate work phases cannot silently run ungated.
 func NewTeammateManager(
 	dir string,
-	gw *model.Gateway,
+	gw *gateway.Gateway,
 	bus *team.MessageBus,
 	taskSvc *task.Service,
 	protocols *team.ProtocolStore,

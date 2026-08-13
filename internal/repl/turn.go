@@ -6,8 +6,8 @@ import (
 	"os"
 
 	"go-code-agent/internal/agent"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 )
 
 func (r *Loop) runUserTurn(sessionCtx context.Context, turns *turnCanceller, messages []llm.Message, line string) []llm.Message {
@@ -33,7 +33,7 @@ func (r *Loop) runUserTurn(sessionCtx context.Context, turns *turnCanceller, mes
 	outcome := r.built.Runtime.Runner.Run(
 		agent.WithPersistedBoundary(turnCtx, &before),
 		messages,
-		model.NewTraceID(),
+		gateway.NewTraceID(),
 	)
 	turns.disarm()
 	cancelTurn()

@@ -2,21 +2,21 @@ package agent
 
 import (
 	"context"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"testing"
 )
 
 type lessonProvider struct{}
 
 func (lessonProvider) Name() string { return "lesson-test" }
-func (lessonProvider) Capabilities() model.ProviderCapabilities {
-	return model.ProviderCapabilities{}
+func (lessonProvider) Capabilities() gateway.ProviderCapabilities {
+	return gateway.ProviderCapabilities{}
 }
 func (lessonProvider) Call(context.Context, llm.CallParams) (*llm.Completion, error) {
 	return &llm.Completion{Content: "Prefer atomic writes and validate paths before mutation."}, nil
 }
-func (lessonProvider) Stream(context.Context, llm.CallParams, model.StreamSink) (*llm.StreamResult, error) {
+func (lessonProvider) Stream(context.Context, llm.CallParams, gateway.StreamSink) (*llm.StreamResult, error) {
 	return &llm.StreamResult{Content: "unused"}, nil
 }
 
@@ -29,7 +29,7 @@ func (m *lessonMemory) Write(content, category string) string {
 func (*lessonMemory) Search(string, int, int, string) string { return "No relevant memories found." }
 
 func TestLLMLessonWriter_RecordFailureUsesLLMAndMemory(t *testing.T) {
-	gw := model.NewGateway(lessonProvider{}, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(lessonProvider{}, gateway.NewRoleThrottle(10))
 	mem := &lessonMemory{}
 	writer := NewLLMLessonWriter(gw, mem, nil, "lesson-model")
 	writer.RecordFailure(context.Background(), []llm.Message{

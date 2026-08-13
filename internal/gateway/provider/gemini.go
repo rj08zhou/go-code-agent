@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"io"
 	"net/http"
 	"os"
@@ -19,7 +19,7 @@ type GeminiProvider struct {
 	instanceID string
 }
 
-func NewGemini(apiKey, baseURL string) model.Provider {
+func NewGemini(apiKey, baseURL string) gateway.Provider {
 	if baseURL == "" {
 		baseURL = "https://generativelanguage.googleapis.com"
 	}
@@ -27,15 +27,15 @@ func NewGemini(apiKey, baseURL string) model.Provider {
 		apiKey:     apiKey,
 		baseURL:    baseURL,
 		client:     &http.Client{},
-		instanceID: model.StableProviderInstanceID("gemini", baseURL),
+		instanceID: gateway.StableProviderInstanceID("gemini", baseURL),
 	}
 }
 
 func (p *GeminiProvider) Name() string       { return "gemini" }
 func (p *GeminiProvider) InstanceID() string { return p.instanceID }
 
-func (p *GeminiProvider) Capabilities() model.ProviderCapabilities {
-	return model.ProviderCapabilities{
+func (p *GeminiProvider) Capabilities() gateway.ProviderCapabilities {
+	return gateway.ProviderCapabilities{
 		StructuredOutput: true,
 		ToolCalling:      false, // Gemini REST API does not support tool_calls
 		Streaming:        false, // Only Call is implemented; no Stream method
@@ -125,7 +125,7 @@ func (p *GeminiProvider) Call(ctx context.Context, params llm.CallParams) (*llm.
 	}, nil
 }
 
-func (p *GeminiProvider) Stream(ctx context.Context, params llm.CallParams, sink model.StreamSink) (*llm.StreamResult, error) {
+func (p *GeminiProvider) Stream(ctx context.Context, params llm.CallParams, sink gateway.StreamSink) (*llm.StreamResult, error) {
 	comp, err := p.Call(ctx, params)
 	if err != nil {
 		return nil, err

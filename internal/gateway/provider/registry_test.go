@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"go-code-agent/internal/config"
-	"go-code-agent/internal/model"
+	"go-code-agent/internal/gateway"
 )
 
 func TestJudgeProviderUsesDedicatedCredentials(t *testing.T) {
@@ -25,8 +25,8 @@ func TestJudgeProviderUsesDedicatedCredentials(t *testing.T) {
 	if jp.Name() != "anthropic" {
 		t.Fatalf("provider name = %q, want anthropic", jp.Name())
 	}
-	wantID := model.StableProviderInstanceID("anthropic", "https://judge.example.com")
-	if id := model.ProviderInstanceID(jp); id != wantID {
+	wantID := gateway.StableProviderInstanceID("anthropic", "https://judge.example.com")
+	if id := gateway.ProviderInstanceID(jp); id != wantID {
 		t.Fatalf("instance ID = %q, want %q (isolated from main agent)", id, wantID)
 	}
 }
@@ -42,6 +42,33 @@ func TestJudgeProviderFallsBackToRegisteredProviderWithoutDedicatedCreds(t *test
 	jp := reg.JudgeProvider(cfg)
 	if jp != main {
 		t.Fatalf("expected registered anthropic provider reuse, got %#v", jp)
+	}
+}
+
+func TestInferName_DeepSeekV4UsesResponsesProvider(t *testing.T) {
+	if got := inferName("deepseek-v4-flash"); got != "deepseek" {
+		t.Fatalf("inferName(deepseek-v4-flash) = %q", got)
+	}
+	if got := inferName("deepseek-v4-pro"); got != "deepseek" {
+		t.Fatalf("inferName(deepseek-v4-pro) = %q", got)
+	}
+	// Chat Completions models keep the OpenAI-compatible path.
+	if got := inferName("deepseek-chat"); got != "" {
+		t.Fatalf("inferName(deepseek-chat) = %q, want empty so Chat Completions still works", got)
+	}
+}
+
+func TestPickFallsBackToOpenAIWhenDeepSeekUnregistered(t *testing.T) {
+	reg := NewRegistry()
+	openai := NewOpenAI("openai-key", "")
+	reg.Register(openai)
+
+	got, err := reg.Pick(&config.Config{ModelID: "deepseek-v4-flash"})
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	if got != openai {
+		t.Fatalf("expected OpenAI fallback, got %s", got.Name())
 	}
 }
 

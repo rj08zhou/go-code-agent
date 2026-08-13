@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"go-code-agent/internal/event"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/tool"
 )
@@ -43,7 +43,7 @@ func TestToolEventPayloadOnlyExposesInvestigationMetadata(t *testing.T) {
 
 func TestRunner_BlocksRepeatedIdenticalToolCalls(t *testing.T) {
 	fake := &fakeProvider{name: "fake", content: "continue"}
-	gateway := model.NewGateway(fake, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fake, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{{
 		Name:    "noop",
@@ -51,7 +51,7 @@ func TestRunner_BlocksRepeatedIdenticalToolCalls(t *testing.T) {
 		Handler: func(*tool.ToolScope, json.RawMessage) tool.Result { return tool.Succeeded("ok") },
 	}})
 
-	runner := NewRunner(NewExploreProfile(), gateway, tool.NewExecutor(catalog, nil, nil), &tool.ToolScope{
+	runner := NewRunner(NewExploreProfile(), gw, tool.NewExecutor(catalog, nil, nil), &tool.ToolScope{
 		Role:       "explore",
 		CanRead:    true,
 		CanExecute: true,

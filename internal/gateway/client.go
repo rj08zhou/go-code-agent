@@ -1,4 +1,4 @@
-package model
+package gateway
 
 import (
 	"context"

@@ -3,8 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/tool"
 	"os"
 	"path/filepath"
@@ -15,7 +15,7 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// fakeProvider implements model.Provider for integration testing.
+// fakeProvider implements gateway.Provider for integration testing.
 type fakeProvider struct {
 	name string
 
@@ -47,8 +47,8 @@ func (f *fakeProvider) InstanceID() string {
 	return f.name
 }
 
-func (f *fakeProvider) Capabilities() model.ProviderCapabilities {
-	return model.ProviderCapabilities{
+func (f *fakeProvider) Capabilities() gateway.ProviderCapabilities {
+	return gateway.ProviderCapabilities{
 		StructuredOutput: true,
 		ToolCalling:      true,
 		Streaming:        true,
@@ -88,7 +88,7 @@ func (f *fakeProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Co
 	}, nil
 }
 
-func (f *fakeProvider) Stream(ctx context.Context, params llm.CallParams, sink model.StreamSink) (*llm.StreamResult, error) {
+func (f *fakeProvider) Stream(ctx context.Context, params llm.CallParams, sink gateway.StreamSink) (*llm.StreamResult, error) {
 	f.lastParams = &params
 	f.callCount++
 	if f.callErr != nil {
@@ -114,7 +114,7 @@ func (f *fakeProvider) withOneShot() *fakeProvider {
 // TestRunner_Integration_ModelReceivesTools verifies the Runner passes tool defs to the model.
 func TestRunner_Integration_ModelReceivesTools(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{Name: "bash", Description: "Run shell", Effects: tool.Effects(tool.EffectExecuteProcess), Handler: func(scope *tool.ToolScope, args json.RawMessage) tool.Result { return tool.Succeeded("ok") }},
@@ -152,7 +152,7 @@ func TestRunner_Integration_ExecutesToolAndCollectsResult(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	fakeModel := &fakeProvider{name: "fake"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{
@@ -227,7 +227,7 @@ func TestRunner_Integration_ExecutesToolAndCollectsResult(t *testing.T) {
 // TestRunner_Integration_FailingToolProducesStructuredResult verifies structured failure status.
 func TestRunner_Integration_FailingToolProducesStructuredResult(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{
@@ -269,7 +269,7 @@ func TestRunner_Integration_FailingToolProducesStructuredResult(t *testing.T) {
 // TestRunner_Integration_CapabilityDenied verifies capability gating.
 func TestRunner_Integration_CapabilityDenied(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{
@@ -307,7 +307,7 @@ func TestRunner_Integration_CapabilityDenied(t *testing.T) {
 // TestRunner_Integration_ApprovalCheck verifies the approval checker.
 func TestRunner_Integration_ApprovalCheck(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{
@@ -346,7 +346,7 @@ func TestRunner_Integration_ApprovalCheck(t *testing.T) {
 // TestRunner_Integration_TimeoutTools verifies timeout produces structured status.
 func TestRunner_Integration_TimeoutTools(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{
@@ -388,7 +388,7 @@ func TestRunner_Integration_TimeoutTools(t *testing.T) {
 // TestRunner_Integration_MaxRoundsTermination verifies max rounds enforcement.
 func TestRunner_Integration_MaxRoundsTermination(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{
@@ -425,7 +425,7 @@ func TestRunner_Integration_MaxRoundsTermination(t *testing.T) {
 // TestRunner_Integration_MemoryCapabilityDenied verifies memory mutation gating.
 func TestRunner_Integration_MemoryCapabilityDenied(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{
@@ -464,7 +464,7 @@ func TestRunner_Integration_MemoryCapabilityDenied(t *testing.T) {
 // does NOT fire for agents with CanMemory=false (explore/teammate).
 func TestRunner_Integration_AutoLessonSkipsSubagent(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{
@@ -506,7 +506,7 @@ func TestRunner_Integration_AutoLessonSkipsSubagent(t *testing.T) {
 // tool failures. A run that completed without failures does not need a lesson.
 func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{
@@ -547,7 +547,7 @@ func TestRunner_Integration_AutoLessonFiresForLead(t *testing.T) {
 // does not run when every tool execution succeeded.
 func TestRunner_Integration_AutoLessonSkipsOnSuccess(t *testing.T) {
 	fakeModel := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
-	gw := model.NewGateway(fakeModel, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(fakeModel, gateway.NewRoleThrottle(10))
 	catalog := tool.NewToolCatalog()
 	catalog.RegisterAll([]tool.ToolDefinition{
 		{

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 )
 
 func TestUsageTrackerCreatesSessionDir(t *testing.T) {
@@ -87,7 +87,7 @@ func TestRunnerAccumulatesReasoningTokensAcrossModelCalls(t *testing.T) {
 	}
 	runner := NewRunner(
 		NewExploreProfile(),
-		model.NewGateway(fake, model.NewRoleThrottle(10)),
+		gateway.NewGateway(fake, gateway.NewRoleThrottle(10)),
 		nil, nil, nil,
 	)
 	out := &TurnOutcome{}

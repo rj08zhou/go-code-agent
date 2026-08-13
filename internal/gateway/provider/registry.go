@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"go-code-agent/internal/config"
-	"go-code-agent/internal/model"
+	"go-code-agent/internal/gateway"
 	"strings"
 	"sync"
 )
@@ -17,35 +17,36 @@ var ErrNoProvider = errors.New("no LLM provider available")
 // Registry holds all registered providers.
 type Registry struct {
 	mu        sync.RWMutex
-	providers map[string]model.Provider
-	builders  map[string]func(apiKey, baseURL string) model.Provider
+	providers map[string]gateway.Provider
+	builders  map[string]func(apiKey, baseURL string) gateway.Provider
 }
 
 func NewRegistry() *Registry {
 	r := &Registry{
-		providers: make(map[string]model.Provider),
-		builders:  make(map[string]func(apiKey, baseURL string) model.Provider),
+		providers: make(map[string]gateway.Provider),
+		builders:  make(map[string]func(apiKey, baseURL string) gateway.Provider),
 	}
 	// Builders let JudgeProvider construct an isolated instance when
 	// JUDGE_API_KEY / JUDGE_BASE_URL differ from the main agent credentials.
 	r.builders["openai"] = NewOpenAI
 	r.builders["anthropic"] = NewAnthropic
+	r.builders["deepseek"] = NewDeepSeek
 	return r
 }
 
-func (r *Registry) Register(p model.Provider) {
+func (r *Registry) Register(p gateway.Provider) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.providers[strings.ToLower(p.Name())] = p
 }
 
-func (r *Registry) RegisterBuilder(name string, fn func(apiKey, baseURL string) model.Provider) {
+func (r *Registry) RegisterBuilder(name string, fn func(apiKey, baseURL string) gateway.Provider) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.builders[strings.ToLower(name)] = fn
 }
 
-func (r *Registry) Pick(cfg *config.Config) (model.Provider, error) {
+func (r *Registry) Pick(cfg *config.Config) (gateway.Provider, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	// Explicit override wins
@@ -68,7 +69,7 @@ func (r *Registry) Pick(cfg *config.Config) (model.Provider, error) {
 	return nil, ErrNoProvider
 }
 
-func (r *Registry) JudgeProvider(cfg *config.Config) model.Provider {
+func (r *Registry) JudgeProvider(cfg *config.Config) gateway.Provider {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -103,6 +104,8 @@ func inferName(modelID string) string {
 		return "anthropic"
 	case strings.HasPrefix(m, "gemini-") || strings.HasPrefix(m, "gemini."):
 		return "gemini"
+	case strings.HasPrefix(m, "deepseek-v4"):
+		return "deepseek"
 	case strings.HasPrefix(m, "gpt-") || strings.HasPrefix(m, "o1") || strings.HasPrefix(m, "o3"):
 		return "openai"
 	}
@@ -111,13 +114,13 @@ func inferName(modelID string) string {
 
 // --- Helper: centralize provider selection ---
 
-func BuildGateway(cfg *config.Config, registry *Registry) (*model.Gateway, *model.RoleThrottle, error) {
+func BuildGateway(cfg *config.Config, registry *Registry) (*gateway.Gateway, *gateway.RoleThrottle, error) {
 	p, err := registry.Pick(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-	throttle := model.NewRoleThrottle(cfg.LLMMaxConcurrency)
-	gw := model.NewGateway(p, throttle)
+	throttle := gateway.NewRoleThrottle(cfg.LLMMaxConcurrency)
+	gw := gateway.NewGateway(p, throttle)
 
 	if cfg.JudgeEnabled && cfg.JudgeModel != "" {
 		if jp := registry.JudgeProvider(cfg); jp != nil {

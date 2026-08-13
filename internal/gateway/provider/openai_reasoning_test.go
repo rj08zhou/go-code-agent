@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 )
 
 func decodeRequestBody(t *testing.T, r *http.Request) map[string]any {
@@ -84,7 +84,7 @@ func TestOpenAIReasoningNonStreamingToolContinuation(t *testing.T) {
 		t.Fatalf("tool response lost reasoning state: %#v", first.Reasoning)
 	}
 	state := first.Reasoning.State
-	if state.Provider != model.ProviderInstanceID(p) || state.Model != params.Model || state.Kind != openAIReasoningContentKind {
+	if state.Provider != gateway.ProviderInstanceID(p) || state.Model != params.Model || state.Kind != openAIReasoningContentKind {
 		t.Fatalf("state binding = %#v", state)
 	}
 	var private string

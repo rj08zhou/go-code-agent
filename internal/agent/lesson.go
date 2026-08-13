@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"go-code-agent/internal/config"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"strings"
 )
@@ -20,13 +20,13 @@ type LessonMemory interface {
 // lesson. It deliberately performs one bounded, non-tool LLM call and writes
 // only the resulting summary to the lesson category.
 type LLMLessonWriter struct {
-	gateway *model.Gateway
+	gateway *gateway.Gateway
 	memory  LessonMemory
 	prompts *prompt.Loader
 	modelID string
 }
 
-func NewLLMLessonWriter(gateway *model.Gateway, memory LessonMemory, prompts *prompt.Loader, modelID string) *LLMLessonWriter {
+func NewLLMLessonWriter(gateway *gateway.Gateway, memory LessonMemory, prompts *prompt.Loader, modelID string) *LLMLessonWriter {
 	return &LLMLessonWriter{gateway: gateway, memory: memory, prompts: prompts, modelID: modelID}
 }
 

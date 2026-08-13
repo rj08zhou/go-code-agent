@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"sort"
 	"strings"
 
@@ -21,7 +21,7 @@ type AnthropicProvider struct {
 	instanceID string
 }
 
-func NewAnthropic(apiKey, baseURL string) model.Provider {
+func NewAnthropic(apiKey, baseURL string) gateway.Provider {
 	opts := []option.RequestOption{}
 	if apiKey != "" {
 		opts = append(opts, option.WithAPIKey(apiKey))
@@ -31,15 +31,15 @@ func NewAnthropic(apiKey, baseURL string) model.Provider {
 	}
 	return &AnthropicProvider{
 		client:     anthropic.NewClient(opts...),
-		instanceID: model.StableProviderInstanceID("anthropic", baseURL),
+		instanceID: gateway.StableProviderInstanceID("anthropic", baseURL),
 	}
 }
 
 func (p *AnthropicProvider) Name() string       { return "anthropic" }
 func (p *AnthropicProvider) InstanceID() string { return p.instanceID }
 
-func (p *AnthropicProvider) Capabilities() model.ProviderCapabilities {
-	return model.ProviderCapabilities{
+func (p *AnthropicProvider) Capabilities() gateway.ProviderCapabilities {
+	return gateway.ProviderCapabilities{
 		StructuredOutput: true,
 		ToolCalling:      true,
 		Streaming:        true,
@@ -57,7 +57,7 @@ func toAnthropicProviderError(err error) error {
 		statusCode = apiErr.StatusCode
 		code = string(apiErr.Type())
 	}
-	return model.NewProviderError("anthropic", statusCode, code, err)
+	return gateway.NewProviderError("anthropic", statusCode, code, err)
 }
 
 func toAnthropicOutputConfig(output *llm.StructuredOutput) (anthropic.OutputConfigParam, bool) {
@@ -100,7 +100,7 @@ func (p *AnthropicProvider) Call(ctx context.Context, params llm.CallParams) (*l
 	return mapAnthropicResponse(resp), nil
 }
 
-func (p *AnthropicProvider) Stream(ctx context.Context, params llm.CallParams, sink model.StreamSink) (*llm.StreamResult, error) {
+func (p *AnthropicProvider) Stream(ctx context.Context, params llm.CallParams, sink gateway.StreamSink) (*llm.StreamResult, error) {
 	sys, msgs := buildAnthropicMessages(params.Messages)
 	maxTok := int64(params.MaxTokens)
 	if maxTok <= 0 {
@@ -152,7 +152,7 @@ func newAnthropicStreamAccum() *anthropicStreamAccum {
 	}
 }
 
-func (a *anthropicStreamAccum) apply(ev anthropic.MessageStreamEventUnion, sink model.StreamSink) {
+func (a *anthropicStreamAccum) apply(ev anthropic.MessageStreamEventUnion, sink gateway.StreamSink) {
 	switch ev.Type {
 	case "message_start":
 		ms := ev.AsMessageStart()
@@ -200,7 +200,7 @@ func (a *anthropicStreamAccum) apply(ev anthropic.MessageStreamEventUnion, sink 
 	}
 }
 
-func (a *anthropicStreamAccum) finalize(sink model.StreamSink) *llm.StreamResult {
+func (a *anthropicStreamAccum) finalize(sink gateway.StreamSink) *llm.StreamResult {
 	indices := make([]int64, 0, len(a.blocks))
 	for idx := range a.blocks {
 		indices = append(indices, idx)

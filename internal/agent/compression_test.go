@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/history"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 )
 
@@ -321,7 +321,7 @@ func compressionHistoryFixture(t *testing.T) (*history.Store, []llm.Message) {
 func testCompression(t *testing.T, provider *fakeProvider, histStore *history.Store) *Compression {
 	t.Helper()
 	compression := NewCompression(
-		model.NewGateway(provider, model.NewRoleThrottle(2)),
+		gateway.NewGateway(provider, gateway.NewRoleThrottle(2)),
 		histStore,
 		t.TempDir(),
 		"fake",
