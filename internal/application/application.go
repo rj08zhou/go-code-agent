@@ -13,10 +13,10 @@ import (
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
-	"go-code-agent/internal/hitlaudit"
+	"go-code-agent/internal/gateway"
+	"go-code-agent/internal/gateway/provider"
+	"go-code-agent/internal/hitl"
 	"go-code-agent/internal/memory"
-	"go-code-agent/internal/model"
-	"go-code-agent/internal/model/provider"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/session"
@@ -34,12 +34,12 @@ type Application struct {
 	dataDir string
 
 	// Project-level services (process lifetime)
-	gateway       *model.Gateway
+	gateway       *gateway.Gateway
 	registry      *provider.Registry
 	sessionRepo   *session.Repository
 	memStore      *memory.Store
 	consoleSink   *event.ConsoleSink
-	interactiveIO security.InteractiveIO
+	interactiveIO hitl.InteractiveIO
 
 	// Active runtime
 	runtime         *SessionRuntime
@@ -94,6 +94,9 @@ func New(cfgDir, workdir string, opts ...Option) (*Application, error) {
 	if cfg.AnthropicAPIKey != "" {
 		reg.Register(provider.NewAnthropic(cfg.AnthropicAPIKey, cfg.AnthropicBaseURL))
 	}
+	if cfg.DeepSeekAPIKey != "" {
+		reg.Register(provider.NewDeepSeek(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL))
+	}
 
 	gw, throttle, err := provider.BuildGateway(cfg, reg)
 	if err != nil {
@@ -108,7 +111,7 @@ func New(cfgDir, workdir string, opts ...Option) (*Application, error) {
 
 // NewWithGateway constructs an Application from a pre-built gateway/registry.
 // Production code uses New(); tests inject a fake provider without API keys.
-func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gateway, reg *provider.Registry, opts ...Option) (*Application, error) {
+func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *gateway.Gateway, reg *provider.Registry, opts ...Option) (*Application, error) {
 	if cfg == nil {
 		cfg = &config.Config{ModelID: "default"}
 	}
@@ -134,9 +137,9 @@ func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gatewa
 	if consoleSink == nil {
 		consoleSink = event.NewConsoleSink()
 	}
-	var interactiveIO security.InteractiveIO
+	var interactiveIO hitl.InteractiveIO
 	if boot.hasReader {
-		interactiveIO = security.NewInteractiveIO(consoleSink, boot.readLine, boot.isTTY)
+		interactiveIO = hitl.NewInteractiveIO(consoleSink, boot.readLine, boot.isTTY)
 	}
 
 	return &Application{
@@ -154,7 +157,7 @@ func NewWithGateway(cfgDir, workdir string, cfg *config.Config, gw *model.Gatewa
 }
 
 // Gateway returns the model gateway.
-func (a *Application) Gateway() *model.Gateway { return a.gateway }
+func (a *Application) Gateway() *gateway.Gateway { return a.gateway }
 
 // SessionRepo returns the session repository.
 func (a *Application) SessionRepo() *session.Repository { return a.sessionRepo }
@@ -165,14 +168,14 @@ func (a *Application) DataDir() string { return a.dataDir }
 // Config returns the process-wide configuration.
 func (a *Application) Config() *config.Config { return a.cfg }
 
-func (a *Application) interactive() security.InteractiveIO {
+func (a *Application) interactive() hitl.InteractiveIO {
 	if a != nil && a.interactiveIO != nil {
 		return a.interactiveIO
 	}
 	if a != nil && a.consoleSink != nil {
-		return security.NewInteractiveIO(a.consoleSink, nil, false)
+		return hitl.NewInteractiveIO(a.consoleSink, nil, false)
 	}
-	return security.DefaultInteractiveIO()
+	return hitl.DefaultInteractiveIO()
 }
 
 // CloseSession stops the active session runtime and releases its ownership.
@@ -227,7 +230,7 @@ type ShutdownHook struct {
 // It holds only the shared services it actually needs, not a circular
 // reference back to Application.
 type SessionRuntime struct {
-	gateway     *model.Gateway
+	gateway     *gateway.Gateway
 	workdir     string
 	catalog     *tool.ToolCatalog
 	sessionRepo *session.Repository
@@ -242,7 +245,7 @@ type SessionRuntime struct {
 
 // NewSessionRuntime creates a runtime for the given session state.
 // It receives only the shared services it uses — no Application pointer.
-func NewSessionRuntime(parent context.Context, gw *model.Gateway, workdir string, catalog *tool.ToolCatalog, repo *session.Repository, st *session.State) *SessionRuntime {
+func NewSessionRuntime(parent context.Context, gw *gateway.Gateway, workdir string, catalog *tool.ToolCatalog, repo *session.Repository, st *session.State) *SessionRuntime {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -319,10 +322,10 @@ type openedSession struct {
 }
 
 type sessionSecurity struct {
-	hitlMgr      *hitlaudit.HITLManager
+	hitlMgr      *hitl.HITLManager
 	approval     *security.ApprovalState
 	permissions  *security.Permissions
-	diffPreview  *security.DiffPreview
+	diffPreview  *hitl.DiffPreview
 	promptLoader *prompt.Loader
 	cfg          *config.Config
 }
@@ -483,17 +486,17 @@ func (app *Application) configureSessionSecurity(opts BuildOptions) sessionSecur
 		cfg = &config.Config{ModelID: "default"}
 	}
 
-	hitlMgr := hitlaudit.NewHITLManager(promptLoader, app.interactive())
+	hitlMgr := hitl.NewHITLManager(promptLoader, app.interactive())
 	approval := security.NewApprovalState()
 	// Default approval mode is safe-auto. --human alone escalates to manual.
 	// --human-mode is retained as the advanced compatibility override.
-	hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeSafeAuto)
+	hitl.ApplyMode(hitlMgr, approval, hitl.HITLModeSafeAuto)
 	if opts.Human && opts.HumanMode == "" {
-		hitlaudit.ApplyMode(hitlMgr, approval, hitlaudit.HITLModeInteractive)
+		hitl.ApplyMode(hitlMgr, approval, hitl.HITLModeInteractive)
 	}
 	if opts.HumanMode != "" {
-		if mode, err := hitlaudit.ParseMode(opts.HumanMode); err == nil {
-			hitlaudit.ApplyMode(hitlMgr, approval, mode)
+		if mode, err := hitl.ParseMode(opts.HumanMode); err == nil {
+			hitl.ApplyMode(hitlMgr, approval, mode)
 		} else {
 			fmt.Fprintf(os.Stderr, "[warn] %v\n", err)
 		}
@@ -505,7 +508,7 @@ func (app *Application) configureSessionSecurity(opts BuildOptions) sessionSecur
 		hitlMgr:      hitlMgr,
 		approval:     approval,
 		permissions:  permissions,
-		diffPreview:  security.NewDiffPreview(app.workdir),
+		diffPreview:  hitl.NewDiffPreview(app.workdir),
 		promptLoader: promptLoader,
 		cfg:          cfg,
 	}

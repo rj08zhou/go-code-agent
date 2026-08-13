@@ -13,12 +13,12 @@ import (
 	"go-code-agent/internal/background"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/history"
-	"go-code-agent/internal/hitlaudit"
+	"go-code-agent/internal/hitl"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/mcp"
 	"go-code-agent/internal/memory"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/security"
 	"go-code-agent/internal/skill"
@@ -41,8 +41,8 @@ type RunnerParams struct {
 	Bus          *team.MessageBus
 	WebService   tool.WebService
 	Console      *event.ConsoleSink
-	Interactive  security.InteractiveIO
-	HITLMgr      *hitlaudit.HITLManager
+	Interactive  hitl.InteractiveIO
+	HITLMgr      *hitl.HITLManager
 	Approval     *security.ApprovalState
 	MCPMgr       *mcp.Manager
 	WorktreeSvc  *worktree.Service
@@ -63,7 +63,7 @@ type wireBundle struct {
 	runner       *agent.Runner
 	histStore    *history.Store
 	judge        *agent.Judge
-	hitlAdpt     *hitlaudit.HITLApprovalAdapter
+	hitlAdpt     *hitl.HITLApprovalAdapter
 	network      tool.NetworkChecker
 	outputSafety tool.OutputSanitizer
 }
@@ -147,6 +147,8 @@ func providerEndpointHost(cfg *config.Config, providerName string) string {
 		return safeEndpointHost(cfg.OpenAIBaseURL, "api.openai.com")
 	case "anthropic":
 		return safeEndpointHost(cfg.AnthropicBaseURL, "api.anthropic.com")
+	case "deepseek":
+		return safeEndpointHost(cfg.DeepSeekBaseURL, "api.deepseek.com")
 	case "gemini":
 		return "generativelanguage.googleapis.com"
 	default:
@@ -178,8 +180,8 @@ func safeEndpointHost(rawURL, defaultHost string) string {
 	return host
 }
 
-func wireSecurity(rt *SessionRuntime, params RunnerParams) (*tool.Executor, *hitlaudit.HITLApprovalAdapter, tool.NetworkChecker, tool.OutputSanitizer) {
-	hitlApproval := hitlaudit.NewHITLApprovalAdapter(params.HITLMgr, params.Interactive)
+func wireSecurity(rt *SessionRuntime, params RunnerParams) (*tool.Executor, *hitl.HITLApprovalAdapter, tool.NetworkChecker, tool.OutputSanitizer) {
+	hitlApproval := hitl.NewHITLApprovalAdapter(params.HITLMgr, params.Interactive)
 	hitlApproval.SetApproval(params.Approval)
 	hitlApproval.SetCatalog(rt.catalog)
 	hitlApproval.SetPermissions(params.Permissions)
@@ -195,25 +197,25 @@ func wireTeam(
 	rt *SessionRuntime,
 	params RunnerParams,
 	sessionDir string,
-	hitlApproval *hitlaudit.HITLApprovalAdapter,
+	hitlApproval *hitl.HITLApprovalAdapter,
 	network tool.NetworkChecker,
 	outputSafety tool.OutputSanitizer,
 ) (*agent.SubagentRunner, *agent.TeammateManager) {
 	cfg := params.Config
-	subagentRunner := agent.NewSubagentRunner(rt.gateway, rt.catalog, cfg, params.PromptLoader)
+	subagentRunner := agent.NewSubagentRunner(
+		rt.gateway, rt.catalog, cfg, params.PromptLoader,
+		hitlApproval, network, outputSafety,
+	)
 	subagentRunner.SetCompression(agent.NewCompression(rt.gateway, nil, sessionDir, cfg.ModelID, params.PromptLoader))
-	subagentRunner.SetApproval(hitlApproval)
-	subagentRunner.SetExecutorSecurity(network, outputSafety)
 
 	teamMgr := agent.NewTeammateManager(
 		filepath.Join(sessionDir, "team"), rt.gateway,
 		params.Bus, params.TaskSvc, params.Protocols, params.WorktreeSvc,
 		rt.catalog, cfg.ModelID, params.PromptLoader,
+		hitlApproval, network, outputSafety,
 	)
 	teamMgr.SetSessionCtx(rt.Ctx)
 	teamMgr.SetDiffPreview(params.DiffPreview)
-	teamMgr.SetApproval(hitlApproval)
-	teamMgr.SetExecutorSecurity(network, outputSafety)
 	teamMgr.SetReasoningConfig(cfg)
 	return subagentRunner, teamMgr
 }
@@ -333,13 +335,13 @@ func wireObservability(rt *SessionRuntime, params RunnerParams, wb *wireBundle, 
 	// Gateway is process-scoped; observers are session-scoped. Carry them on
 	// the runtime context so every call made by this session sees the same
 	// event sink and usage recorder without mutating shared Gateway state.
-	observers := model.CallObservers{Events: allEvents}
+	observers := gateway.CallObservers{Events: allEvents}
 	if params.Usage != nil {
 		observers.Usage = func(role, providerName, modelID, traceID string, usage llm.Usage, duration float64) {
 			params.Usage.Record(providerName, role, modelID, traceID, usage, duration)
 		}
 	}
-	rt.Ctx = model.WithCallObservers(rt.Ctx, observers)
+	rt.Ctx = gateway.WithCallObservers(rt.Ctx, observers)
 	wb.teamMgr.SetSessionCtx(rt.Ctx)
 	return sessionLog
 }
@@ -371,8 +373,8 @@ func registerSessionShutdownHooks(
 	})
 }
 
-func diffPreviewConcrete(dp tool.DiffPreview) *security.DiffPreview {
-	if v, ok := dp.(*security.DiffPreview); ok {
+func diffPreviewConcrete(dp tool.DiffPreview) *hitl.DiffPreview {
+	if v, ok := dp.(*hitl.DiffPreview); ok {
 		return v
 	}
 	return nil
@@ -382,10 +384,10 @@ func diffPreviewConcrete(dp tool.DiffPreview) *security.DiffPreview {
 func newSessionParams(
 	app *Application,
 	sessionDir, workdir string,
-	hitlMgr *hitlaudit.HITLManager,
+	hitlMgr *hitl.HITLManager,
 	approval *security.ApprovalState,
 	perms *security.Permissions,
-	diffPreview *security.DiffPreview,
+	diffPreview *hitl.DiffPreview,
 	decisionLog *agent.DecisionLog,
 	msgBus *team.MessageBus,
 	promptLoader *prompt.Loader,

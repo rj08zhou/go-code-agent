@@ -8,19 +8,19 @@ import (
 
 	"go-code-agent/internal/application"
 	"go-code-agent/internal/config"
+	"go-code-agent/internal/gateway"
+	"go-code-agent/internal/gateway/provider"
 	"go-code-agent/internal/history"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
-	"go-code-agent/internal/model/provider"
 )
 
-// stubProvider satisfies model.Provider without network I/O.
+// stubProvider satisfies gateway.Provider without network I/O.
 type stubProvider struct{}
 
 func (stubProvider) Name() string { return "openai" }
 
-func (stubProvider) Capabilities() model.ProviderCapabilities {
-	return model.ProviderCapabilities{
+func (stubProvider) Capabilities() gateway.ProviderCapabilities {
+	return gateway.ProviderCapabilities{
 		Streaming: true,
 	}
 }
@@ -29,7 +29,7 @@ func (stubProvider) Call(ctx context.Context, params llm.CallParams) (*llm.Compl
 	return &llm.Completion{Content: "ok", FinishReason: "stop"}, nil
 }
 
-func (stubProvider) Stream(ctx context.Context, params llm.CallParams, sink model.StreamSink) (*llm.StreamResult, error) {
+func (stubProvider) Stream(ctx context.Context, params llm.CallParams, sink gateway.StreamSink) (*llm.StreamResult, error) {
 	sink.OnTextDelta("ok")
 	sink.OnDone()
 	return &llm.StreamResult{Content: "ok", FinishReason: "stop"}, nil
@@ -44,8 +44,8 @@ func newTestApp(t *testing.T) (*application.Application, string, string) {
 
 	reg := provider.NewRegistry()
 	reg.Register(stubProvider{})
-	throttle := model.NewRoleThrottle(4)
-	gw := model.NewGateway(stubProvider{}, throttle)
+	throttle := gateway.NewRoleThrottle(4)
+	gw := gateway.NewGateway(stubProvider{}, throttle)
 
 	cfg := &config.Config{
 		ModelID:           "gpt-test",
@@ -81,7 +81,7 @@ func TestBuildExposesSanitizedRuntimeStatus(t *testing.T) {
 			ReasoningEffort:   " HIGH ",
 			LLMMaxConcurrency: 1,
 		},
-		model.NewGateway(primary, model.NewRoleThrottle(1)),
+		gateway.NewGateway(primary, gateway.NewRoleThrottle(1)),
 		registry,
 	)
 	if err != nil {

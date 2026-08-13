@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/tool"
 	"strings"
@@ -32,7 +32,7 @@ type Profile struct {
 // compression, reflection, judge, and snapshot support.
 type Runner struct {
 	profile  Profile
-	gateway  *model.Gateway
+	gateway  *gateway.Gateway
 	executor *tool.Executor
 	scope    *tool.ToolScope
 
@@ -68,7 +68,7 @@ func reasoningRequestFromConfig(cfg *config.Config) *llm.ReasoningRequest {
 
 func NewRunner(
 	profile Profile,
-	gateway *model.Gateway,
+	gateway *gateway.Gateway,
 	executor *tool.Executor,
 	scope *tool.ToolScope,
 	cfg *config.Config,
@@ -230,7 +230,7 @@ func (r *Runner) RunWithTaskBatch(
 		r.scope.TaskBatch = tool.NewTaskBatch(strings.TrimSpace(taskBatchID))
 	}
 
-	ctx = model.WithTraceID(ctx, traceID)
+	ctx = gateway.WithTraceID(ctx, traceID)
 	// Capture original task for plan gate and inject dynamic context once per
 	// turn as UserMessage so the system block stays stable for prompt caching.
 	messages := r.injectTurnContext(append([]llm.Message{}, thread...))

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/task"
 	"go-code-agent/internal/tool"
@@ -50,7 +50,7 @@ func exploreToolNames(agentType string, hasApproval bool) []string {
 // SubagentRunner runs an isolated read-only agent loop using the unified Runner
 // and returns a summary string.
 type SubagentRunner struct {
-	gateway      *model.Gateway
+	gateway      *gateway.Gateway
 	catalog      *tool.ToolCatalog
 	cfg          *config.Config
 	modelID      string
@@ -62,30 +62,36 @@ type SubagentRunner struct {
 	sanitizer    tool.OutputSanitizer
 }
 
-func NewSubagentRunner(gw *model.Gateway, catalog *tool.ToolCatalog, cfg *config.Config, pl *prompt.Loader) *SubagentRunner {
+// NewSubagentRunner requires the session HITL adapter and shared executor
+// security up front. A nil approval checker fail-closes bash out of the
+// explore whitelist; network/sanitizer nils disable those gates (tests only).
+func NewSubagentRunner(
+	gw *gateway.Gateway,
+	catalog *tool.ToolCatalog,
+	cfg *config.Config,
+	pl *prompt.Loader,
+	approval tool.ApprovalChecker,
+	network tool.NetworkChecker,
+	sanitizer tool.OutputSanitizer,
+) *SubagentRunner {
 	modelID := "default"
 	if cfg != nil && cfg.ModelID != "" {
 		modelID = cfg.ModelID
 	}
-	return &SubagentRunner{gateway: gw, catalog: catalog, cfg: cfg, modelID: modelID, promptLoader: pl}
+	return &SubagentRunner{
+		gateway:      gw,
+		catalog:      catalog,
+		cfg:          cfg,
+		modelID:      modelID,
+		promptLoader: pl,
+		approval:     approval,
+		network:      network,
+		sanitizer:    sanitizer,
+	}
 }
 
 func (s *SubagentRunner) SetEventSink(sink event.Sink) {
 	s.eventSink = sink
-}
-
-// SetApproval wires the session HITL adapter so explore tools are gated
-// the same way as lead tools.
-func (s *SubagentRunner) SetApproval(a tool.ApprovalChecker) {
-	s.approval = a
-}
-
-// SetExecutorSecurity applies the session's shared preflight and redaction
-// policy to every subagent executor. Subagents add output truncation after
-// the shared sanitizer to keep their prompt budget bounded.
-func (s *SubagentRunner) SetExecutorSecurity(network tool.NetworkChecker, sanitizer tool.OutputSanitizer) {
-	s.network = network
-	s.sanitizer = sanitizer
 }
 
 // SetCompression enables auto-compaction for subagent runners.
@@ -150,7 +156,7 @@ func (s *SubagentRunner) Run(ctx context.Context, prompt, agentType, workdir, so
 		llm.UserMessage(prompt),
 	}
 
-	traceID := model.NewTraceID()
+	traceID := gateway.NewTraceID()
 	outcome := runner.RunWithTaskBatch(ctx, messages, traceID, task.NewBatchID(agentType))
 
 	finalText := lastAssistantText(outcome.Messages)
@@ -270,7 +276,7 @@ func lastAssistantText(msgs []llm.Message) string {
 	return ""
 }
 
-// prefixedSink wraps a model.StreamSink with a prefix and color consistent
+// prefixedSink wraps a gateway.StreamSink with a prefix and color consistent
 // with the original project's terminal output conventions.
 //
 //	lead   → green body, no [lead] prefix

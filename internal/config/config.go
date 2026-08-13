@@ -25,6 +25,8 @@ type Config struct {
 	OpenAIBaseURL    string
 	AnthropicAPIKey  string
 	AnthropicBaseURL string
+	DeepSeekAPIKey   string
+	DeepSeekBaseURL  string
 
 	// ReasoningEnabled opts agent execution calls into provider-native
 	// reasoning. ReasoningEffort is a provider-interpreted hint; the OpenAI
@@ -64,6 +66,8 @@ func Load() *Config {
 		OpenAIBaseURL:         strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
 		AnthropicAPIKey:       strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
 		AnthropicBaseURL:      strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")),
+		DeepSeekAPIKey:        strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY")),
+		DeepSeekBaseURL:       strings.TrimSpace(os.Getenv("DEEPSEEK_BASE_URL")),
 		ReasoningEnabled:      envBool("REASONING_ENABLED"),
 		ReasoningEffort:       firstNonEmptyEnv("REASONING_EFFORT", "medium"),
 		LLMMaxQPS:             envFloat("LLM_MAX_QPS", 4.0),
@@ -111,8 +115,8 @@ func (c *Config) CompactionThreshold(model string) int {
 
 func (c *Config) Validate() []string {
 	var warns []string
-	if c.OpenAIAPIKey == "" && c.AnthropicAPIKey == "" {
-		warns = append(warns, "no LLM API key found (set OPENAI_API_KEY or ANTHROPIC_API_KEY)")
+	if c.OpenAIAPIKey == "" && c.AnthropicAPIKey == "" && c.DeepSeekAPIKey == "" {
+		warns = append(warns, "no LLM API key found (set OPENAI_API_KEY, ANTHROPIC_API_KEY, or DEEPSEEK_API_KEY)")
 	}
 	return warns
 }
@@ -208,10 +212,10 @@ const (
 )
 
 const (
-	TokenThreshold          = 300000
-	KeepRecent              = 15
-	MaxOutputLen            = 64 * 1024
-	KeepRecentMessages      = 20
+	TokenThreshold     = 300000
+	KeepRecent         = 15
+	MaxOutputLen       = 64 * 1024
+	KeepRecentMessages = 20
 	// BashOutputMaxChars caps the lead agent's bash output. Unlike read_file,
 	// bash has no offset paging, so oversized output is kept as a head/tail
 	// window (diagnostics like build errors usually land at the end) plus a

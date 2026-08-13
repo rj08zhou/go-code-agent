@@ -8,22 +8,22 @@ import (
 
 	"go-code-agent/internal/config"
 	"go-code-agent/internal/event"
+	"go-code-agent/internal/gateway"
+	"go-code-agent/internal/gateway/provider"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
-	"go-code-agent/internal/model/provider"
 	"go-code-agent/internal/session"
 )
 
 type ctorStubProvider struct{}
 
 func (ctorStubProvider) Name() string { return "openai" }
-func (ctorStubProvider) Capabilities() model.ProviderCapabilities {
-	return model.ProviderCapabilities{}
+func (ctorStubProvider) Capabilities() gateway.ProviderCapabilities {
+	return gateway.ProviderCapabilities{}
 }
 func (ctorStubProvider) Call(context.Context, llm.CallParams) (*llm.Completion, error) {
 	return &llm.Completion{Content: "ok", FinishReason: "stop"}, nil
 }
-func (ctorStubProvider) Stream(context.Context, llm.CallParams, model.StreamSink) (*llm.StreamResult, error) {
+func (ctorStubProvider) Stream(context.Context, llm.CallParams, gateway.StreamSink) (*llm.StreamResult, error) {
 	return &llm.StreamResult{Content: "ok", FinishReason: "stop"}, nil
 }
 
@@ -35,7 +35,7 @@ func TestNewWithGatewayBuildsInteractiveIOFromReader(t *testing.T) {
 		t.TempDir(),
 		t.TempDir(),
 		&config.Config{ModelID: "gpt-test", OpenAIAPIKey: "x"},
-		model.NewGateway(ctorStubProvider{}, model.NewRoleThrottle(1)),
+		gateway.NewGateway(ctorStubProvider{}, gateway.NewRoleThrottle(1)),
 		reg,
 		WithInteractiveReader(func(string) (string, error) {
 			calls++
@@ -66,7 +66,7 @@ func TestNewWithGatewayUsesInjectedConsoleSinkForInteractiveIO(t *testing.T) {
 		t.TempDir(),
 		t.TempDir(),
 		&config.Config{ModelID: "gpt-test", OpenAIAPIKey: "x"},
-		model.NewGateway(ctorStubProvider{}, model.NewRoleThrottle(1)),
+		gateway.NewGateway(ctorStubProvider{}, gateway.NewRoleThrottle(1)),
 		reg,
 		WithConsoleSink(sink),
 		WithInteractiveReader(func(string) (string, error) { return "n", nil }, false),

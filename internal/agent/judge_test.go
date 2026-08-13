@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 )
 
@@ -14,8 +14,8 @@ const validJudgeVerdictJSON = `{"approved":true,"score":9,"issues":[],"suggestio
 
 func TestJudgeVerifyRequestsStructuredOutput(t *testing.T) {
 	provider := &fakeProvider{name: "fake", content: validJudgeVerdictJSON}
-	gateway := model.NewGateway(provider, model.NewRoleThrottle(10))
-	judge := NewJudge(true, "judge-model", 7, prompt.NewLoader(), gateway)
+	gw := gateway.NewGateway(provider, gateway.NewRoleThrottle(10))
+	judge := NewJudge(true, "judge-model", 7, prompt.NewLoader(), gw)
 
 	verdict, err := judge.Verify(
 		context.Background(),
@@ -73,8 +73,8 @@ func TestParseJudgeResponseStrict(t *testing.T) {
 
 func TestJudgeVerifySchemaViolationIsExplicit(t *testing.T) {
 	provider := &fakeProvider{name: "fake", content: "not-json"}
-	gateway := model.NewGateway(provider, model.NewRoleThrottle(10))
-	judge := NewJudge(true, "judge-model", 7, prompt.NewLoader(), gateway)
+	gw := gateway.NewGateway(provider, gateway.NewRoleThrottle(10))
+	judge := NewJudge(true, "judge-model", 7, prompt.NewLoader(), gw)
 
 	verdict, err := judge.Verify(context.Background(), "task", nil, nil, "fallback-model")
 	if err == nil {
@@ -87,9 +87,9 @@ func TestJudgeVerifySchemaViolationIsExplicit(t *testing.T) {
 
 func TestRunnerJudgeUsesCapturedOriginalTask(t *testing.T) {
 	provider := &fakeProvider{name: "fake", content: validJudgeVerdictJSON}
-	gateway := model.NewGateway(provider, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(provider, gateway.NewRoleThrottle(10))
 	runner := NewRunner(NewLeadProfile("test"), nil, nil, nil, nil)
-	runner.SetJudge(NewJudge(true, "judge-model", 7, prompt.NewLoader(), gateway))
+	runner.SetJudge(NewJudge(true, "judge-model", 7, prompt.NewLoader(), gw))
 	runner.turn.originalTask = "implement the requested feature"
 
 	messages := []llm.Message{

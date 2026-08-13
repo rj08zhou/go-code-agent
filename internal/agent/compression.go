@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"go-code-agent/internal/config"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/history"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/logging"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/prompt"
 	"go-code-agent/internal/store"
 	"go-code-agent/internal/utils"
@@ -73,7 +73,7 @@ func compactedHistoryCoverage(written, messageCount, split int, boundary *int) i
 // Compression handles microCompact (in-place truncation) and
 // AutoCompact (LLM summary) to keep context windows under budget.
 type Compression struct {
-	gateway      *model.Gateway
+	gateway      *gateway.Gateway
 	histStore    *history.Store
 	dataDir      string
 	modelID      string
@@ -81,7 +81,7 @@ type Compression struct {
 	promptLoader *prompt.Loader
 }
 
-func NewCompression(gw *model.Gateway, hs *history.Store, dataDir, modelID string, pl *prompt.Loader) *Compression {
+func NewCompression(gw *gateway.Gateway, hs *history.Store, dataDir, modelID string, pl *prompt.Loader) *Compression {
 	return &Compression{
 		gateway:      gw,
 		histStore:    hs,

@@ -41,8 +41,7 @@ func TestSubagentExecutorAppliesSharedSecurityAndTruncation(t *testing.T) {
 		},
 	})
 
-	runner := &SubagentRunner{}
-	runner.SetExecutorSecurity(denyNetwork{}, redactSanitizer{})
+	runner := NewSubagentRunner(nil, catalog, nil, nil, nil, denyNetwork{}, redactSanitizer{})
 	exec := runner.newExecutor(catalog)
 
 	denied := exec.Execute(context.Background(), &tool.ToolScope{
@@ -88,8 +87,7 @@ func TestTeammateExecutorAppliesSharedSecurity(t *testing.T) {
 		},
 	})
 
-	tm := &TeammateManager{catalog: catalog}
-	tm.SetExecutorSecurity(denyNetwork{}, redactSanitizer{})
+	tm := NewTeammateManager(t.TempDir(), nil, nil, nil, nil, nil, catalog, "", nil, nil, denyNetwork{}, redactSanitizer{})
 	exec := tm.newExecutor()
 
 	denied := exec.Execute(context.Background(), &tool.ToolScope{

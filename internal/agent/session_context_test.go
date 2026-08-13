@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/tool"
 )
 
@@ -70,7 +70,7 @@ func TestRunnerReturnsWithoutInjectedTurnContext(t *testing.T) {
 	provider := &fakeProvider{name: "fake", content: "done", finishReason: "stop"}
 	runner := NewRunner(
 		NewLeadProfile("sys"),
-		model.NewGateway(provider, model.NewRoleThrottle(2)),
+		gateway.NewGateway(provider, gateway.NewRoleThrottle(2)),
 		tool.NewExecutor(tool.NewToolCatalog(), nil, nil),
 		nil,
 		nil,

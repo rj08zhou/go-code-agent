@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"go-code-agent/internal/agent"
 	"go-code-agent/internal/application"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/llm"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/tool"
 	"os"
 	"os/exec"
@@ -171,7 +171,7 @@ func (h *Harness) runMocked(ctx context.Context, t Task, workdir string) Result 
 
 	// Build scripted provider that replays pre-defined model responses
 	sp := &scriptedProvider{script: t.Script}
-	gw := model.NewGateway(sp, model.NewRoleThrottle(10))
+	gw := gateway.NewGateway(sp, gateway.NewRoleThrottle(10))
 
 	// Build tool catalog with basic builtin tools
 	catalog := tool.NewToolCatalog()
@@ -223,7 +223,7 @@ func (h *Harness) runLive(ctx context.Context, t Task, workdir string) Result {
 
 	gw := app.Gateway()
 	if gw == nil {
-		r.Error = "no LLM gateway available (set OPENAI_API_KEY or ANTHROPIC_API_KEY)"
+		r.Error = "no LLM gateway available (set OPENAI_API_KEY, ANTHROPIC_API_KEY, or DEEPSEEK_API_KEY)"
 		return r
 	}
 
@@ -270,8 +270,8 @@ type scriptedProvider struct {
 
 func (s *scriptedProvider) Name() string { return "scripted" }
 
-func (s *scriptedProvider) Capabilities() model.ProviderCapabilities {
-	return model.ProviderCapabilities{
+func (s *scriptedProvider) Capabilities() gateway.ProviderCapabilities {
+	return gateway.ProviderCapabilities{
 		StructuredOutput: true,
 		ToolCalling:      true,
 		Streaming:        true,
@@ -282,7 +282,7 @@ func (s *scriptedProvider) Call(ctx context.Context, params llm.CallParams) (*ll
 	return s.nextResponse(), nil
 }
 
-func (s *scriptedProvider) Stream(ctx context.Context, params llm.CallParams, sink model.StreamSink) (*llm.StreamResult, error) {
+func (s *scriptedProvider) Stream(ctx context.Context, params llm.CallParams, sink gateway.StreamSink) (*llm.StreamResult, error) {
 	resp := s.nextResponse()
 	if sink != nil {
 		sink.OnTextDelta(resp.Content)

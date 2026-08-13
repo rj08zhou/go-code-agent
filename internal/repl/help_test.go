@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"go-code-agent/internal/application"
-	"go-code-agent/internal/hitlaudit"
+	"go-code-agent/internal/hitl"
 	"go-code-agent/internal/security"
 )
 
@@ -91,13 +91,13 @@ func TestHandleApprovalCanonicalModes(t *testing.T) {
 }
 
 func newApprovalTestLoop() *Loop {
-	hitl := hitlaudit.NewHITLManager(nil)
-	hitl.SetEnabled(true)
-	hitl.SetMode(hitlaudit.HITLModeSafeAuto)
+	mgr := hitl.NewHITLManager(nil)
+	mgr.SetEnabled(true)
+	mgr.SetMode(hitl.HITLModeSafeAuto)
 	approval := security.NewApprovalState()
 	approval.ApplyPreset("safe-auto")
 	return &Loop{built: &application.BuiltRunner{Security: application.SecurityFacade{
-		HITL: hitl, Approval: approval,
+		HITL: mgr, Approval: approval,
 	}}}
 }
 

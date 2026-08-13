@@ -7,10 +7,10 @@ import (
 	"testing"
 
 	"go-code-agent/internal/config"
+	"go-code-agent/internal/gateway"
 	"go-code-agent/internal/history"
 	"go-code-agent/internal/llm"
 	"go-code-agent/internal/memory"
-	"go-code-agent/internal/model"
 	"go-code-agent/internal/session"
 )
 
@@ -20,14 +20,14 @@ type backfillProvider struct {
 }
 
 func (p *backfillProvider) Name() string { return "openai" }
-func (p *backfillProvider) Capabilities() model.ProviderCapabilities {
-	return model.ProviderCapabilities{}
+func (p *backfillProvider) Capabilities() gateway.ProviderCapabilities {
+	return gateway.ProviderCapabilities{}
 }
 func (p *backfillProvider) Call(context.Context, llm.CallParams) (*llm.Completion, error) {
 	p.calls++
 	return &llm.Completion{Content: p.content, FinishReason: "stop"}, nil
 }
-func (p *backfillProvider) Stream(context.Context, llm.CallParams, model.StreamSink) (*llm.StreamResult, error) {
+func (p *backfillProvider) Stream(context.Context, llm.CallParams, gateway.StreamSink) (*llm.StreamResult, error) {
 	return &llm.StreamResult{Content: p.content, FinishReason: "stop"}, nil
 }
 
@@ -85,7 +85,7 @@ func TestSaveSessionToMemoryEndToEnd(t *testing.T) {
 		cfg:         &config.Config{ModelID: "gpt-test"},
 		sessionRepo: repo,
 		memStore:    memory.NewStore(root),
-		gateway:     model.NewGateway(prov, model.NewRoleThrottle(1)),
+		gateway:     gateway.NewGateway(prov, gateway.NewRoleThrottle(1)),
 		runtime:     &SessionRuntime{SessionState: active},
 	}
 
@@ -140,7 +140,7 @@ func TestSaveSessionToMemorySkipsActiveSession(t *testing.T) {
 	app := &Application{
 		sessionRepo: repo,
 		memStore:    memory.NewStore(root),
-		gateway:     model.NewGateway(prov, model.NewRoleThrottle(1)),
+		gateway:     gateway.NewGateway(prov, gateway.NewRoleThrottle(1)),
 	}
 	msg, err := app.saveSessionToMemory(context.Background(), active.ID)
 	if err != nil {
@@ -194,7 +194,7 @@ func TestStartMemoryBackfillRunsInBackground(t *testing.T) {
 		cfg:         &config.Config{ModelID: "gpt-test"},
 		sessionRepo: repo,
 		memStore:    memory.NewStore(root),
-		gateway:     model.NewGateway(prov, model.NewRoleThrottle(1)),
+		gateway:     gateway.NewGateway(prov, gateway.NewRoleThrottle(1)),
 		runtime:     &SessionRuntime{SessionState: active},
 	}
 	app.StartMemoryBackfill(active.ID)

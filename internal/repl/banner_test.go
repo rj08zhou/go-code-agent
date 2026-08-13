@@ -5,15 +5,15 @@ import (
 	"testing"
 
 	"go-code-agent/internal/application"
-	"go-code-agent/internal/hitlaudit"
+	"go-code-agent/internal/hitl"
 	"go-code-agent/internal/mcp"
 	"go-code-agent/internal/security"
 )
 
 func TestRenderBannerShowsOneCompleteStatusCard(t *testing.T) {
-	hitl := hitlaudit.NewHITLManager(nil)
-	hitl.SetEnabled(true)
-	hitl.SetMode(hitlaudit.HITLModeSafeAuto)
+	mgr := hitl.NewHITLManager(nil)
+	mgr.SetEnabled(true)
+	mgr.SetMode(hitl.HITLModeSafeAuto)
 	approval := security.NewApprovalState()
 	approval.ApplyPreset("safe-auto")
 	built := &application.BuiltRunner{
@@ -32,7 +32,7 @@ func TestRenderBannerShowsOneCompleteStatusCard(t *testing.T) {
 			ReasoningEffort:    "high",
 		},
 		Security: application.SecurityFacade{
-			HITL:     hitl,
+			HITL:     mgr,
 			Approval: approval,
 		},
 		Team: application.TeamFacade{MCP: mcp.NewManager(t.TempDir())},
