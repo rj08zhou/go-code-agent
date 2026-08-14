@@ -17,7 +17,7 @@ import (
 
 	"go-code-agent/internal/application"
 	"go-code-agent/internal/logging"
-	"go-code-agent/internal/model/provider"
+	"go-code-agent/internal/gateway/provider"
 	"go-code-agent/internal/repl"
 	"go-code-agent/internal/session"
 	"go-code-agent/internal/store"
